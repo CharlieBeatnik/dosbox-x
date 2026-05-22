@@ -1,6 +1,6 @@
 # Agent interface — task list
 
-**Current iteration:** Iteration 5
+**Current iteration:** Iteration 6
 **Branch:** `agent-interface`
 
 `[ ]` not started · `[~]` in progress (note who/when) · `[x]` done (note commit SHA)
@@ -93,15 +93,24 @@ Goal: agent can type into the running guest.
 
 Goal: agent can pause/resume and is notified when breakpoints fire — without curses being present.
 
-- [ ] `cpu.pause` command → existing `DEBUG_Enable_Handler(true)` path.
-- [ ] `cpu.run` command → `ParseCommand("RUN")`.
-- [ ] `AGENT_EmitBpHit` emit from `CBreakpoint::CheckBreakpoint` (`src/debug/debug.cpp:731`) before the return.
-- [ ] `debugger.entered` emit from `DEBUG_EnableDebugger` after `DEBUG_Enable_Handler(true)`.
-- [ ] `state.paused` / `state.running` emits from RUN/RUNWATCH (`:2621`/`:2647`) and the auto-resume inside `DEBUG_Loop` (`:~4812`).
-- [ ] Call `AGENT_Poll(true)` inside `DEBUG_Loop`'s paused branch alongside `DEBUG_CheckKeys`.
-- [ ] `AGENT_IsHeadless()` predicate; gate `DBGUI_StartUp()` in `DEBUG_EnableDebugger`. Add null-window guards in `DEBUG_CheckKeys` and any `Draw*` paths missing them.
-- [ ] Manual: set a code breakpoint, reboot, observe `bp.hit` then `debugger.entered`, run `BPLIST`, then `RUN`, observe `state.running`.
+- [x] `cpu.pause` command → `DEBUG_EnableDebugger()`. The handler does all the real work (sets `debugging=true`, switches loop to `DEBUG_Loop`, etc.).
+- [x] `cpu.run` command → `ParseCommand("RUN")`.
+- [x] `AGENT_EmitBpHit` populated in `agent_events.cpp`. Emitted from both `return true` paths inside `CBreakpoint::CheckBreakpoint` — the BKPNT_PHYSICAL match and the C_HEAVY_DEBUG memory-watch match. `bp_index` is the iteration position in `BPoints`.
+- [x] `debugger.entered` emitted from `DEBUG_EnableDebugger` immediately after `DEBUG_Enable_Handler(true)` — gated on a `wasRunning` snapshot so we only emit on the running→paused edge. Currently always emits `reason:"breakpoint"`; widening to `"manual"` / `"int3"` / `"sysenter"` is iteration 7+.
+- [x] `state.paused` paired with `debugger.entered`. `state.running` emitted from three sites: end of `RUN` handler, end of `RUNWATCH` handler, and the auto-resume branch in `DEBUG_Loop` (after `DOSBOX_SetNormalLoop`).
+- [x] `AGENT_Poll(true)` called inside `DEBUG_Loop`'s paused branch, immediately before `DEBUG_CheckKeys`. Lets the agent dispatch commands while the CPU is halted.
+- [x] `AGENT_IsHeadless()` predicate returns `g_started`. `DBGUI_StartUp` and `DEBUG_SetupConsole` both early-return when headless, so `dbg.win_*` stays NULL. Null-window guards added/verified in `DEBUG_CheckKeys`, `DEBUG_BeginPagedContent`, `DrawVariables`. All other `Draw*` / `DEBUG_RefreshPage` paths already had guards. **Trade-off:** with `-agent-listen` active, pressing the F12/Alt-Pause mapper key no longer pops a curses window — the agent owns the debugger UI. A future iteration could split "agent active" from "curses suppressed" if both-at-once is wanted.
+- [~] Manual: set a code breakpoint, reboot, observe `bp.hit` then `debugger.entered`, run `BPLIST`, then `RUN`, observe `state.running`. **Not exercised in this session** — needs a live boot with `-agent-listen` and a connected client.
+- [x] Verify build (VS Debug x64): 0 errors. Tests: 34/34 pass (17 protocol + 7 dispatch + 8 keymap + 2 events).
 - [ ] Commit `agent: events, state transitions, headless debugger control`.
+
+### Iteration 5 — open issues for the next session
+
+- **`debugger.entered` reason is always `"breakpoint"`.** Plan lists four reasons (breakpoint, manual, int3, sysenter); distinguishing them needs separate emit sites or a thread-local reason variable set by the trigger. Defer until a real consumer needs the distinction.
+- **`debugrunmode==1` immediately RUNs after debugger.entered.** When the agent calls `cpu.pause` and the user has configured `debugrun=normal`, the handler emits `state.paused` then immediately a `state.running` from the chained RUN. The agent sees both events — accurate but jarring. The user config is uncommon in agent flows.
+- **`AGENT_IsHeadless()` is binary on agent-started.** No way today to mix agent + curses. If a developer wants to drive the agent AND watch the curses window, this iteration won't let them. Add a `[agent] headless=` config in iteration 6+ if asked.
+- **`DEBUG_Run` inside cpu.run is not headless-tested.** ParseCommand("RUN") runs in test mode without crashing today (it's not exercised by our 34 tests), but a real `cpu.run` issued by an external client touches `DEBUG_Run(1,false)` which we haven't proven safe with curses uninitialized. The first manual-test session should poke this hard.
+- **`AGENT_Poll(true)` inside `DEBUG_Loop` runs every `SDL_Delay(1)` iteration.** Same cadence as the tick handler (1 ms). No double-poll concern because `serverPoll` is idempotent under accept/drain, but if a future iteration adds expensive per-poll work this could double-bill the CPU.
 
 ## Iteration 6 — Python reference client + smoke doc
 

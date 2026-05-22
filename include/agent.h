@@ -51,6 +51,9 @@ void AGENT_Poll(bool paused);
  * context. */
 void AGENT_EmitBpHit(uint16_t seg, uint32_t off, int bp_index);
 void AGENT_EmitLog(const char *line);
+void AGENT_EmitDebuggerEntered(const char *reason);
+void AGENT_EmitStateRunning(void);
+void AGENT_EmitStatePaused(void);
 
 /* Notified when DOSBOX_SetNormalLoop / DOSBOX_SetLoop changes the main
  * loop. Used so we know when to flip state.paused <-> state.running. */
@@ -67,6 +70,9 @@ static inline void AGENT_Stop(void) {}
 static inline void AGENT_Poll(bool /*paused*/) {}
 static inline void AGENT_EmitBpHit(uint16_t /*seg*/, uint32_t /*off*/, int /*bp_index*/) {}
 static inline void AGENT_EmitLog(const char * /*line*/) {}
+static inline void AGENT_EmitDebuggerEntered(const char * /*reason*/) {}
+static inline void AGENT_EmitStateRunning(void) {}
+static inline void AGENT_EmitStatePaused(void) {}
 static inline void AGENT_OnLoopChange(void) {}
 static inline bool AGENT_IsHeadless(void) { return false; }
 

@@ -589,6 +589,15 @@ void DEBUG_FlushInput(void) {
 }
 
 void DBGUI_StartUp(void) {
+	/* When the agent owns the debugger UI we don't want a curses window
+	 * popping up — the agent drives the debugger via JSON commands and
+	 * AGENT_Poll(true) inside DEBUG_Loop. Skip the GUI init entirely;
+	 * dbg.win_* stays NULL and the various null-guarded paths handle it. */
+	if (AGENT_IsHeadless()) {
+		LOG(LOG_MISC,LOG_DEBUG)("DEBUG GUI startup suppressed by agent (headless)");
+		return;
+	}
+
 	mainMenu.get_item("show_console").check(true).enable(false).refresh_item(mainMenu);
 	mainMenu.get_item("clear_console").check(false).enable(false).refresh_item(mainMenu);
 
@@ -652,9 +661,15 @@ void DEBUG_DrawInput(void);
 
 void DEBUG_BeginPagedContent(void) {
 #if C_DEBUG
-	int maxy, maxx; getmaxyx(dbg.win_out,maxy,maxx);
-
     debugPageCounter = 0;
+    if (dbg.win_out == NULL) {
+        /* Headless / curses not initialized — disable paging entirely so
+         * `DEBUG_ShowMsg` does not look for a non-existent window when
+         * deciding whether to prompt for ENTER. */
+        debugPageStopAt = 0;
+        return;
+    }
+    int maxy, maxx; getmaxyx(dbg.win_out,maxy,maxx);
     debugPageStopAt = maxy;
 #endif
 }

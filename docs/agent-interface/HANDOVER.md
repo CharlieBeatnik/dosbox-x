@@ -5,68 +5,71 @@
 ## State
 
 - **Branch:** `agent-interface`.
-- **Last commit on branch:** about to land — `agent: keyboard input (type / press / release / tap)`. Confirm with `git log --oneline -5`.
-- **Build status:** **Verified.** VS Debug x64 (v143 toolset) compiles cleanly: 0 errors. See `~/.claude/projects/D--data-Git-dosbox-x/memory/reference_windows_build.md` for the exact invocation.
-- **Test status:** **Verified.** All 32 agent tests pass: 17 `AgentProtocolTest`, 7 `AgentDispatchTest`, 8 `AgentKeymapTest`.
+- **Last commit on branch:** about to land — `agent: events, state transitions, headless debugger control`. Confirm with `git log --oneline -5`.
+- **Build status:** **Verified.** VS Debug x64 (v143 toolset) compiles cleanly: 0 errors.
+- **Test status:** **Verified.** All 34 agent tests pass: 17 protocol, 7 dispatch, 8 keymap, 2 events.
 
-## What was just done — Iteration 4
+## What was just done — Iteration 5
 
-The agent can now type into the guest. Four new commands:
+The agent can now drive the debugger entirely from an external client. With `-agent-listen` in effect:
 
-- `keyboard.type {text}` → `strPasteBuffer.append(text)`; the existing paste pump in `sdlmain.cpp:6785` delivers chars at the configured `pastespeed`. Returns `{queued: N}` where N is byte-count.
-- `keyboard.press {key}` → `KEYBOARD_AddKey(k, true)`.
-- `keyboard.release {key}` → `KEYBOARD_AddKey(k, false)`.
-- `keyboard.tap {key}` → press then release.
-
-The key-name table in `agent_keyboard.cpp` covers every value of `KBD_KEYS` except `KBD_NONE` / `KBD_LAST`. A test (`TableCoversEnumRange`) catches accidental drift if a new key value lands in `include/keyboard.h` without a matching table entry.
+- The curses window is suppressed (`DBGUI_StartUp` / `DEBUG_SetupConsole` early-return on `AGENT_IsHeadless()`).
+- `cpu.pause` and `cpu.run` commands route through the existing debugger entry points.
+- Five new events arrive at any connected client: `bp.hit`, `debugger.entered`, `state.paused`, `state.running`, plus the existing `log.line`.
+- `AGENT_Poll(true)` fires inside `DEBUG_Loop`'s paused branch, so commands sent while the CPU is halted get dispatched immediately rather than waiting for the next tick.
 
 Files added:
-- `tests/agent_keymap_tests.cpp` — 8 gTest cases.
+- `tests/agent_events_tests.cpp` — 2 gTest cases: the four emitter helpers are no-op-safe without a client; `AGENT_IsHeadless()` returns false in test mode.
 
 Files modified:
-- `src/agent/agent_keyboard.cpp` — was an empty stub; now ~190 lines of name table + four dispatch handlers.
-- `src/agent/agent_internal.h` — exposes `keyboardNameToKey`, `keyboardTableSize`, the four `handleKeyboardXxx` functions, and the previously-private `makeReplyOk`/`makeReplyError` helpers (moved from `agent.cpp`'s anonymous namespace into the `agent` namespace so `agent_keyboard.cpp` can use them). Pulled in `keyboard.h` for the `KBD_KEYS` enum.
-- `src/agent/agent.cpp` — `makeReplyOk`/`makeReplyError` un-anonymised; dispatch routes for the four new commands added.
-- `tests/tests.h` — `#include "agent_keymap_tests.cpp"`.
+- `include/agent.h` — three new public emitters (`AGENT_EmitDebuggerEntered`, `AGENT_EmitStateRunning`, `AGENT_EmitStatePaused`) with inline-noop stubs for `!C_DEBUG`.
+- `src/agent/agent_events.cpp` — populated `AGENT_EmitBpHit` (was an empty stub since iteration 1) and the three new emitters. All format compact JSON inline and call `serverBroadcastLine`.
+- `src/agent/agent.cpp` — `AGENT_IsHeadless()` now returns `g_started` (the old `g_headless` field is gone). Two new dispatch handlers (`handleCpuPause`, `handleCpuRun`) and routes for `cpu.pause` / `cpu.run`.
+- `src/debug/debug.cpp` — `#include "agent.h"`. Event emit calls in: `CBreakpoint::CheckBreakpoint` (both `return true` paths), `DEBUG_EnableDebugger` (on the running→paused transition), `RUN` and `RUNWATCH` ParseCommand handlers, and the auto-resume branch in `DEBUG_Loop`. `AGENT_Poll(true)` added to the paused branch of `DEBUG_Loop`. Null guards added/strengthened: `DEBUG_CheckKeys` early-returns if `dbg.win_main == NULL`; `DrawVariables` guards `dbg.win_var`; `DEBUG_SetupConsole` early-returns if `AGENT_IsHeadless()`.
+- `src/debug/debug_gui.cpp` — `DBGUI_StartUp` early-returns if `AGENT_IsHeadless()`; `DEBUG_BeginPagedContent` handles `dbg.win_out == NULL` by setting `debugPageStopAt = 0` and returning.
+- `tests/tests.h` — `#include "agent_events_tests.cpp"`.
 
 ## What to do next
 
-Start **Iteration 5** in `TASKS.md`: events, state, and headless debugger.
+Start **Iteration 6** in `TASKS.md`: Python reference client + smoke doc + the first opening PR.
 
-This is the largest iteration so far and the one that unlocks fully-automated debugger sessions. The key pieces, from the plan:
+The iteration plan from `TASKS.md`:
+- `contrib/agent-client/dbxagent.py` — ~200 lines: connect, sync request/response with id correlation, async event listener.
+- `docs/agent-interface/SMOKE.md` — the 6-step manual smoke sequence from `PLAN.md` § Verification.
+- Open PR `agent-interface → master`.
 
-- `cpu.pause` → existing `DEBUG_Enable_Handler(true)` path.
-- `cpu.run` → `ParseCommand("RUN")`.
-- `AGENT_EmitBpHit` populated; call site at `src/debug/debug.cpp:731` (`CBreakpoint::CheckBreakpoint`).
-- `debugger.entered` event from `DEBUG_EnableDebugger` after `DEBUG_Enable_Handler(true)`.
-- `state.paused` / `state.running` from the three transition sites: `DEBUG_EnableDebugger`, RUN/RUNWATCH (`:2621`/`:2647`), and the auto-resume inside `DEBUG_Loop` (`:~4812`).
-- `AGENT_Poll(true)` inside `DEBUG_Loop`'s paused branch.
-- `AGENT_IsHeadless()` predicate; gate `DBGUI_StartUp()` in `DEBUG_EnableDebugger`. Null-window guards in `DEBUG_CheckKeys` / `DEBUG_BeginPagedContent` / `DEBUG_EndPagedContent` / `DEBUG_DrawInput` and probably `CBreakpoint::ShowList`.
+The Python client is the right vehicle to **finally** run the manual smoke checks that have been carried forward since iteration 2. The order should be:
 
-**Why the headless bit matters:** iteration 3's `debugger.command` only works today when the user has manually opened the curses debugger. Iteration 5 lets the agent open it via `cpu.pause` without flashing a curses window on screen, and lets commands like `BPLIST` / `D 0:0 16` run safely against a NULL `dbg.win_out`.
+1. Write `dbxagent.py` minimally — enough to do request/reply + event subscription.
+2. Use it to run the four pending manual checks (see below) on a real DOSBox-X build.
+3. If anything breaks, that's the bug-fix budget for iteration 6.
+4. Write `SMOKE.md` as a reproducible recipe.
+5. Open the PR.
 
-Suggested order:
-1. Null-guard the curses entry points first (cheap, easy, no behaviour change with curses up). This makes existing iteration-3 tests slightly more robust as a side effect.
-2. Add the `AGENT_IsHeadless()` predicate and gate `DBGUI_StartUp` on it.
-3. Add the event emitters one site at a time, testing each by single-stepping in a connected session.
-4. Then `cpu.pause` / `cpu.run` dispatch — those are one-liners that route to existing entry points.
+## Outstanding manual checks (still pending)
 
-## Outstanding manual checks (carry-overs)
+These haven't been validated against a live boot in any session yet:
 
-These have been pending since iteration 2 and remain relevant; they're the verification path the docs keep deferring:
+1. **Boot with `-agent-listen 127.0.0.1:0 -agent-portfile dbxport.txt`.** Confirm: log line `agent: listening on 127.0.0.1:NNNNN`, portfile contains NNNNN, Python client gets a reply to `vm.version`.
+2. **Boot with no agent flags.** `netstat -ano | grep LISTENING` must show no new socket; no `agent:` line in the log. The byte-identical guarantee.
+3. **Linux/macOS build** (`./build-debug` or `./build-debug-sdl2`). Only VS x64 is exercised today.
+4. **The full smoke flow from iteration 5's last task:**
+   - Connect, `log.subscribe`.
+   - Set a code breakpoint via `debugger.command BP 0:7C00`.
+   - Reboot the machine (`debugger.command BOOT A:` or similar).
+   - Expect the connected client to receive `{event:"bp.hit",...}` then `{event:"debugger.entered","reason":"breakpoint"}` then `{event:"state.paused"}`.
+   - Send `debugger.command BPLIST` → see one entry in `output`.
+   - Send `cpu.run` (or `debugger.command RUN`) → receive `{event:"state.running"}`.
 
-1. Boot with `-agent-listen 127.0.0.1:0 -agent-portfile dbxport.txt`. Confirm a log line "agent: listening on 127.0.0.1:NNNNN", that `dbxport.txt` contains the port, and the Python one-liner works (see iteration 2 section of git history for the snippet).
-2. Boot with **no** agent flags. `netstat -ano | grep LISTENING` must show no new socket and no `agent:` line in the log. The byte-identical-to-upstream guarantee.
-3. Linux/macOS build (`./build-debug`). Only VS x64 has been exercised. The `#if defined(C_SDL2_NET) && C_SDL2_NET` branch in `agent_server.cpp` is only reached on those builds.
-4. Once iteration 5 lands: `keyboard.type "DIR\r"` over a live agent connection should make DOS run `DIR`. (Today it'd technically work too — paste doesn't need curses.)
+The headless-curses changes have not been exercised against `DEBUG_Run(1,false)` (called by ParseCommand("RUN")). The first session that does the manual smoke should poke `cpu.run` hard — that's where curses-missing surprises most likely lurk.
 
 ## Open decisions / gotchas
 
-- **`delay_ms` arg on `keyboard.type` is intentionally not implemented.** `paste_speed` is a session-wide config setting, not a per-call override. Adding the arg meaningfully needs either a temp config mutation (racy) or a parallel pump. Revisit if a real consumer asks.
-- **`keyboard.type` accepts arbitrary bytes; the paste driver only handles ASCII reliably.** Non-ASCII chars in `strPasteBuffer` produce platform-dependent results — Windows uses `VkKeyScan` per char, other platforms use a scancode table. For reliable unicode input, fall back to `keyboard.tap` per-key with explicit shift/altgr modifiers.
-- **`makeReplyOk` / `makeReplyError` were moved** from `agent.cpp`'s anonymous namespace into the `agent` namespace. If you write any new dispatch handler in `agent.cpp` itself, the helpers are still there at file scope — no change to call sites.
-- **The keymap test (`TableCoversEnumRange`) will fail loudly** if `KBD_KEYS` ever gains or loses a value and `agent_keyboard.cpp`'s table isn't updated to match. Treat that as a useful trip-wire, not a flake.
-- **`ParseCommand` is still not headless-safe.** Iteration 5 fixes it. Until then, any `debugger.command` issued before the curses debugger has been opened can crash inside `DEBUG_BeginPagedContent`.
+- **`debugger.entered` always reports `reason:"breakpoint"`.** Plan distinguishes breakpoint / manual / int3 / sysenter; we only emit one signal. Differentiate when a real consumer needs it.
+- **`AGENT_IsHeadless()` is true whenever the agent is started.** No way to run agent + curses concurrently today. Acceptable for Phase 1; trade-off documented.
+- **The `cpu.pause` then `RUN` race** when `debugrunmode==1` ("Run Normal"): the user sees `state.paused` then immediately `state.running`. Accurate but possibly confusing. Document in the smoke doc if users hit it.
+- **`AGENT_Poll(true)` runs once per `DEBUG_Loop` iteration** which is paced by `SDL_Delay(1)` — same 1 ms cadence as the tick handler. Two pollers, but `serverPoll` is idempotent.
+- **`bp_index` is iteration order, not a stable handle.** If breakpoints get added/removed between hits, the index a client receives for the same breakpoint changes. Iteration 7+ should switch to a stable ID when it adds `bp.add` / `bp.list` / `bp.del`.
 
 ## End-of-session checklist (for whoever closes the next session)
 

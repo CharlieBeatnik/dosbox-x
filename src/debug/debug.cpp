@@ -50,6 +50,7 @@ using namespace std;
 #include "../cpu/lazyflags.h"
 #include "keyboard.h"
 #include "control.h"
+#include "agent.h"
 
 bool Clear_SYSENTER_Debug();
 bool Toggle_BreakSYSEnter();
@@ -735,11 +736,13 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
 	if (BPoints.empty()) return false;
 
 	// Search matching breakpoint
-	for (auto i = BPoints.begin(); i != BPoints.end(); ++i) {
+	int bp_index = 0;
+	for (auto i = BPoints.begin(); i != BPoints.end(); ++i, ++bp_index) {
 		CBreakpoint *bp = (*i);
 
 		if ((bp->GetType() == BKPNT_PHYSICAL) && bp->IsActive() &&
 		    (bp->GetLocation() == GetAddress(seg, off))) {
+			AGENT_EmitBpHit(seg, off, bp_index);
 			// Found
 			if (bp->GetOnce()) {
 				// delete it, if it should only be used once
@@ -783,6 +786,7 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
                         return false;
                     }
 					DEBUG_ShowMsg("DEBUG: Memory breakpoint %s: %04X:%04X - %02X -> %02X\n",(bp->GetType()==BKPNT_MEMORY_PROT)?"(Prot)":"",bp->GetSegment(),bp->GetOffset(),bp->GetValue(),value);
+					AGENT_EmitBpHit(seg, off, bp_index);
 					bp->SetValue(value);
 					return true;
 				}
@@ -2639,8 +2643,9 @@ bool ParseCommand(char* str) {
 		mainMenu.get_item("debugger_runnormal").check(true).refresh_item(mainMenu);
 		mainMenu.get_item("debugger_runwatch").check(false).refresh_item(mainMenu);
 
-		DOSBOX_SetNormalLoop();	
+		DOSBOX_SetNormalLoop();
 		GFX_SetTitle(-1,-1,-1,is_paused);
+		AGENT_EmitStateRunning();
 		return true;
 	}
 
@@ -2658,6 +2663,7 @@ bool ParseCommand(char* str) {
 		mainMenu.get_item("debugger_runnormal").check(false).refresh_item(mainMenu);
 		mainMenu.get_item("debugger_runwatch").check(true).refresh_item(mainMenu);
 		DEBUG_DrawScreen();
+		AGENT_EmitStateRunning();
 		return true;
 	}
 
@@ -4325,6 +4331,11 @@ int32_t DEBUG_Run(int32_t amount,bool quickexit) {
 }
 
 uint32_t DEBUG_CheckKeys(void) {
+	/* When the curses debugger has not been initialised (e.g. headless
+	 * agent-driven debugging), there is no stdscr for `getch` to read
+	 * from. Bail out immediately rather than crash inside pdcurses. */
+	if (dbg.win_main == NULL) return 0;
+
 	Bits ret=0;
 	bool numberrun = false;
 	bool skipDraw = false;
@@ -4811,6 +4822,7 @@ Bitu DEBUG_Loop(void) {
             mainMenu.get_item("debugger_runwatch").check(false).refresh_item(mainMenu);
             DOSBOX_SetNormalLoop();
             DrawRegistersUpdateOld();
+            AGENT_EmitStateRunning();
             return 0;
         }
 
@@ -4840,7 +4852,8 @@ Bitu DEBUG_Loop(void) {
             DEBUG_RefreshPage(0);
         }
 
-    	return DEBUG_CheckKeys();
+        AGENT_Poll(true);
+        return DEBUG_CheckKeys();
     }
 }
 
@@ -5653,11 +5666,22 @@ Bitu DEBUG_EnableDebugger(void)
 {
 	exitLoop = true;
 
-	if (!debugging || (debugging && debug_running))
+	const bool wasRunning = !debugging || (debugging && debug_running);
+	if (wasRunning)
 		DEBUG_Enable_Handler(true);
 
 	CPU_CycleLeft += CPU_Cycles;
 	CPU_Cycles = 0;
+
+	/* Emit debugger.entered + state.paused exactly once per transition
+	 * from running -> paused, regardless of trigger source. Note: for
+	 * debugrunmode != 0 the Enable_Handler above immediately issues
+	 * RUN/RUNWATCH which will emit state.running, so the agent sees the
+	 * pair in that order — accurate but transient. */
+	if (wasRunning && debugging && !debug_running) {
+		AGENT_EmitDebuggerEntered("breakpoint");
+		AGENT_EmitStatePaused();
+	}
 	return 0;
 }
 
@@ -5688,6 +5712,9 @@ void DBGBlock::set_data_view(unsigned int view) {
 }
 
 void DEBUG_SetupConsole(void) {
+	/* Agent owns the debugger UI — don't open a console / curses session. */
+	if (AGENT_IsHeadless()) return;
+
 	if (dbg.win_main == NULL) {
         LOG(LOG_MISC, LOG_DEBUG)("DEBUG_SetupConsole initializing GUI");
 
@@ -5697,7 +5724,7 @@ void DEBUG_SetupConsole(void) {
 		WIN32_Console();
 #else
 		tcgetattr(0,&consolesettings);
-#endif	
+#endif
 		//	dbg.active_win=3;
 		/* Start the Debug Gui */
 		DBGUI_StartUp();
@@ -5908,6 +5935,7 @@ static void OutputVecTable(char* filename) {
 
 #define DEBUG_VAR_BUF_LEN 16
 static void DrawVariables(void) {
+	if (dbg.win_var == NULL) return;
 	if (CDebugVar::varList.empty()) return;
 
 	char buffer[DEBUG_VAR_BUF_LEN];

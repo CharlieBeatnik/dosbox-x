@@ -26,6 +26,8 @@
 #include "agent.h"
 #include "agent_internal.h"
 
+#include <cstdio>
+
 namespace agent {
 
 /* Single-threaded: the agent only runs on the emulator main thread. */
@@ -52,14 +54,39 @@ void emitLogLine(const char *line) {
 
 /* ---- Public surface ----------------------------------------------------- */
 
-void AGENT_EmitBpHit(uint16_t /*seg*/, uint32_t /*off*/, int /*bp_index*/)
+void AGENT_EmitBpHit(uint16_t seg, uint32_t off, int bp_index)
 {
-    /* Iteration 5 will populate this. */
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+        "{\"event\":\"bp.hit\",\"seg\":%u,\"off\":%u,\"bp_index\":%d}",
+        static_cast<unsigned>(seg), static_cast<unsigned>(off), bp_index);
+    agent::serverBroadcastLine(buf);
 }
 
 void AGENT_EmitLog(const char *line)
 {
     agent::emitLogLine(line);
+}
+
+void AGENT_EmitDebuggerEntered(const char *reason)
+{
+    char buf[128];
+    /* `reason` is one of a fixed set of literals ("breakpoint", "manual",
+     * "int3", "sysenter") so no escaping needed. */
+    snprintf(buf, sizeof(buf),
+        "{\"event\":\"debugger.entered\",\"reason\":\"%s\"}",
+        reason ? reason : "unknown");
+    agent::serverBroadcastLine(buf);
+}
+
+void AGENT_EmitStateRunning(void)
+{
+    agent::serverBroadcastLine("{\"event\":\"state.running\"}");
+}
+
+void AGENT_EmitStatePaused(void)
+{
+    agent::serverBroadcastLine("{\"event\":\"state.paused\"}");
 }
 
 #endif /* C_DEBUG */

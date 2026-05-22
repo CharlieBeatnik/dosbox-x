@@ -44,7 +44,6 @@ namespace {
 bool g_started        = false;     /* did we register the tick handler / start the server? */
 bool g_tickInstalled  = false;
 bool g_exitInstalled  = false;
-bool g_headless       = false;     /* not driven yet — set in iteration 5 */
 
 void agentShutdown(Section * /*sec*/) {
     /* Exit callback. AGENT_Stop is declared in agent.h above. */
@@ -162,6 +161,23 @@ JsonValue handleLogUnsubscribe(double id, const JsonValue & /*args*/) {
     return makeReplyOk(id, std::move(r));
 }
 
+/* cpu.pause / cpu.run — route through the existing debugger entry points.
+ * Both are forward-declared here because including debug.h would pull a
+ * lot more than we need (and that header isn't exposed via the include
+ * path the agent subsystem uses). */
+JsonValue handleCpuPause(double id, const JsonValue & /*args*/) {
+    Bitu DEBUG_EnableDebugger(void);
+    DEBUG_EnableDebugger();
+    return makeReplyOk(id, JsonObject{});
+}
+
+JsonValue handleCpuRun(double id, const JsonValue & /*args*/) {
+    bool ParseCommand(char *);
+    char cmd[] = "RUN";
+    ParseCommand(cmd);
+    return makeReplyOk(id, JsonObject{});
+}
+
 }  /* anonymous namespace */
 
 JsonValue makeReplyOk(double id, JsonObject result) {
@@ -217,6 +233,8 @@ std::string dispatchLine(const std::string &line) {
     if (cmd->s == "keyboard.press")    return jsonEncode(handleKeyboardPress(id, a));
     if (cmd->s == "keyboard.release")  return jsonEncode(handleKeyboardRelease(id, a));
     if (cmd->s == "keyboard.tap")      return jsonEncode(handleKeyboardTap(id, a));
+    if (cmd->s == "cpu.pause")         return jsonEncode(handleCpuPause(id, a));
+    if (cmd->s == "cpu.run")           return jsonEncode(handleCpuRun(id, a));
 
     return jsonEncode(makeReplyError(id, "unknown_cmd",
         std::string("unknown command: ") + cmd->s));
@@ -269,7 +287,11 @@ void AGENT_OnLoopChange(void) {
 }
 
 bool AGENT_IsHeadless(void) {
-    return agent::g_headless;
+    /* For Phase 1 the agent owns the debugger UI whenever the listener is
+     * up. Granular control (e.g. agent + curses concurrently) can be
+     * revisited later; the loss is that pressing Alt-Pause with the agent
+     * active no longer pops a curses window. */
+    return agent::g_started;
 }
 
 #endif /* C_DEBUG */
