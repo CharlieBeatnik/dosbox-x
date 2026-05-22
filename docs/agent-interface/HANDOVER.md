@@ -5,9 +5,9 @@
 ## State
 
 - **Branch:** `agent-interface`.
-- **Last commit on branch (about to land):** the Iteration 2 commit. Verify with `git log --oneline -5` once committed; before the commit, `git status` will show the changes listed below.
-- **Build status:** *Not verified in this session.* Same as previous session — Windows host without a compiler toolchain. Code review and protocol logic only.
-- **Test status:** New unit tests added (`tests/agent_protocol_tests.cpp`); not run.
+- **Last commit on branch:** `7878e1d24 agent: TCP listener, JSON framing, vm.version`. Confirm with `git log --oneline -5`.
+- **Build status:** **Verified.** VS Debug x64 (v143 toolset) compiles cleanly — 0 errors, 1086 pre-existing warnings, ~36s. Build command (on this Windows host): launch a "Developer Command Prompt for VS 2022" (sets up MSBuild + MSVC env), then `msbuild vs\dosbox-x.sln /property:GenerateFullPaths=true /p:Configuration=Debug /p:Platform=x64 /p:PlatformToolset=v143 -m`. Output exe at `bin/x64/Debug/dosbox-x.exe`.
+- **Test status:** **Verified.** All 17 `AgentProtocolTest` cases pass. Run with `dosbox-x.exe -tests "--gtest_filter=AgentProtocol*" "--gtest_output=xml:out.xml"` — DOSBox-X's option parser warns on `--gtest_filter` ("Unknown option ... first parsing stage") but the arg still reaches Google Test via the unmodified argv, so the filter works. The XML output sidesteps a separate issue where DOSBox-X's Win32 stdio handling drops console writes after the test runner exits.
 
 ## What was just done — Iteration 2
 
@@ -31,20 +31,17 @@ Files modified:
 
 Start **Iteration 3** in `TASKS.md`: debugger pass-through (`debugger.command`) and log tee.
 
-**Verify Iteration 2 build first** before adding new code — every commit since Iteration 1 has shipped uncompiled. Highest-leverage check, in order:
+**Outstanding manual checks** before pushing further into iteration 3:
 
-1. `./build-debug` on Linux/macOS or VS Debug-SDL2 x64. The agent + tests are under `#if C_DEBUG`; a release build will silently elide them.
-2. `./dosbox-x -tests --gtest_filter=AgentProtocol*` — expect 13 tests to pass. If one of the `RejectsControlCharInString` / surrogate-pair tests fails on a particular compiler, the JSON code likely has a portability slip; fix before iteration 3.
-3. Boot with `-agent-listen 127.0.0.1:0 -agent-portfile /tmp/dbxport`. Confirm: a log line "agent: listening on 127.0.0.1:NNNNN" appears, the portfile contains that NNNNN, and a Python one-liner can connect & receive a reply:
+1. Boot with `-agent-listen 127.0.0.1:0 -agent-portfile dbxport.txt`. Confirm a log line `agent: listening on 127.0.0.1:NNNNN` appears, `dbxport.txt` contains that NNNNN, and a Python one-liner can connect & receive a reply:
    ```python
-   import socket, json
-   s = socket.create_connection(("127.0.0.1", int(open("/tmp/dbxport").read().strip())))
+   import socket
+   s = socket.create_connection(("127.0.0.1", int(open("dbxport.txt").read().strip())))
    s.sendall(b'{"id":1,"cmd":"vm.version"}\n')
    print(s.makefile().readline())
    ```
-4. Boot with **no** agent flags. Confirm `netstat -ano` / `ss -tlnp` shows no new listening socket and no `agent:` line in the log. This is the crucial "release-build is byte-identical" guarantee.
-
-**If the build fails:** the most likely culprits are (a) the `SDL_net.h` include path differing between SDL1 and SDL2 builds — the `#if defined(C_SDL2_NET) && C_SDL2_NET` block in `agent_server.cpp` mirrors what `misc_util.cpp` does, so any divergence there will catch up to us; (b) MSVC complaining about `snprintf` (handled — we use `<cstdio>`); (c) `Section_prop` / `control` symbols not visible — `agent.cpp` includes `control.h` and `setup.h`.
+2. Boot with **no** agent flags. Confirm `netstat -ano | grep LISTENING` shows no new listening socket and no `agent:` line in the log. This is the "release-build is byte-identical" guarantee.
+3. Verify the Linux/macOS build still works (`./build-debug`) — only VS x64 has been exercised so far. SDL2 builds should be equivalent but the `#if defined(C_SDL2_NET) && C_SDL2_NET` branch in `agent_server.cpp` only exercises on those.
 
 ## Open decisions / gotchas
 

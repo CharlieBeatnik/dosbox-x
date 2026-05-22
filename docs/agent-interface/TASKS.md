@@ -42,9 +42,9 @@ Goal: external clients can connect, exchange JSON, and call one trivial command.
 - [x] One implemented command: `vm.version` → `{ "version": "...", "machine": "...", "build": "..." }`.
 - [x] Per-client outbox `std::deque<std::string>` with 1 MB cap. Overflow drops the line and emits `agent.overflow` once room frees.
 - [x] `tests/agent_protocol_tests.cpp` — JSON encode/decode round-trip + dispatch sanity. Registered in `tests/tests.h`.
-- [~] `./dosbox-x -tests --gtest_filter=AgentProtocol*` passes. **Not run in this session** (no compiler toolchain on Windows host).
-- [~] Manual: connect from a Python one-liner, get a reply. **Not run in this session** (no build).
-- [ ] Commit `agent: TCP listener, JSON framing, vm.version`.
+- [x] `./dosbox-x -tests --gtest_filter=AgentProtocol*` passes. Verified on VS Debug x64 build: 17/17 tests pass (0.005s, gtest XML output).
+- [~] Manual: connect from a Python one-liner, get a reply. **Not exercised in this session** — only the unit tests were run, not a full boot with `-agent-listen`.
+- [x] Commit `agent: TCP listener, JSON framing, vm.version` — `7878e1d24`.
 
 ### Iteration 2 — open issues for the next session
 
