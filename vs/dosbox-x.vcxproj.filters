@@ -4,6 +4,9 @@
     <Filter Include="Sources">
       <UniqueIdentifier>{8dbaf89d-8c9d-42a3-b8a4-a60a4c5aef56}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Sources\agent">
+      <UniqueIdentifier>{8c4b6e54-2f4d-4d3b-9f3a-1a0b6c5d2e7a}</UniqueIdentifier>
+    </Filter>
     <Filter Include="Sources\aviwriter">
       <UniqueIdentifier>{a1ec8d2a-54a6-4ea0-bf63-61f7449b66b6}</UniqueIdentifier>
     </Filter>
@@ -824,6 +827,21 @@
     </ClCompile>
     <ClCompile Include="..\src\debug\debug_win32.cpp">
       <Filter>Sources\debug</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\agent\agent.cpp">
+      <Filter>Sources\agent</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\agent\agent_server.cpp">
+      <Filter>Sources\agent</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\agent\agent_json.cpp">
+      <Filter>Sources\agent</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\agent\agent_keyboard.cpp">
+      <Filter>Sources\agent</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\agent\agent_events.cpp">
+      <Filter>Sources\agent</Filter>
     </ClCompile>
     <ClCompile Include="..\src\dosbox.cpp">
       <Filter>Sources</Filter>
@@ -1989,6 +2007,9 @@
       <Filter>Includes</Filter>
     </ClInclude>
     <ClInclude Include="..\include\clockdomain.h">
+      <Filter>Includes</Filter>
+    </ClInclude>
+    <ClInclude Include="..\include\agent.h">
       <Filter>Includes</Filter>
     </ClInclude>
     <ClInclude Include="..\include\control.h">

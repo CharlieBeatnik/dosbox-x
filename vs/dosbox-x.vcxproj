@@ -1155,6 +1155,11 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClCompile Include="..\src\debug\debug_disasm.cpp" />
     <ClCompile Include="..\src\debug\debug_gui.cpp" />
     <ClCompile Include="..\src\debug\debug_win32.cpp" />
+    <ClCompile Include="..\src\agent\agent.cpp" />
+    <ClCompile Include="..\src\agent\agent_server.cpp" />
+    <ClCompile Include="..\src\agent\agent_json.cpp" />
+    <ClCompile Include="..\src\agent\agent_keyboard.cpp" />
+    <ClCompile Include="..\src\agent\agent_events.cpp" />
     <ClCompile Include="..\src\dosbox.cpp" />
     <ClCompile Include="..\src\dos\cdrom.cpp" />
     <ClCompile Include="..\src\dos\cdrom_aspi_win32.cpp" />
@@ -1623,6 +1628,7 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClInclude Include="..\include\keymap.h" />
     <ClInclude Include="..\include\midi.h" />
     <ClInclude Include="..\include\ptrop.h" />
+    <ClInclude Include="..\include\agent.h" />
     <ClInclude Include="..\include\builtin.h" />
     <ClInclude Include="..\include\callback.h" />
     <ClInclude Include="..\include\clockdomain.h" />

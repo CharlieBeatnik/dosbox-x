@@ -4603,6 +4603,27 @@ void DOSBOX_SetupConfigSections(void) {
     Pint->Set_help("(in milliseconds) if nonzero: the time the page will be ejected automatically after when no more data arrives at the printer.");
     Pint->SetBasic(true);
 
+#if C_DEBUG
+    /* Agent control channel. Programmatic access to the built-in debugger
+     * and to keyboard/mouse input. Loopback-only; off by default. See
+     * docs/agent-interface/PLAN.md. */
+    secprop = control->AddSection_prop("agent", &Null_Init);
+    Pbool = secprop->Add_bool("enabled", Property::Changeable::OnlyAtStart, false);
+    Pbool->Set_help("Enable the agent control channel. When enabled, DOSBox-X listens on the address given by 'listen' for JSON commands\n"
+                    "that drive the built-in debugger and inject keyboard input. Loopback only.");
+
+    Pstring = secprop->Add_string("listen", Property::Changeable::OnlyAtStart, "127.0.0.1:0");
+    Pstring->Set_help("Address and port the agent control channel listens on. Must be on 127.0.0.1 / ::1. Port 0 selects an ephemeral port,\n"
+                      "which is then written to 'portfile' (or printed to the log).");
+
+    Pstring = secprop->Add_string("portfile", Property::Changeable::OnlyAtStart, "");
+    Pstring->Set_help("If set, the agent's listening port number is written to this file once the listener is ready.");
+
+    Pstring = secprop->Add_string("auth_token", Property::Changeable::OnlyAtStart, "");
+    Pstring->Set_help("If set, the first JSON message from any agent client must include {\"token\":\"...\"} matching this value.\n"
+                      "If empty, no token check is performed (loopback is the only protection).");
+#endif
+
     /* All the DOS Related stuff, which will eventually start up in the shell */
     secprop=control->AddSection_prop("dos",&Null_Init,false);//done
     Pbool = secprop->Add_bool("xms",Property::Changeable::WhenIdle,true);

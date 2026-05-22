@@ -4,27 +4,45 @@
 
 ## State
 
-- **Branch:** `agent-interface` (just created off `master`).
-- **Last commit:** the scaffold commit on this branch (run `git log --oneline -1 -- docs/agent-interface/` to see the SHA).
-- **Build status:** Unchanged from `master`; no source under `src/` or `include/` modified yet.
-- **Test status:** Unchanged from `master`.
+- **Branch:** `agent-interface`.
+- **Last commit:** the Iteration 1 scaffold commit. Run `git log --oneline -5` to confirm.
+- **Build status:** *Not verified in this session.* No Linux/macOS/MinGW toolchain was available in the previous session. The Iteration-1 changes were prepared with care but have not been compiled.
+- **Test status:** Unchanged from `master` (no test files added in Iteration 1).
 
-## What was just done
+## What was just done — Iteration 1
 
-Iteration 0 only — created `PLAN.md`, `TASKS.md`, and this file on a fresh branch `agent-interface`. No code changes yet, no Makefile or VS project edits. The repo on `master` is byte-identical for everything outside `docs/agent-interface/`.
+Wired the empty agent skeleton in. Behaviour of the emulator is unchanged: the CLI flags parse and store values, the `[agent]` config section registers under `#if C_DEBUG`, but no socket is opened, no thread is created, no log message printed.
+
+Files added:
+- `include/agent.h` — public surface, inline-noop in non-debug builds.
+- `src/agent/agent.cpp` — empty `AGENT_StartIfRequested / AGENT_Stop / AGENT_Poll / AGENT_OnLoopChange / AGENT_IsHeadless`.
+- `src/agent/agent_server.cpp`, `agent_json.cpp`, `agent_keyboard.cpp` — empty TUs (compile but contain nothing yet under `#if C_DEBUG`).
+- `src/agent/agent_events.cpp` — empty `AGENT_EmitBpHit / AGENT_EmitLog`.
+- `src/agent/Makefile.am` — builds `libagent.a` from the five `.cpp` files.
+
+Files modified:
+- `include/control.h` — three new string fields `opt_agent_listen / opt_agent_portfile / opt_agent_token`.
+- `src/gui/sdlmain.cpp` — parse `-agent-listen / -agent-portfile / -agent-token`; help text in `-helpdebug`.
+- `src/dosbox.cpp` — `[agent]` config section, gated on `#if C_DEBUG`.
+- `src/Makefile.am` — added `agent` to `SUBDIRS` and `agent/libagent.a` as the first entry in `dosbox_x_LDADD`.
+- `vs/dosbox-x.vcxproj` and `.vcxproj.filters` — five `ClCompile` entries and one `ClInclude` for `agent.h`, plus a new `Sources\agent` filter.
 
 ## What to do next
 
-Start **Iteration 1** in `TASKS.md`: scaffold `src/agent/`, add the CLI flags, add the `[agent]` config section. Behaviour of the emulator stays identical after Iteration 1 — flags are parsed but do nothing.
+Start **Iteration 2** in `TASKS.md`: TCP server, JSON framing, `vm.version`. The agent now goes from no-op to listening-on-demand.
 
-Key pointers before you start:
-- The full file-by-file reuse map is in `PLAN.md` § "Reuse — don't reinvent". Open it once before touching code.
-- Iteration 1 is light: ~7 files created, ~3 files lightly modified, no behavior change. Should fit comfortably in one session.
-- The Visual Studio project changes (`vs/dosbox-x.vcxproj` and `.filters`) must touch all four Debug configurations (Win32/x64 × SDL1/SDL2). Release configs are intentionally untouched (`C_DEBUG` is off there).
+**Verify the Iteration-1 build first** before touching new code:
+1. Pick a build script that matches your environment (`./build-debug` on Linux/macOS, `./build-mingw` for MinGW, or VS Debug-SDL2 x64). The build must include `C_DEBUG` for libagent to contain any code at all.
+2. Run `./dosbox-x --helpdebug` and confirm the three `-agent-*` lines appear.
+3. Boot a normal session without `-agent-*` flags — should be byte-identical behaviour. Verify with `netstat`/`ss` that no new listening socket appears (it shouldn't — `AGENT_StartIfRequested` is empty).
+4. **If the build fails**, the most likely cause is a typo in the C_DEBUG guards or a header include. The agent code is intentionally trivial; treat any build error as easy to fix and don't proceed to Iteration 2 until clean.
+5. Once a build is in hand, run `./update-dosbox-x-reference-conf` to confirm the reference conf is unchanged (it should be, since `[agent]` is `#if C_DEBUG`-gated and the existing conf is generated from a non-debug build).
 
 ## Open decisions / gotchas
 
-None at scaffold time. Future agents: add anything here that the next agent must know but is not yet captured in `PLAN.md`. Keep the list short — if a decision is permanent, fold it into `PLAN.md` and remove it from here.
+- **VS project wiring deviates from the plan:** TASKS.md Iteration 1 said "four debug configurations only", but `src/debug/*` is wired unconditionally in `vs/dosbox-x.vcxproj`, and `vs/config.h` hard-codes `C_DEBUG 1` for all VS builds. So the agent files were added unconditionally too. The `#if C_DEBUG` guards in source are the real gate. If we later want a "release without C_DEBUG" VS configuration, both `src/debug/*` and `src/agent/*` need the same per-config exclusion treatment — they're a pair.
+- **Reference conf not regenerated** — see Iteration-1 task notes in `TASKS.md`. Next session with a built binary should run `./update-dosbox-x-reference-conf` and commit any unexpected diff (none expected).
+- **`Property::Changeable::OnlyAtStart` used for all four agent settings.** Intentional: starting/stopping the listener on a live config change isn't supported and isn't worth supporting in Phase 1.
 
 ## End-of-session checklist (for whoever closes the next session)
 

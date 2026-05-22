@@ -7460,6 +7460,10 @@ bool DOSBOX_parse_argv() {
             fprintf(stderr,"  -log-fileio                             Log file I/O through INT 21h (debug level)\n");
             fprintf(stderr,"  -nolog                                  Do not log anything to log file\n");
             fprintf(stderr,"  -tests                                  Run unit tests to test the DOSBox-X code\n");
+            fprintf(stderr,"  -agent-listen <addr:port>               Start the agent control channel on the given address (loopback only).\n");
+            fprintf(stderr,"                                          Port 0 picks an ephemeral port. Implies [agent] enabled=true.\n");
+            fprintf(stderr,"  -agent-portfile <path>                  Write the listening port number to this file once the agent is ready.\n");
+            fprintf(stderr,"  -agent-token <hex>                      Require this token on the first JSON message of each agent connection.\n");
             fprintf(stderr,"  -print-ticks                            (Debug) Print emulator time and SDL_GetTicks()\n");
             fprintf(stderr,"  -force-gfx-hardware                     Force render scaler system to act as if GFX_HARDWARE\n");
             fprintf(stderr,"\n");
@@ -7517,6 +7521,15 @@ bool DOSBOX_parse_argv() {
             control->opt_console = true;
             control->opt_nomenu = true;
             control->opt_fastlaunch = true;
+        }
+        else if (optname == "agent-listen" || optname == "agent_listen") {
+            if (!control->cmdline->NextOptArgv(control->opt_agent_listen)) return false;
+        }
+        else if (optname == "agent-portfile" || optname == "agent_portfile") {
+            if (!control->cmdline->NextOptArgv(control->opt_agent_portfile)) return false;
+        }
+        else if (optname == "agent-token" || optname == "agent_token") {
+            if (!control->cmdline->NextOptArgv(control->opt_agent_token)) return false;
         }
         else if (optname == "exit") {
             control->opt_exit = true;
