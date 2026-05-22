@@ -1,6 +1,6 @@
 # Agent interface — task list
 
-**Current iteration:** Iteration 3
+**Current iteration:** Iteration 4
 **Branch:** `agent-interface`
 
 `[ ]` not started · `[~]` in progress (note who/when) · `[x]` done (note commit SHA)
@@ -57,12 +57,19 @@ Goal: external clients can connect, exchange JSON, and call one trivial command.
 
 Goal: agent can issue any of the existing 88 debugger commands and read their output.
 
-- [ ] `debugger.command` command in `agent.cpp` → installs a per-request `DEBUG_ShowMsg` capture buffer (using a thread-local-ish static guarded by the existing `in_debug_showmsg`), calls `ParseCommand`, returns captured output as `{output: "..."}`.
-- [ ] Tap `DEBUG_ShowMsg` in `src/debug/debug_gui.cpp:714` to forward formatted `buf[]` to `AGENT_EmitLog`.
-- [ ] `log.subscribe` / `log.unsubscribe` commands; `log.line` events only sent to subscribers.
-- [ ] `tests/agent_dispatch_tests.cpp` — fixture invokes `AGENT_DispatchJson` with `BPLIST`, `D 0:0 16`, `R`, asserts captured output looks right.
-- [ ] Manual: `debugger.command BPLIST` returns empty list; `debugger.command D 0:0 16` returns a memory hexdump.
+- [x] `debugger.command` command in `agent.cpp` → installs a per-request capture buffer via `agent::captureBegin/End`, calls `ParseCommand` on a writable buffer, returns `{output, recognized}`.
+- [x] Tap `DEBUG_ShowMsg` in `src/debug/debug_gui.cpp` (just after the newline strip) calls `AGENT_EmitLog(buf)`.
+- [x] `log.subscribe` / `log.unsubscribe` commands; per-client `logSubscribed` flag in the Client struct. `serverEmitLogLine` enqueues `{event:"log.line",text:"..."}` only for the subscribed client.
+- [x] `tests/agent_dispatch_tests.cpp` — 7 cases covering the capture state machine (begin/append/end, idempotent end, overwrite semantics) + dispatch routing (debugger.command missing-text, log.subscribe/unsubscribe without a client). **Deviation from plan:** the plan called for fixture-driven `BPLIST` / `D 0:0 16` / `R` ParseCommand round-trips, but ParseCommand depends on the curses debugger being initialized — `dbg.win_out` is NULL inside `-tests` mode, so most commands would crash. Headless ParseCommand support lands in iteration 5; covering ParseCommand end-to-end in unit tests waits for that.
+- [~] Manual: `debugger.command BPLIST` returns empty list; `debugger.command D 0:0 16` returns a memory hexdump. **Not exercised in this session** — needs a live boot with `-agent-listen` *and* curses up (Alt-Pause / Alt-F12). Verify once iteration 5 lands the headless path; until then this only works after the user has opened the debugger.
+- [x] Verify build (VS Debug x64): 0 errors. Tests: 24/24 pass (17 protocol + 7 dispatch).
 - [ ] Commit `agent: ParseCommand pass-through and log tee`.
+
+### Iteration 3 — open issues for the next session
+
+- **Most ParseCommand commands need curses.** Calling `debugger.command BPLIST` against a freshly-booted DOSBox-X (no debugger window) will crash inside `DEBUG_BeginPagedContent` (dereferences `dbg.win_out`). Iteration 5 fixes this with `AGENT_IsHeadless()` guards. Until then, the agent client should only send `debugger.command` after a `debugger.entered` event, OR after the user has opened the debugger interactively.
+- **Capture nesting is overwrite, not stack.** `captureBegin` while a capture is active loses the outer pointer (documented in `CaptureCanBeNested` test). Not a problem today — `debugger.command` is the only caller — but worth knowing if iteration 7+ adds more capture sites.
+- **Log subscription has no replay / backlog.** A client that subscribes mid-session sees only future log lines. The first iteration consumer (Claude Code) starts subscribed at connect time, so this is fine.
 
 ## Iteration 4 — keyboard injection
 

@@ -5,55 +5,65 @@
 ## State
 
 - **Branch:** `agent-interface`.
-- **Last commit on branch:** `7878e1d24 agent: TCP listener, JSON framing, vm.version`. Confirm with `git log --oneline -5`.
-- **Build status:** **Verified.** VS Debug x64 (v143 toolset) compiles cleanly — 0 errors, 1086 pre-existing warnings, ~36s. Build command (on this Windows host): launch a "Developer Command Prompt for VS 2022" (sets up MSBuild + MSVC env), then `msbuild vs\dosbox-x.sln /property:GenerateFullPaths=true /p:Configuration=Debug /p:Platform=x64 /p:PlatformToolset=v143 -m`. Output exe at `bin/x64/Debug/dosbox-x.exe`.
-- **Test status:** **Verified.** All 17 `AgentProtocolTest` cases pass. Run with `dosbox-x.exe -tests "--gtest_filter=AgentProtocol*" "--gtest_output=xml:out.xml"` — DOSBox-X's option parser warns on `--gtest_filter` ("Unknown option ... first parsing stage") but the arg still reaches Google Test via the unmodified argv, so the filter works. The XML output sidesteps a separate issue where DOSBox-X's Win32 stdio handling drops console writes after the test runner exits.
+- **Last commit on branch:** about to land — `agent: ParseCommand pass-through and log tee`. Confirm with `git log --oneline -5`.
+- **Build status:** **Verified.** VS Debug x64 (v143 toolset) compiles cleanly: 0 errors. See `~/.claude/projects/D--data-Git-dosbox-x/memory/reference_windows_build.md` for the exact PowerShell invocation that imports the VS env and runs `msbuild`.
+- **Test status:** **Verified.** All 24 agent tests pass (17 `AgentProtocolTest`, 7 `AgentDispatchTest`).
 
-## What was just done — Iteration 2
+## What was just done — Iteration 3
 
-The agent now listens. When `-agent-listen ADDR:PORT` (or `[agent] enabled=true`) is in effect, DOSBox-X opens a loopback TCP socket, accepts one client, drains newline-delimited JSON, and answers `vm.version`. With no flag and `enabled=false`, behaviour is byte-identical to master — no socket, no thread, no tick handler.
+The agent can now invoke any debugger command via `ParseCommand` and capture its output. Three new commands are dispatched:
+
+- `debugger.command {text}` → runs `ParseCommand`, returns `{output, recognized}`.
+- `log.subscribe` → flips the client's `logSubscribed` flag.
+- `log.unsubscribe` → clears it.
+
+Every `DEBUG_ShowMsg` call (which is what `LOG_MSG` resolves to) is now teed to the agent: if a capture is active, the line goes into the capture buffer; if a client is subscribed, the line is also emitted as `{event:"log.line",text:"..."}`.
 
 Files added:
-- `src/agent/agent_internal.h` — private header shared between agent TUs. Declares the `JsonValue` ADT, `jsonParse`/`jsonEncode`, the server lifecycle (`serverStart`/`serverStop`/`serverPoll`/`serverBroadcastLine`/`serverActive`), and `dispatchLine`.
-- `tests/agent_protocol_tests.cpp` — gTest coverage of the JSON parser/encoder edge cases (escapes, surrogate pairs, control-char rejection, number forms, round-trip) plus `dispatchLine` sanity (`vm.version`, unknown cmd, missing cmd, malformed JSON). 13 tests.
-
-Files filled in (previously empty under `#if C_DEBUG`):
-- `src/agent/agent_json.cpp` — hand-rolled parser + encoder. ~270 LOC. Encoder guarantees no literal `\n`/`\r` in output so framing is trivial.
-- `src/agent/agent_server.cpp` — SDL_net listener, single-client accept, per-client recv buffer with newline framing, 1 MB outbox cap with `agent.overflow` event. Loopback-only enforced by checking the resolved IP starts with 127.
-- `src/agent/agent.cpp` — `AGENT_StartIfRequested` resolves CLI → `[agent]` section, calls `serverStart`, registers `tickPoll` via `TIMER_AddTickHandler`, and installs an `AddExitFunction` shutdown hook. `dispatchLine` handles `vm.version`; all other commands return `unknown_cmd`.
+- `tests/agent_dispatch_tests.cpp` — 7 gTest cases. Pure capture-state-machine tests + dispatch routing checks that don't require `ParseCommand` to actually execute (it needs curses, which isn't up in `-tests` mode).
 
 Files modified:
-- `src/gui/sdlmain.cpp` — `#include "agent.h"`; call `AGENT_StartIfRequested()` immediately after `IPX_Init()` in the section-init block (`:~9752`).
-- `tests/tests.h` — `#include "agent_protocol_tests.cpp"`.
-- `vs/dosbox-x.vcxproj` + `.filters` — added `src/agent/agent_internal.h` as a ClInclude under `Sources\agent`.
+- `src/agent/agent_internal.h` — adds `serverSetLogSubscribed`, `serverEmitLogLine`, `captureBegin/captureEnd`, `emitLogLine` to the agent-private API.
+- `src/agent/agent_events.cpp` — implements the capture pointer (single-threaded plain static, no `thread_local`) and `AGENT_EmitLog` → `emitLogLine` plumbing.
+- `src/agent/agent_server.cpp` — adds `logSubscribed` flag to `Client`, `serverSetLogSubscribed`, and `serverEmitLogLine` (inline JSON encoder so this TU stays independent of agent_json.cpp).
+- `src/agent/agent.cpp` — three new command handlers + `<vector>` include; routes `debugger.command` / `log.subscribe` / `log.unsubscribe`.
+- `src/debug/debug_gui.cpp` — `#include "agent.h"`; one call to `AGENT_EmitLog(buf)` immediately after the newline-strip loop in `DEBUG_ShowMsg`.
+- `tests/tests.h` — `#include "agent_dispatch_tests.cpp"`.
 
 ## What to do next
 
-Start **Iteration 3** in `TASKS.md`: debugger pass-through (`debugger.command`) and log tee.
+Start **Iteration 4** in `TASKS.md`: keyboard injection. The plan is a key-name → `KBD_KEYS` table in `agent_keyboard.cpp` plus three commands: `keyboard.type`, `keyboard.press`/`release`/`tap`.
 
-**Outstanding manual checks** before pushing further into iteration 3:
+Helpful starting points:
+- The `KBD_KEYS` enum is in `include/keyboard.h:22-76`.
+- The paste driver lives in `src/misc/clipboard.cpp` — append into `strPasteBuffer` rather than reinventing modifier juggling.
+- `KEYBOARD_AddKey(KBD_KEYS, bool)` is the raw make/break entry point at `include/keyboard.h:78`.
 
-1. Boot with `-agent-listen 127.0.0.1:0 -agent-portfile dbxport.txt`. Confirm a log line `agent: listening on 127.0.0.1:NNNNN` appears, `dbxport.txt` contains that NNNNN, and a Python one-liner can connect & receive a reply:
-   ```python
-   import socket
-   s = socket.create_connection(("127.0.0.1", int(open("dbxport.txt").read().strip())))
-   s.sendall(b'{"id":1,"cmd":"vm.version"}\n')
-   print(s.makefile().readline())
-   ```
-2. Boot with **no** agent flags. Confirm `netstat -ano | grep LISTENING` shows no new listening socket and no `agent:` line in the log. This is the "release-build is byte-identical" guarantee.
-3. Verify the Linux/macOS build still works (`./build-debug`) — only VS x64 has been exercised so far. SDL2 builds should be equivalent but the `#if defined(C_SDL2_NET) && C_SDL2_NET` branch in `agent_server.cpp` only exercises on those.
+## Verifying iteration 3 manually (before iteration 4)
+
+The unit tests cover routing and capture, but not the live end-to-end. To exercise `debugger.command` against a real DOSBox-X you need curses up; for now that means:
+
+1. Start with `-agent-listen 127.0.0.1:0 -agent-portfile dbxport.txt`.
+2. Open the debugger interactively (Alt-Pause on Win/Linux, Alt-F12 on Mac).
+3. Connect a client and send `{"id":1,"cmd":"debugger.command","args":{"text":"BPLIST"}}\n`.
+4. Expect `{"id":1,"ok":true,"result":{"output":"Breakpoint list:\n...","recognized":true}}`.
+
+`debugger.command` against a process without curses initialized will crash inside `DEBUG_BeginPagedContent` (NULL `dbg.win_out`). Iteration 5 adds the `AGENT_IsHeadless()` guards needed to fix that.
+
+Also still outstanding from iteration 2:
+1. Confirm that, with **no** agent flags, no listening socket appears and no `agent:` line is emitted — the "byte-identical to upstream" guarantee.
+2. SDL2 / Linux / macOS build (`./build-debug` or `./build-debug-sdl2`).
 
 ## Open decisions / gotchas
 
-- **Auth token plumbed but not checked.** `serverStart` stores `auth_token`, no command rejects without it. Phase-1 loopback-only relies on the OS to protect us; the token is for the case where someone later adds remote access. Iteration 3 should add the gate (block all commands until `{"cmd":"auth.hello","args":{"token":"..."}}` is received) if remote access is on the roadmap; otherwise the gate can wait.
-- **Single client only.** Second concurrent connection gets `{"event":"busy"}` and is closed. PLAN.md § Out of scope says this is intentional.
-- **`SDLNet_TCP_GetPeerAddress` on a server socket** — SDL_net's docstring claims it returns NULL for server sockets, but in practice all implementations DOSBox-X targets return the bound address. If the portfile shows port 0 on some platform, fall back to `getsockname` via the `_TCPsocketX` struct hack used in `src/hardware/serialport/misc_util.cpp:~590`.
-- **The plan said `AGENT_StartIfRequested()` should be called at `sdlmain.cpp:~7512`.** That's CLI parsing — before config files load and before the PIC timer is running. Moved to the section-init block (`:~9752`, just after `IPX_Init`). Note this in PLAN.md if you touch it.
-- **No log tee yet.** `LOG_MSG` is not forwarded to the agent. Iteration 3 adds the tap at `debug_gui.cpp:714`.
+- **`ParseCommand` is not headless-safe.** Documented above; iteration 5 fixes it. The agent will happily crash a non-debugger DOSBox-X if it dispatches a command like `BPLIST` at the wrong time.
+- **Capture is single-level overwrite.** `captureBegin(B)` while another capture is active silently switches to `B`. Today this is fine — only `debugger.command` captures — but document if any new caller is added.
+- **`serverEmitLogLine` has its own inline JSON encoder** rather than going through `agent_json.cpp`. Intentional: the log tap is in the DEBUG_ShowMsg hot path, and dragging in `JsonValue` allocations per log line is wasted work. The encoder there is a stripped-down copy of `encodeString` from `agent_json.cpp` — keep them in sync if escape semantics ever change.
+- **Test mode disables most of the debugger.** `dbg.win_out` is NULL during `-tests`. Any future test that wants to drive `ParseCommand` needs to either build a curses stub or wait until iteration 5's headless path makes the commands safe.
 
 ## End-of-session checklist (for whoever closes the next session)
 
 1. Are all `[~]` items in the current iteration either `[x]` or backed out?
 2. Has the iteration pointer at the top of `TASKS.md` been advanced (if the iteration is done)?
 3. Is this `HANDOVER.md` rewritten (not appended) to reflect what the next agent walks into?
-4. Has the commit landed on `agent-interface`?
+4. Has the commit landed on `agent-interface` and been pushed?

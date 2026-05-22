@@ -110,6 +110,29 @@ void serverPoll();
  * `agent.overflow` event if the per-client outbox would exceed its cap. */
 void serverBroadcastLine(const std::string &line);
 
+/* Set the current (only) client's log-subscription flag. Returns true if
+ * a client is connected. */
+bool serverSetLogSubscribed(bool on);
+
+/* Append a single line as a `log.line` event to every subscribed client.
+ * The line is sent literally inside `text` (newlines stripped before
+ * encoding); never logs via DEBUG_ShowMsg so it is safe from inside the
+ * log-tee path. */
+void serverEmitLogLine(const char *text);
+
+/* ---- Log capture --------------------------------------------------------
+ * Used by `debugger.command` to gather any `DEBUG_ShowMsg` output produced
+ * by `ParseCommand` and return it to the caller. Single-threaded — the
+ * agent runs on the emulator main thread, so a plain static pointer is
+ * sufficient. */
+void captureBegin(std::string *into);
+void captureEnd();
+
+/* Called by the DEBUG_ShowMsg tap. Appends to the active capture (if any)
+ * and emits a log.line event to subscribed clients. Never recurses into
+ * the logging system. */
+void emitLogLine(const char *line);
+
 /* ---- Dispatch -----------------------------------------------------------
  * Receives one complete JSON object from a client and produces a response
  * line. Always returns a string ready to write back (with no trailing

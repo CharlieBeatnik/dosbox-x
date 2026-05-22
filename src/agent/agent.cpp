@@ -36,6 +36,7 @@
 
 #include <cstdio>
 #include <string>
+#include <vector>
 
 namespace agent {
 namespace {
@@ -140,6 +141,47 @@ JsonValue handleVmVersion(double id, const JsonValue & /*args*/) {
     return makeReplyOk(id, std::move(r));
 }
 
+/* `debugger.command` — invoke ParseCommand and return whatever
+ * DEBUG_ShowMsg writes during the call. ParseCommand modifies its char*
+ * argument, so we hand it a writable buffer. */
+JsonValue handleDebuggerCommand(double id, const JsonValue &args) {
+    const JsonValue *text = args.get("text");
+    if (!text || !text->isString()) {
+        return makeReplyError(id, "bad_args", "expected {\"text\":\"...\"}");
+    }
+
+    std::string captured;
+    std::vector<char> buf(text->s.begin(), text->s.end());
+    buf.push_back('\0');
+
+    bool ParseCommand(char *);
+
+    captureBegin(&captured);
+    bool ok = ParseCommand(buf.data());
+    captureEnd();
+
+    JsonObject r;
+    r.emplace("output",    JsonValue::makeString(std::move(captured)));
+    r.emplace("recognized", JsonValue::makeBool(ok));
+    return makeReplyOk(id, std::move(r));
+}
+
+JsonValue handleLogSubscribe(double id, const JsonValue & /*args*/) {
+    if (!serverSetLogSubscribed(true))
+        return makeReplyError(id, "no_client", "no connected client to subscribe");
+    JsonObject r;
+    r.emplace("subscribed", JsonValue::makeBool(true));
+    return makeReplyOk(id, std::move(r));
+}
+
+JsonValue handleLogUnsubscribe(double id, const JsonValue & /*args*/) {
+    if (!serverSetLogSubscribed(false))
+        return makeReplyError(id, "no_client", "no connected client");
+    JsonObject r;
+    r.emplace("subscribed", JsonValue::makeBool(false));
+    return makeReplyOk(id, std::move(r));
+}
+
 }  /* anonymous namespace */
 
 std::string dispatchLine(const std::string &line) {
@@ -167,7 +209,10 @@ std::string dispatchLine(const std::string &line) {
     JsonValue empty = JsonValue::makeObject();
     const JsonValue &a = (args && args->isObject()) ? *args : empty;
 
-    if (cmd->s == "vm.version") return jsonEncode(handleVmVersion(id, a));
+    if (cmd->s == "vm.version")        return jsonEncode(handleVmVersion(id, a));
+    if (cmd->s == "debugger.command")  return jsonEncode(handleDebuggerCommand(id, a));
+    if (cmd->s == "log.subscribe")     return jsonEncode(handleLogSubscribe(id, a));
+    if (cmd->s == "log.unsubscribe")   return jsonEncode(handleLogUnsubscribe(id, a));
 
     return jsonEncode(makeReplyError(id, "unknown_cmd",
         std::string("unknown command: ") + cmd->s));

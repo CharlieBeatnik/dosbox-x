@@ -61,6 +61,7 @@ struct Client {
     std::deque<std::string> outbox;
     size_t              outboxBytes = 0;
     bool                overflowPending = false;
+    bool                logSubscribed = false;
 };
 
 struct Server {
@@ -223,6 +224,45 @@ static void enqueueLine(Client &c, const std::string &line) {
 void serverBroadcastLine(const std::string &line) {
     if (!g.active || !g.client) return;
     enqueueLine(*g.client, line);
+}
+
+bool serverSetLogSubscribed(bool on) {
+    if (!g.active || !g.client) return false;
+    g.client->logSubscribed = on;
+    return true;
+}
+
+void serverEmitLogLine(const char *text) {
+    if (!g.active || !g.client || !g.client->logSubscribed || !text) return;
+    /* Inline JSON-encode to avoid pulling agent_json.cpp into this TU's
+     * dependency chain. Strings without high bytes / control chars only
+     * need quotes + a couple of escapes. DEBUG_ShowMsg's buf is already
+     * newline-stripped before we get here. */
+    std::string out;
+    out.reserve(32 + 16);
+    out.append("{\"event\":\"log.line\",\"text\":\"");
+    for (const char *p = text; *p; ++p) {
+        unsigned char c = static_cast<unsigned char>(*p);
+        switch (c) {
+            case '"':  out.append("\\\""); break;
+            case '\\': out.append("\\\\"); break;
+            case '\b': out.append("\\b");  break;
+            case '\f': out.append("\\f");  break;
+            case '\n': out.append("\\n");  break;
+            case '\r': out.append("\\r");  break;
+            case '\t': out.append("\\t");  break;
+            default:
+                if (c < 0x20) {
+                    char esc[8];
+                    snprintf(esc, sizeof(esc), "\\u%04x", c);
+                    out.append(esc);
+                } else {
+                    out.push_back(static_cast<char>(c));
+                }
+        }
+    }
+    out.append("\"}");
+    enqueueLine(*g.client, out);
 }
 
 static void acceptIfReady() {

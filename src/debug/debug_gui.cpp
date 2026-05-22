@@ -35,6 +35,7 @@
 #include "menu.h"
 #include "debug.h"
 #include "debug_inc.h"
+#include "agent.h"
 #include "pic.h"
 
 #include <stdexcept>
@@ -712,6 +713,8 @@ void DEBUG_ShowMsg(char const* format,...) {
 
     /* remove newlines if present */
     while (len > 0 && buf[len-1] == '\n') buf[--len] = 0;
+
+    AGENT_EmitLog(buf);
 
 #if C_DEBUG
 	if (dbg.win_out != NULL)
