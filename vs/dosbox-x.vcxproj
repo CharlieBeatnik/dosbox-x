@@ -1629,6 +1629,7 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClInclude Include="..\include\midi.h" />
     <ClInclude Include="..\include\ptrop.h" />
     <ClInclude Include="..\include\agent.h" />
+    <ClInclude Include="..\src\agent\agent_internal.h" />
     <ClInclude Include="..\include\builtin.h" />
     <ClInclude Include="..\include\callback.h" />
     <ClInclude Include="..\include\clockdomain.h" />

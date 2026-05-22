@@ -1,6 +1,6 @@
 # Agent interface — task list
 
-**Current iteration:** Iteration 2
+**Current iteration:** Iteration 3
 **Branch:** `agent-interface`
 
 `[ ]` not started · `[~]` in progress (note who/when) · `[x]` done (note commit SHA)
@@ -34,17 +34,24 @@ Goal: the build is unchanged in behaviour, but the new files exist, the CLI flag
 
 Goal: external clients can connect, exchange JSON, and call one trivial command.
 
-- [ ] `agent_server.cpp` opens SDL_net listener on `listen` address. Reject non-127.0.0.1.
-- [ ] Write the port to `portfile` after `SDLNet_TCP_Open` returns.
-- [ ] `agent_json.cpp` — minimal hand-rolled JSON parse/encode (subset: numbers, strings with escapes, bools, null, objects, arrays). One-line-per-message framing.
-- [ ] `AGENT_Poll(false)` registered via `TIMER_AddTickHandler` from a small init function in `agent.cpp`.
-- [ ] `AGENT_StartIfRequested()` called from `sdlmain.cpp` at the same place `-tests` triggers test setup (`:~7512`).
-- [ ] One implemented command: `vm.version` → `{ "version": "...", "machine": "...", "build": "..." }`.
-- [ ] Per-client outbox `std::deque<std::string>` with 1 MB cap and overflow event.
-- [ ] `tests/agent_protocol_tests.cpp` — JSON encode/decode round-trip + framing edge cases (partial line, embedded escaped newline, oversize).
-- [ ] `./dosbox-x -tests --gtest_filter=AgentProtocol*` passes.
-- [ ] Manual: connect from a Python one-liner, get a reply.
+- [x] `agent_server.cpp` opens SDL_net listener on `listen` address. Reject non-127.0.0.1.
+- [x] Write the port to `portfile` after `SDLNet_TCP_Open` returns.
+- [x] `agent_json.cpp` — minimal hand-rolled JSON parse/encode (subset: numbers, strings with escapes including `\uXXXX` + surrogate pairs, bools, null, objects, arrays). One-line-per-message framing (encoder guarantees no embedded `\n`/`\r`).
+- [x] `AGENT_Poll(false)` registered via `TIMER_AddTickHandler` from `AGENT_StartIfRequested` in `agent.cpp`. Tick fires every 1 ms; drains accept/recv/send and dispatches complete lines.
+- [x] `AGENT_StartIfRequested()` called from `sdlmain.cpp` immediately after `IPX_Init` in the section-init block. Earlier placements (just-after-CLI-parse) were ruled out — `control->GetSection("agent")` is not safe until config files have been parsed, and `TIMER_AddTickHandler` requires the PIC timer system to be live. **Deviation from plan:** TASKS Iteration 2 said "same place `-tests` triggers test setup (`:~7512`)". That line is inside CLI parsing, before config is loaded; the actual init-list region is `sdlmain.cpp:~9751`.
+- [x] One implemented command: `vm.version` → `{ "version": "...", "machine": "...", "build": "..." }`.
+- [x] Per-client outbox `std::deque<std::string>` with 1 MB cap. Overflow drops the line and emits `agent.overflow` once room frees.
+- [x] `tests/agent_protocol_tests.cpp` — JSON encode/decode round-trip + dispatch sanity. Registered in `tests/tests.h`.
+- [~] `./dosbox-x -tests --gtest_filter=AgentProtocol*` passes. **Not run in this session** (no compiler toolchain on Windows host).
+- [~] Manual: connect from a Python one-liner, get a reply. **Not run in this session** (no build).
 - [ ] Commit `agent: TCP listener, JSON framing, vm.version`.
+
+### Iteration 2 — open issues for the next session
+
+- **Auth token is parsed but not enforced.** `serverStart` stashes it; nothing checks it on the first message. The check belongs in `dispatchLine` (gate non-`auth.hello` commands until the token has been presented) — fold into iteration 3 or its own pre-iteration-3 task.
+- **Bind-port readback assumes `SDLNet_TCP_GetPeerAddress` works on a listening socket.** SDL_net's docs say it returns NULL for server sockets but in practice all platforms return the bound address. If port 0 + portfile reads as 0 on some platform, fall back to platform-specific `getsockname` via the `_TCPsocketX` struct trick used in `misc_util.cpp:~590`.
+- **No log subscription yet** — `LOG_MSG` is not yet teed to the agent. That's iteration 3.
+- **`AGENT_Poll(true)` is wired but its DEBUG_Loop caller doesn't exist yet** — iteration 5.
 
 ## Iteration 3 — debugger pass-through + log tee
 

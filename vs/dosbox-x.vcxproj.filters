@@ -2012,6 +2012,9 @@
     <ClInclude Include="..\include\agent.h">
       <Filter>Includes</Filter>
     </ClInclude>
+    <ClInclude Include="..\src\agent\agent_internal.h">
+      <Filter>Sources\agent</Filter>
+    </ClInclude>
     <ClInclude Include="..\include\control.h">
       <Filter>Includes</Filter>
     </ClInclude>

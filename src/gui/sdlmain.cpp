@@ -138,6 +138,7 @@ char* revert_escape_newlines(const char* aMessage);
 #include "callback.h"
 #include "support.h"
 #include "debug.h"
+#include "agent.h"
 #include "ide.h"
 #include "bitop.h"
 #include "ptrop.h"
@@ -9750,6 +9751,7 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
 #if C_IPX
         IPX_Init();
 #endif
+        AGENT_StartIfRequested();
         MSCDEX_Init();
         CDROM_Image_Init();
 
