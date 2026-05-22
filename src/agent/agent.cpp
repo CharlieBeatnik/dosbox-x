@@ -101,26 +101,6 @@ bool resolveConfig(std::string &listen, std::string &portfile,
 
 /* ---- Command dispatch -------------------------------------------------- */
 
-JsonValue makeReplyOk(double id, JsonObject result) {
-    JsonObject reply;
-    reply.emplace("id", JsonValue::makeNumber(id));
-    reply.emplace("ok", JsonValue::makeBool(true));
-    reply.emplace("result", JsonValue::makeObject(std::move(result)));
-    return JsonValue::makeObject(std::move(reply));
-}
-
-JsonValue makeReplyError(double id, const std::string &code, const std::string &message) {
-    JsonObject err;
-    err.emplace("code",    JsonValue::makeString(code));
-    err.emplace("message", JsonValue::makeString(message));
-
-    JsonObject reply;
-    reply.emplace("id", JsonValue::makeNumber(id));
-    reply.emplace("ok", JsonValue::makeBool(false));
-    reply.emplace("error", JsonValue::makeObject(std::move(err)));
-    return JsonValue::makeObject(std::move(reply));
-}
-
 /* Build VM_VERSION at compile time so the agent can report exactly which
  * build (SDL1 vs SDL2, debug vs heavy debug) the client is talking to. */
 const char *buildTag() {
@@ -184,6 +164,26 @@ JsonValue handleLogUnsubscribe(double id, const JsonValue & /*args*/) {
 
 }  /* anonymous namespace */
 
+JsonValue makeReplyOk(double id, JsonObject result) {
+    JsonObject reply;
+    reply.emplace("id", JsonValue::makeNumber(id));
+    reply.emplace("ok", JsonValue::makeBool(true));
+    reply.emplace("result", JsonValue::makeObject(std::move(result)));
+    return JsonValue::makeObject(std::move(reply));
+}
+
+JsonValue makeReplyError(double id, const std::string &code, const std::string &message) {
+    JsonObject err;
+    err.emplace("code",    JsonValue::makeString(code));
+    err.emplace("message", JsonValue::makeString(message));
+
+    JsonObject reply;
+    reply.emplace("id", JsonValue::makeNumber(id));
+    reply.emplace("ok", JsonValue::makeBool(false));
+    reply.emplace("error", JsonValue::makeObject(std::move(err)));
+    return JsonValue::makeObject(std::move(reply));
+}
+
 std::string dispatchLine(const std::string &line) {
     JsonValue req;
     std::string err;
@@ -213,6 +213,10 @@ std::string dispatchLine(const std::string &line) {
     if (cmd->s == "debugger.command")  return jsonEncode(handleDebuggerCommand(id, a));
     if (cmd->s == "log.subscribe")     return jsonEncode(handleLogSubscribe(id, a));
     if (cmd->s == "log.unsubscribe")   return jsonEncode(handleLogUnsubscribe(id, a));
+    if (cmd->s == "keyboard.type")     return jsonEncode(handleKeyboardType(id, a));
+    if (cmd->s == "keyboard.press")    return jsonEncode(handleKeyboardPress(id, a));
+    if (cmd->s == "keyboard.release")  return jsonEncode(handleKeyboardRelease(id, a));
+    if (cmd->s == "keyboard.tap")      return jsonEncode(handleKeyboardTap(id, a));
 
     return jsonEncode(makeReplyError(id, "unknown_cmd",
         std::string("unknown command: ") + cmd->s));

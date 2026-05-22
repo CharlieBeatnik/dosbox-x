@@ -5,61 +5,68 @@
 ## State
 
 - **Branch:** `agent-interface`.
-- **Last commit on branch:** about to land — `agent: ParseCommand pass-through and log tee`. Confirm with `git log --oneline -5`.
-- **Build status:** **Verified.** VS Debug x64 (v143 toolset) compiles cleanly: 0 errors. See `~/.claude/projects/D--data-Git-dosbox-x/memory/reference_windows_build.md` for the exact PowerShell invocation that imports the VS env and runs `msbuild`.
-- **Test status:** **Verified.** All 24 agent tests pass (17 `AgentProtocolTest`, 7 `AgentDispatchTest`).
+- **Last commit on branch:** about to land — `agent: keyboard input (type / press / release / tap)`. Confirm with `git log --oneline -5`.
+- **Build status:** **Verified.** VS Debug x64 (v143 toolset) compiles cleanly: 0 errors. See `~/.claude/projects/D--data-Git-dosbox-x/memory/reference_windows_build.md` for the exact invocation.
+- **Test status:** **Verified.** All 32 agent tests pass: 17 `AgentProtocolTest`, 7 `AgentDispatchTest`, 8 `AgentKeymapTest`.
 
-## What was just done — Iteration 3
+## What was just done — Iteration 4
 
-The agent can now invoke any debugger command via `ParseCommand` and capture its output. Three new commands are dispatched:
+The agent can now type into the guest. Four new commands:
 
-- `debugger.command {text}` → runs `ParseCommand`, returns `{output, recognized}`.
-- `log.subscribe` → flips the client's `logSubscribed` flag.
-- `log.unsubscribe` → clears it.
+- `keyboard.type {text}` → `strPasteBuffer.append(text)`; the existing paste pump in `sdlmain.cpp:6785` delivers chars at the configured `pastespeed`. Returns `{queued: N}` where N is byte-count.
+- `keyboard.press {key}` → `KEYBOARD_AddKey(k, true)`.
+- `keyboard.release {key}` → `KEYBOARD_AddKey(k, false)`.
+- `keyboard.tap {key}` → press then release.
 
-Every `DEBUG_ShowMsg` call (which is what `LOG_MSG` resolves to) is now teed to the agent: if a capture is active, the line goes into the capture buffer; if a client is subscribed, the line is also emitted as `{event:"log.line",text:"..."}`.
+The key-name table in `agent_keyboard.cpp` covers every value of `KBD_KEYS` except `KBD_NONE` / `KBD_LAST`. A test (`TableCoversEnumRange`) catches accidental drift if a new key value lands in `include/keyboard.h` without a matching table entry.
 
 Files added:
-- `tests/agent_dispatch_tests.cpp` — 7 gTest cases. Pure capture-state-machine tests + dispatch routing checks that don't require `ParseCommand` to actually execute (it needs curses, which isn't up in `-tests` mode).
+- `tests/agent_keymap_tests.cpp` — 8 gTest cases.
 
 Files modified:
-- `src/agent/agent_internal.h` — adds `serverSetLogSubscribed`, `serverEmitLogLine`, `captureBegin/captureEnd`, `emitLogLine` to the agent-private API.
-- `src/agent/agent_events.cpp` — implements the capture pointer (single-threaded plain static, no `thread_local`) and `AGENT_EmitLog` → `emitLogLine` plumbing.
-- `src/agent/agent_server.cpp` — adds `logSubscribed` flag to `Client`, `serverSetLogSubscribed`, and `serverEmitLogLine` (inline JSON encoder so this TU stays independent of agent_json.cpp).
-- `src/agent/agent.cpp` — three new command handlers + `<vector>` include; routes `debugger.command` / `log.subscribe` / `log.unsubscribe`.
-- `src/debug/debug_gui.cpp` — `#include "agent.h"`; one call to `AGENT_EmitLog(buf)` immediately after the newline-strip loop in `DEBUG_ShowMsg`.
-- `tests/tests.h` — `#include "agent_dispatch_tests.cpp"`.
+- `src/agent/agent_keyboard.cpp` — was an empty stub; now ~190 lines of name table + four dispatch handlers.
+- `src/agent/agent_internal.h` — exposes `keyboardNameToKey`, `keyboardTableSize`, the four `handleKeyboardXxx` functions, and the previously-private `makeReplyOk`/`makeReplyError` helpers (moved from `agent.cpp`'s anonymous namespace into the `agent` namespace so `agent_keyboard.cpp` can use them). Pulled in `keyboard.h` for the `KBD_KEYS` enum.
+- `src/agent/agent.cpp` — `makeReplyOk`/`makeReplyError` un-anonymised; dispatch routes for the four new commands added.
+- `tests/tests.h` — `#include "agent_keymap_tests.cpp"`.
 
 ## What to do next
 
-Start **Iteration 4** in `TASKS.md`: keyboard injection. The plan is a key-name → `KBD_KEYS` table in `agent_keyboard.cpp` plus three commands: `keyboard.type`, `keyboard.press`/`release`/`tap`.
+Start **Iteration 5** in `TASKS.md`: events, state, and headless debugger.
 
-Helpful starting points:
-- The `KBD_KEYS` enum is in `include/keyboard.h:22-76`.
-- The paste driver lives in `src/misc/clipboard.cpp` — append into `strPasteBuffer` rather than reinventing modifier juggling.
-- `KEYBOARD_AddKey(KBD_KEYS, bool)` is the raw make/break entry point at `include/keyboard.h:78`.
+This is the largest iteration so far and the one that unlocks fully-automated debugger sessions. The key pieces, from the plan:
 
-## Verifying iteration 3 manually (before iteration 4)
+- `cpu.pause` → existing `DEBUG_Enable_Handler(true)` path.
+- `cpu.run` → `ParseCommand("RUN")`.
+- `AGENT_EmitBpHit` populated; call site at `src/debug/debug.cpp:731` (`CBreakpoint::CheckBreakpoint`).
+- `debugger.entered` event from `DEBUG_EnableDebugger` after `DEBUG_Enable_Handler(true)`.
+- `state.paused` / `state.running` from the three transition sites: `DEBUG_EnableDebugger`, RUN/RUNWATCH (`:2621`/`:2647`), and the auto-resume inside `DEBUG_Loop` (`:~4812`).
+- `AGENT_Poll(true)` inside `DEBUG_Loop`'s paused branch.
+- `AGENT_IsHeadless()` predicate; gate `DBGUI_StartUp()` in `DEBUG_EnableDebugger`. Null-window guards in `DEBUG_CheckKeys` / `DEBUG_BeginPagedContent` / `DEBUG_EndPagedContent` / `DEBUG_DrawInput` and probably `CBreakpoint::ShowList`.
 
-The unit tests cover routing and capture, but not the live end-to-end. To exercise `debugger.command` against a real DOSBox-X you need curses up; for now that means:
+**Why the headless bit matters:** iteration 3's `debugger.command` only works today when the user has manually opened the curses debugger. Iteration 5 lets the agent open it via `cpu.pause` without flashing a curses window on screen, and lets commands like `BPLIST` / `D 0:0 16` run safely against a NULL `dbg.win_out`.
 
-1. Start with `-agent-listen 127.0.0.1:0 -agent-portfile dbxport.txt`.
-2. Open the debugger interactively (Alt-Pause on Win/Linux, Alt-F12 on Mac).
-3. Connect a client and send `{"id":1,"cmd":"debugger.command","args":{"text":"BPLIST"}}\n`.
-4. Expect `{"id":1,"ok":true,"result":{"output":"Breakpoint list:\n...","recognized":true}}`.
+Suggested order:
+1. Null-guard the curses entry points first (cheap, easy, no behaviour change with curses up). This makes existing iteration-3 tests slightly more robust as a side effect.
+2. Add the `AGENT_IsHeadless()` predicate and gate `DBGUI_StartUp` on it.
+3. Add the event emitters one site at a time, testing each by single-stepping in a connected session.
+4. Then `cpu.pause` / `cpu.run` dispatch — those are one-liners that route to existing entry points.
 
-`debugger.command` against a process without curses initialized will crash inside `DEBUG_BeginPagedContent` (NULL `dbg.win_out`). Iteration 5 adds the `AGENT_IsHeadless()` guards needed to fix that.
+## Outstanding manual checks (carry-overs)
 
-Also still outstanding from iteration 2:
-1. Confirm that, with **no** agent flags, no listening socket appears and no `agent:` line is emitted — the "byte-identical to upstream" guarantee.
-2. SDL2 / Linux / macOS build (`./build-debug` or `./build-debug-sdl2`).
+These have been pending since iteration 2 and remain relevant; they're the verification path the docs keep deferring:
+
+1. Boot with `-agent-listen 127.0.0.1:0 -agent-portfile dbxport.txt`. Confirm a log line "agent: listening on 127.0.0.1:NNNNN", that `dbxport.txt` contains the port, and the Python one-liner works (see iteration 2 section of git history for the snippet).
+2. Boot with **no** agent flags. `netstat -ano | grep LISTENING` must show no new socket and no `agent:` line in the log. The byte-identical-to-upstream guarantee.
+3. Linux/macOS build (`./build-debug`). Only VS x64 has been exercised. The `#if defined(C_SDL2_NET) && C_SDL2_NET` branch in `agent_server.cpp` is only reached on those builds.
+4. Once iteration 5 lands: `keyboard.type "DIR\r"` over a live agent connection should make DOS run `DIR`. (Today it'd technically work too — paste doesn't need curses.)
 
 ## Open decisions / gotchas
 
-- **`ParseCommand` is not headless-safe.** Documented above; iteration 5 fixes it. The agent will happily crash a non-debugger DOSBox-X if it dispatches a command like `BPLIST` at the wrong time.
-- **Capture is single-level overwrite.** `captureBegin(B)` while another capture is active silently switches to `B`. Today this is fine — only `debugger.command` captures — but document if any new caller is added.
-- **`serverEmitLogLine` has its own inline JSON encoder** rather than going through `agent_json.cpp`. Intentional: the log tap is in the DEBUG_ShowMsg hot path, and dragging in `JsonValue` allocations per log line is wasted work. The encoder there is a stripped-down copy of `encodeString` from `agent_json.cpp` — keep them in sync if escape semantics ever change.
-- **Test mode disables most of the debugger.** `dbg.win_out` is NULL during `-tests`. Any future test that wants to drive `ParseCommand` needs to either build a curses stub or wait until iteration 5's headless path makes the commands safe.
+- **`delay_ms` arg on `keyboard.type` is intentionally not implemented.** `paste_speed` is a session-wide config setting, not a per-call override. Adding the arg meaningfully needs either a temp config mutation (racy) or a parallel pump. Revisit if a real consumer asks.
+- **`keyboard.type` accepts arbitrary bytes; the paste driver only handles ASCII reliably.** Non-ASCII chars in `strPasteBuffer` produce platform-dependent results — Windows uses `VkKeyScan` per char, other platforms use a scancode table. For reliable unicode input, fall back to `keyboard.tap` per-key with explicit shift/altgr modifiers.
+- **`makeReplyOk` / `makeReplyError` were moved** from `agent.cpp`'s anonymous namespace into the `agent` namespace. If you write any new dispatch handler in `agent.cpp` itself, the helpers are still there at file scope — no change to call sites.
+- **The keymap test (`TableCoversEnumRange`) will fail loudly** if `KBD_KEYS` ever gains or loses a value and `agent_keyboard.cpp`'s table isn't updated to match. Treat that as a useful trip-wire, not a flake.
+- **`ParseCommand` is still not headless-safe.** Iteration 5 fixes it. Until then, any `debugger.command` issued before the curses debugger has been opened can crash inside `DEBUG_BeginPagedContent`.
 
 ## End-of-session checklist (for whoever closes the next session)
 

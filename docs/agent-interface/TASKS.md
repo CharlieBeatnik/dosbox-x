@@ -1,6 +1,6 @@
 # Agent interface — task list
 
-**Current iteration:** Iteration 4
+**Current iteration:** Iteration 5
 **Branch:** `agent-interface`
 
 `[ ]` not started · `[~]` in progress (note who/when) · `[x]` done (note commit SHA)
@@ -75,12 +75,19 @@ Goal: agent can issue any of the existing 88 debugger commands and read their ou
 
 Goal: agent can type into the running guest.
 
-- [ ] Key-name → `KBD_KEYS` table in `agent_keyboard.cpp`. Cover every value in the enum.
-- [ ] `keyboard.type` `{text, delay_ms?}` → append to `strPasteBuffer`. Reuse the existing paste driver.
-- [ ] `keyboard.press` / `keyboard.release` / `keyboard.tap` `{key}` → `KEYBOARD_AddKey`.
-- [ ] `tests/agent_keymap_tests.cpp` — every JSON key name resolves to a `KBD_KEYS` value; round-trip for a sample.
-- [ ] Manual: boot DOSBox-X, type `DIR\r`, observe DOS run `DIR`.
+- [x] Key-name → `KBD_KEYS` table in `agent_keyboard.cpp`. Covers every value in the enum (`KBD_LAST - 1` entries; KBD_NONE excluded). Unit test guards against accidental drift if `KBD_KEYS` gains a value.
+- [x] `keyboard.type` `{text}` → append to `strPasteBuffer`. Reply `{queued: N}`. The existing 1-char-per-`paste_speed`-tick pump in `sdlmain.cpp:6785` delivers them. **Deviation from plan:** `delay_ms` is not implemented — `paste_speed` is a per-session config setting, not a per-call override; honouring `delay_ms` would mean either temporarily mutating `paste_speed` (racy) or building a parallel paste pump (out-of-scope for this iteration). Document in HANDOVER for a future revisit.
+- [x] `keyboard.press` / `keyboard.release` / `keyboard.tap` `{key}` → `KEYBOARD_AddKey`. Each returns `{ok:true, result:{}}` on success or `{ok:false, error:{code:"bad_args",...}}` on missing/unknown key.
+- [x] `tests/agent_keymap_tests.cpp` — 8 tests: table-size enum coverage, common-key resolution, unknown-name rejection, type round-trip into `strPasteBuffer`, type-rejects-non-string, press/release/tap arg validation, valid-key press dispatch.
+- [~] Manual: boot DOSBox-X, type `DIR\r`, observe DOS run `DIR`. **Not exercised in this session** — needs a live boot with `-agent-listen` and a connected client.
+- [x] Verify build (VS Debug x64): 0 errors. Tests: 32/32 pass (17 protocol + 7 dispatch + 8 keymap).
 - [ ] Commit `agent: keyboard input (type / press / release / tap)`.
+
+### Iteration 4 — open issues for the next session
+
+- **`delay_ms` arg deferred.** The paste driver is paced by `[sdl] pastespeed=` (default 30). A per-call override would need a parallel pump or temporary config mutation — neither feels worth it for Phase 1. Re-evaluate when a real consumer asks.
+- **`keyboard.type` accepts arbitrary text but the paste driver only handles ASCII.** Non-ASCII chars in `strPasteBuffer` will likely produce wrong scancodes or be silently dropped, depending on platform. The agent honestly returns `queued: <byte-count>`; consumers needing reliable unicode input should fall back to per-key `tap` events.
+- **No way to query the current paste-buffer length** so a client can wait until DOSBox-X has drained queued input before sending more. Could add `keyboard.status` later if needed.
 
 ## Iteration 5 — events, state, headless debugger
 

@@ -34,6 +34,8 @@
 #include <string>
 #include <vector>
 
+#include "keyboard.h"      /* for the KBD_KEYS enum used below */
+
 /* ---- JSON ---------------------------------------------------------------
  * A minimal hand-rolled JSON value. Numbers are stored as doubles; the
  * agent protocol uses integers and never relies on fractional precision
@@ -132,6 +134,24 @@ void captureEnd();
  * and emits a log.line event to subscribed clients. Never recurses into
  * the logging system. */
 void emitLogLine(const char *line);
+
+/* ---- Keyboard ----------------------------------------------------------
+ * JSON key name -> KBD_KEYS lookup. The table is defined in
+ * agent_keyboard.cpp and covers every value of KBD_KEYS except
+ * KBD_NONE / KBD_LAST. Names are lowercase canonical (e.g. "leftshift",
+ * "kp1", "f10"). Returns false if `name` isn't recognized. */
+bool keyboardNameToKey(const std::string &name, KBD_KEYS &out);
+size_t keyboardTableSize();
+
+/* Dispatch entry points implemented in agent_keyboard.cpp. */
+JsonValue handleKeyboardType(double id, const JsonValue &args);
+JsonValue handleKeyboardPress(double id, const JsonValue &args);
+JsonValue handleKeyboardRelease(double id, const JsonValue &args);
+JsonValue handleKeyboardTap(double id, const JsonValue &args);
+
+/* Reply helpers shared between agent.cpp and agent_keyboard.cpp. */
+JsonValue makeReplyOk(double id, JsonObject result);
+JsonValue makeReplyError(double id, const std::string &code, const std::string &message);
 
 /* ---- Dispatch -----------------------------------------------------------
  * Receives one complete JSON object from a client and produces a response
