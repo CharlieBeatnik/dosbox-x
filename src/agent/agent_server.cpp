@@ -36,6 +36,15 @@
 #include <cstdlib>
 #include <cstring>
 
+#if defined(_WIN32)
+# include <winsock2.h>   /* SOCKET / getsockname for the ephemeral-port readback */
+#else
+# include <sys/types.h>
+# include <sys/socket.h>
+# include <netinet/in.h>
+# include <arpa/inet.h>
+#endif
+
 #if defined(C_SDL2_NET) && C_SDL2_NET
 #include <SDL2/SDL_net.h>
 #else
@@ -136,44 +145,75 @@ void serverStart(const std::string &listen, const std::string &portfile,
     uint16_t    port;
     parseListen(listen, host, port);
 
-    /* Reject anything that isn't loopback at config-parse time. We resolve
-     * the host first via SDLNet so e.g. "localhost" works, then check the
-     * resulting IP. SDL_net stores host as a network-byte-order uint32. */
-    IPaddress addr;
-    if (SDLNet_ResolveHost(&addr, host.c_str(), port) != 0) {
+    /* Validate the requested listen address resolves to loopback. We
+     * resolve the host (so "localhost" works) then check the result.
+     * SDLNet_TCP_Open treats any non-INADDR_ANY/NONE address as a *client*
+     * connect target, so we cannot pass 127.0.0.1 to it directly to bind.
+     * Instead we resolve once for validation, then a second time with a
+     * NULL hostname (= INADDR_ANY) to actually open the listener. Loopback
+     * enforcement then happens per-connection in acceptIfReady(). */
+    IPaddress checkAddr;
+    if (SDLNet_ResolveHost(&checkAddr, host.c_str(), port) != 0) {
         LOG(LOG_MISC, LOG_WARN)("agent: cannot resolve listen host '%s'", host.c_str());
         return;
     }
-    /* 127.0.0.0/8 — first network byte must be 127. addr.host is network
-     * byte order so the lowest byte is the first byte of the dotted quad. */
-    uint8_t firstByte = static_cast<uint8_t>(addr.host & 0xFF);
+    uint8_t firstByte = static_cast<uint8_t>(checkAddr.host & 0xFF);
     if (firstByte != 127) {
         LOG(LOG_MISC, LOG_WARN)("agent: listen address '%s' is not loopback; refusing", host.c_str());
         return;
     }
 
-    g.listener = SDLNet_TCP_Open(&addr);
+    IPaddress bindAddr;
+    if (SDLNet_ResolveHost(&bindAddr, NULL, port) != 0) {
+        LOG(LOG_MISC, LOG_WARN)("agent: SDLNet_ResolveHost(NULL, %u) failed: %s", static_cast<unsigned>(port), SDLNet_GetError());
+        return;
+    }
+
+    g.listener = SDLNet_TCP_Open(&bindAddr);
     if (!g.listener) {
         LOG(LOG_MISC, LOG_WARN)("agent: SDLNet_TCP_Open failed: %s", SDLNet_GetError());
         return;
     }
 
-    /* If port 0 was requested, ask the OS what it actually bound to. */
+    /* If port 0 was requested, ask the kernel for the bound port. SDL_net
+     * has no public getter and its internal `localAddress` field is never
+     * populated for server sockets — so we mirror the _TCPsocket struct
+     * to reach the underlying `channel` (the native SOCKET / fd) and call
+     * getsockname() ourselves. The layout is verbatim from
+     * vs/sdlnet/SDLnetTCP.c and matches the `_TCPsocketX` mirror in
+     * src/hardware/serialport/misc_util.h. */
     if (port == 0) {
-        IPaddress *bound = SDLNet_TCP_GetPeerAddress(g.listener);
-        if (bound) {
-            /* SDLNet_TCP_GetPeerAddress returns the bound address for
-             * server sockets (per the docstring it's NULL only when called
-             * on a server socket *and* the implementation doesn't support
-             * it; in practice it works on all platforms SDL_net targets).
-             * `port` field is network byte order. */
-            uint16_t np = bound->port;
-            g.listenPort = static_cast<uint16_t>((np >> 8) | (np << 8));
+        struct AgentTCPsocketLayout {
+            int ready;
+#if defined(_WIN32)
+            SOCKET channel;
+#else
+            int channel;
+#endif
+            IPaddress remoteAddress;
+            IPaddress localAddress;
+            int sflag;
+        };
+        auto *layout = reinterpret_cast<AgentTCPsocketLayout *>(g.listener);
+        struct sockaddr_in sa;
+#if defined(_WIN32)
+        int sa_len = sizeof(sa);
+#else
+        socklen_t sa_len = sizeof(sa);
+#endif
+        if (getsockname(layout->channel, reinterpret_cast<struct sockaddr *>(&sa), &sa_len) == 0) {
+            g.listenPort = ntohs(sa.sin_port);
         } else {
             g.listenPort = 0;
         }
     } else {
         g.listenPort = port;
+    }
+
+    if (g.listenPort == 0) {
+        LOG(LOG_MISC, LOG_WARN)("agent: failed to determine bound port; clients won't be able to connect");
+        SDLNet_TCP_Close(g.listener); g.listener = nullptr;
+        return;
     }
 
     g.sockset = SDLNet_AllocSocketSet(2);
@@ -268,6 +308,17 @@ void serverEmitLogLine(const char *text) {
 static void acceptIfReady() {
     TCPsocket s = SDLNet_TCP_Accept(g.listener);
     if (!s) return;
+
+    /* Reject non-loopback peers. The listener is bound to INADDR_ANY (SDL_net
+     * has no portable way to bind to a specific address) so the loopback
+     * restriction must be enforced here. */
+    IPaddress *peer = SDLNet_TCP_GetPeerAddress(s);
+    if (peer == NULL || static_cast<uint8_t>(peer->host & 0xFF) != 127) {
+        LOG(LOG_MISC, LOG_WARN)("agent: rejecting non-loopback connection");
+        SDLNet_TCP_Close(s);
+        return;
+    }
+
     if (g.client) {
         /* One client at a time in Phase 1. Reject. */
         const char *reply = "{\"event\":\"busy\"}\n";

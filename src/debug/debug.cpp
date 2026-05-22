@@ -806,11 +806,13 @@ bool CBreakpoint::CheckIntBreakpoint(PhysPt adr, uint8_t intNr, uint16_t ahValue
     (void)adr;
 
 	// Search matching breakpoint
+	int bp_index = 0;
 	std::list<CBreakpoint*>::iterator i;
-	for(i=BPoints.begin(); i != BPoints.end(); ++i) {
+	for(i=BPoints.begin(); i != BPoints.end(); ++i, ++bp_index) {
 		CBreakpoint* bp = (*i);
 		if ((bp->GetType()==BKPNT_INTERRUPT) && bp->IsActive() && (bp->GetIntNr()==intNr)) {
 			if (((bp->GetValue()==BPINT_ALL) || (bp->GetValue()==ahValue)) && ((bp->GetOther()==BPINT_ALL) || (bp->GetOther()==alValue))) {
+				AGENT_EmitBpHit(SegValue(cs), reg_eip, bp_index);
 				// Ignore it once ?
 				// Found
 				if (bp->GetOnce()) {

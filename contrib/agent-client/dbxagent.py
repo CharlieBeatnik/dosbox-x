@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""Reference client for the DOSBox-X agent control channel.
+
+The wire protocol is one JSON object per line over a loopback TCP socket.
+A request is ``{"id": N, "cmd": "...", "args": {...}}``; a response carries
+the same ``id`` plus ``ok`` and either ``result`` or ``error``. Messages
+without an ``id`` are server-initiated events.
+
+Typical use::
+
+    from dbxagent import DbxAgent
+
+    with DbxAgent(portfile="dbxport.txt") as a:
+        print(a.vm_version())
+        a.log_subscribe()
+        a.keyboard_type("DIR\\r")
+        a.cpu_pause()
+        print(a.debugger_command("BPLIST"))
+        a.cpu_run()
+        for ev in a.events(timeout=2.0):
+            print(ev)
+
+The module is deliberately small (no third-party deps, no asyncio) so it
+can serve both as a hands-on driver and as a worked example for clients
+written in other languages.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import queue
+import socket
+import sys
+import threading
+import time
+from typing import Any, Dict, Iterator, Optional
+
+
+class AgentError(RuntimeError):
+    """Raised when the server returns ``ok:false`` for a request."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
+
+
+class DbxAgent:
+    """Synchronous request/response client with an async event queue.
+
+    A background reader thread demultiplexes server messages: replies are
+    routed back to the caller blocked in :meth:`call`, unsolicited events
+    land in a thread-safe queue accessible via :meth:`events` /
+    :meth:`next_event`.
+    """
+
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: Optional[int] = None,
+        portfile: Optional[str] = None,
+        connect_timeout: float = 5.0,
+    ) -> None:
+        if port is None:
+            if portfile is None:
+                raise ValueError("must provide either port or portfile")
+            with open(portfile, "r") as f:
+                port = int(f.read().strip())
+        self._sock = socket.create_connection((host, port), timeout=connect_timeout)
+        self._sock.settimeout(None)
+        self._reader = self._sock.makefile("rb")
+        self._writer = self._sock.makefile("wb")
+
+        self._lock = threading.Lock()
+        self._next_id = 1
+        self._pending: Dict[int, "threading.Event"] = {}
+        self._replies: Dict[int, dict] = {}
+        self._events: "queue.Queue[dict]" = queue.Queue()
+        self._closed = False
+        self._read_err: Optional[Exception] = None
+
+        self._reader_thread = threading.Thread(
+            target=self._read_loop, name="dbxagent-reader", daemon=True
+        )
+        self._reader_thread.start()
+
+    # ---- Connection lifecycle ----------------------------------------
+
+    def close(self) -> None:
+        self._closed = True
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        self._sock.close()
+
+    def __enter__(self) -> "DbxAgent":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    # ---- Request / response ------------------------------------------
+
+    def call(self, cmd: str, *, timeout: float = 5.0, **args: Any) -> dict:
+        """Send ``cmd`` with keyword ``args`` and block for the reply.
+
+        Returns the ``result`` object from a successful reply. Raises
+        :class:`AgentError` on ``ok:false``, :class:`TimeoutError` if no
+        reply arrives within ``timeout``.
+        """
+        ev = threading.Event()
+        with self._lock:
+            mid = self._next_id
+            self._next_id += 1
+            self._pending[mid] = ev
+
+        msg = {"id": mid, "cmd": cmd}
+        if args:
+            msg["args"] = args
+        encoded = (json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8")
+        try:
+            self._writer.write(encoded)
+            self._writer.flush()
+        except OSError as e:
+            with self._lock:
+                self._pending.pop(mid, None)
+            raise ConnectionError(f"send failed: {e}") from e
+
+        if not ev.wait(timeout):
+            with self._lock:
+                self._pending.pop(mid, None)
+            raise TimeoutError(f"no reply within {timeout}s for cmd={cmd!r}")
+
+        with self._lock:
+            reply = self._replies.pop(mid)
+        if reply.get("ok"):
+            return reply.get("result", {})
+        err = reply.get("error", {})
+        raise AgentError(err.get("code", "unknown"), err.get("message", ""))
+
+    # ---- Events ------------------------------------------------------
+
+    def next_event(self, timeout: Optional[float] = None) -> Optional[dict]:
+        """Return the next queued event, or ``None`` on timeout."""
+        try:
+            return self._events.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def events(self, timeout: Optional[float] = None) -> Iterator[dict]:
+        """Yield events until ``timeout`` elapses with no further events.
+
+        ``timeout=None`` blocks forever waiting for each event; ``0`` drains
+        whatever has already arrived.
+        """
+        while True:
+            ev = self.next_event(timeout=timeout)
+            if ev is None:
+                return
+            yield ev
+
+    # ---- Convenience wrappers ----------------------------------------
+
+    def vm_version(self) -> dict:
+        return self.call("vm.version")
+
+    def cpu_pause(self) -> dict:
+        return self.call("cpu.pause")
+
+    def cpu_run(self) -> dict:
+        return self.call("cpu.run")
+
+    def keyboard_type(self, text: str) -> dict:
+        return self.call("keyboard.type", text=text)
+
+    def keyboard_tap(self, key: str) -> dict:
+        return self.call("keyboard.tap", key=key)
+
+    def keyboard_press(self, key: str) -> dict:
+        return self.call("keyboard.press", key=key)
+
+    def keyboard_release(self, key: str) -> dict:
+        return self.call("keyboard.release", key=key)
+
+    def debugger_command(self, text: str) -> dict:
+        return self.call("debugger.command", text=text)
+
+    def log_subscribe(self) -> dict:
+        return self.call("log.subscribe")
+
+    def log_unsubscribe(self) -> dict:
+        return self.call("log.unsubscribe")
+
+    # ---- Internals ---------------------------------------------------
+
+    def _read_loop(self) -> None:
+        try:
+            for raw in self._reader:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except json.JSONDecodeError:
+                    # Malformed framing: log to stderr and keep going. The
+                    # server is supposed to emit only valid lines, so this
+                    # is purely defensive.
+                    print(f"dbxagent: malformed line: {line!r}", file=sys.stderr)
+                    continue
+                if isinstance(msg, dict) and "id" in msg:
+                    mid = int(msg["id"])
+                    with self._lock:
+                        ev = self._pending.pop(mid, None)
+                        if ev is not None:
+                            self._replies[mid] = msg
+                    if ev is not None:
+                        ev.set()
+                else:
+                    self._events.put(msg)
+        except Exception as e:  # pragma: no cover — best-effort cleanup
+            if not self._closed:
+                self._read_err = e
+        finally:
+            # Unblock any waiters still pending so close() doesn't deadlock.
+            with self._lock:
+                for ev in list(self._pending.values()):
+                    ev.set()
+                self._pending.clear()
+
+
+# ---- CLI demo --------------------------------------------------------
+
+
+def _demo(args: argparse.Namespace) -> int:
+    with DbxAgent(host=args.host, port=args.port, portfile=args.portfile) as a:
+        ver = a.vm_version()
+        print(f"connected: version={ver['version']} machine={ver['machine']} build={ver['build']}")
+        if args.subscribe:
+            a.log_subscribe()
+        if args.type:
+            res = a.keyboard_type(args.type)
+            print(f"queued {res.get('queued')} bytes for paste")
+        if args.cmd:
+            res = a.debugger_command(args.cmd)
+            print("--- debugger.command output ---")
+            print(res.get("output", ""))
+            print("--- end ---")
+        if args.events:
+            deadline = time.time() + args.events
+            while time.time() < deadline:
+                ev = a.next_event(timeout=max(0.1, deadline - time.time()))
+                if ev is not None:
+                    print(f"event: {ev}")
+    return 0
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="DOSBox-X agent reference client")
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument("--port", type=int, help="connect to this TCP port directly")
+    src.add_argument("--portfile", help="read port number from this file")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--type", help="paste this text into the guest")
+    parser.add_argument("--cmd", help="run this debugger command and print the captured output")
+    parser.add_argument("--subscribe", action="store_true", help="subscribe to log lines before doing anything else")
+    parser.add_argument("--events", type=float, default=0.0, help="after the commands, listen for events for this many seconds")
+    return _demo(parser.parse_args(argv))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

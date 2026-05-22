@@ -1,6 +1,6 @@
 # Agent interface — task list
 
-**Current iteration:** Iteration 6
+**Current iteration:** Phase 1 done — PR pending
 **Branch:** `agent-interface`
 
 `[ ]` not started · `[~]` in progress (note who/when) · `[x]` done (note commit SHA)
@@ -116,9 +116,15 @@ Goal: agent can pause/resume and is notified when breakpoints fire — without c
 
 Goal: a reproducible end-to-end test.
 
-- [ ] `contrib/agent-client/dbxagent.py` — ~200 lines: connect, sync request/response with id correlation, async event listener.
-- [ ] `docs/agent-interface/SMOKE.md` — the 6-step manual smoke sequence from `PLAN.md` § Verification.
-- [ ] Commit `agent: reference Python client and smoke test`.
+- [x] `contrib/agent-client/dbxagent.py` — 273 lines: connect via host:port or portfile, async reader thread demultiplexes responses by id vs events, sync `call()` API with timeout, convenience wrappers for every Phase-1 command, CLI demo `if __name__ == "__main__"`.
+- [x] `docs/agent-interface/SMOKE.md` — six numbered checks corresponding to PLAN.md § Verification. Each step has a runnable command, an expectation, and what it actually verifies. Includes known gotchas (Windows firewall prompt, choosing BPINT 08 over BPINT 21 for trigger reliability).
+- [x] **Bug fixes uncovered while running the smoke:**
+  - `SDLNet_TCP_Open(IPaddress)` treats any non-INADDR_ANY/NONE address as a *client connect target* — it would not bind to 127.0.0.1. Switched to a two-step pattern: validate the requested host resolves to loopback, then re-resolve with `NULL` host (INADDR_ANY) for the actual bind. Loopback enforcement moved to per-accept via `SDLNet_TCP_GetPeerAddress` in `acceptIfReady`.
+  - SDL_net's internal `_TCPsocket.localAddress` field is declared but **never populated**, so reading it for the ephemeral port returned garbage. Replaced with a direct `getsockname()` call via the `channel` field (using the same struct-layout mirror that `src/hardware/serialport/misc_util.h:_TCPsocketX` already employs). On Windows this means `#include <winsock2.h>` in `agent_server.cpp`.
+  - `CBreakpoint::CheckIntBreakpoint` wasn't emitting `bp.hit` — the plan only mentioned `CheckBreakpoint`. Added the emit; without it, interrupt-breakpoint hits never reach the agent.
+- [x] Manual smoke verified end-to-end on VS Debug x64: `vm.version`, `keyboard.type`, `cpu.pause` + `debugger.command BPLIST` + `cpu.run`, `BPINT 08` → full `state.running` → `bp.hit` → `debugger.entered` → `state.paused` event sequence. Byte-identical-without-flag check confirmed via `netstat`.
+- [x] Unit tests: 34/34 still pass after the bug-fix changes.
+- [ ] Commit `agent: reference Python client, smoke doc, and Phase-1 fixes`.
 - [ ] Open PR `agent-interface → master`.
 
 ## Iteration 7+ — Phase 2 (each bullet is its own iteration)
