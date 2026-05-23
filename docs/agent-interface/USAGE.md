@@ -12,19 +12,25 @@ required reading just to *use* the channel.
 ## What you get
 
 A loopback TCP socket on the running DOSBox-X process, speaking
-newline-delimited JSON. With Phase 1 you can:
+newline-delimited JSON. You can:
 
 - Pause / resume the CPU.
 - Type ASCII into the guest, or send raw key make/break events.
-- Invoke **any** of the 88 existing debugger commands (`BP`, `BPM`, `BPINT`,
-  `BPLIST`, `D`, `MEMDUMP`, `R`, `DV`, `INT`, `IDT`, `GDT`, `KERN`,
-  `CALLBACKS`, …) and read whatever the debugger would have printed.
+- Read all CPU registers in one structured reply (`regs.get`).
+- Read up to 64 KB of guest memory at a time, base64-encoded (`mem.read`).
+- Invoke any of the existing debugger commands whose output goes through
+  `DEBUG_ShowMsg` (`BPLIST`, `BP`, `BPM`, `BPINT`, `BPDEL`, `EV`, `INT`,
+  `IDT`, `GDT`, `KERN`, `CALLBACKS`, `DOS MCBS/DEVS/XMS/EMS`, `BIOS MEM`,
+  `SELINFO`, …) via `debugger.command`.
 - Subscribe to log lines and to events (`bp.hit`, `debugger.entered`,
   `state.paused`, `state.running`, `log.line`).
 
-What is **not** available yet (planned for Phase 2): typed breakpoint /
-memory / register / step / disasm commands; mouse input; screenshots; stable
-breakpoint handles; finer `debugger.entered` reasons.
+Not available — see "What is **not** capturable" below for the full list,
+but the headlines are: anything the curses debugger draws into a pane
+(register pane, disassembly pane, hex/ASCII data pane) is invisible to
+the agent. `MEMDUMP` writes a file on disk rather than returning bytes
+inline. Mouse input, screenshots, and typed breakpoint/step commands are
+planned for Phase 2.
 
 ## Requirements
 
@@ -68,9 +74,11 @@ portfile = dbxport.txt
 from dbxagent import DbxAgent          # contrib/agent-client/dbxagent.py
 
 with DbxAgent(portfile="dbxport.txt") as a:
-    print(a.vm_version())               # {'version':'2026.05.02','machine':'vga','build':'heavy-debug'}
+    print(a.vm_version())                       # {'version':'2026.05.02','machine':'vga','build':'heavy-debug'}
     a.keyboard_type("DIR\r")
     a.cpu_pause()
+    regs = a.call("regs.get")                   # {'eax': 0, 'ebx': 0, ... 'eflags': 0x246}
+    print(f"CS:EIP = {regs['cs']:04x}:{regs['eip']:08x}")
     print(a.debugger_command("BPLIST")["output"])
     a.cpu_run()
 ```
@@ -99,18 +107,20 @@ events don't. The reference client does this in a single reader thread.
 
 ## Commands
 
-| Command             | Args                | Result                              |
-|---------------------|---------------------|-------------------------------------|
-| `vm.version`        | none                | `{version, machine, build}`         |
-| `debugger.command`  | `{text}`            | `{output, recognized}`              |
-| `cpu.pause`         | none                | `{}`                                |
-| `cpu.run`           | none                | `{}`                                |
-| `keyboard.type`     | `{text}`            | `{queued}` (byte count)             |
-| `keyboard.press`    | `{key}`             | `{}`                                |
-| `keyboard.release`  | `{key}`             | `{}`                                |
-| `keyboard.tap`      | `{key}`             | `{}`                                |
-| `log.subscribe`     | none                | `{subscribed: true}`                |
-| `log.unsubscribe`   | none                | `{subscribed: false}`               |
+| Command             | Args                          | Result                              |
+|---------------------|-------------------------------|-------------------------------------|
+| `vm.version`        | none                          | `{version, machine, build}`         |
+| `regs.get`          | none                          | All GPRs + segregs + EIP + EFLAGS   |
+| `mem.read`          | `{kind, addr, len}`           | `{bytes, len}` — bytes base64       |
+| `debugger.command`  | `{text}`                      | `{output, recognized}`              |
+| `cpu.pause`         | none                          | `{}`                                |
+| `cpu.run`           | none                          | `{}`                                |
+| `keyboard.type`     | `{text}`                      | `{queued}` (byte count)             |
+| `keyboard.press`    | `{key}`                       | `{}`                                |
+| `keyboard.release`  | `{key}`                       | `{}`                                |
+| `keyboard.tap`      | `{key}`                       | `{}`                                |
+| `log.subscribe`     | none                          | `{subscribed: true}`                |
+| `log.unsubscribe`   | none                          | `{subscribed: false}`               |
 
 ### `vm.version`
 
@@ -123,23 +133,88 @@ events don't. The reference client does this in a single reader thread.
 
 Cheap. Useful as a connection sanity-check after the portfile appears.
 
+### `regs.get`
+
+Returns all general-purpose registers, segment registers, EIP, and EFLAGS
+as one structured reply. No arguments.
+
+```json
+{
+  "eax": 4275878552, "ebx": 0, "ecx": 0, "edx": 0,
+  "esi": 0, "edi": 0, "ebp": 0, "esp": 65520,
+  "eip": 256,
+  "cs": 4096, "ds": 4096, "es": 4096,
+  "fs": 0, "gs": 0, "ss": 4096,
+  "eflags": 582
+}
+```
+
+All values are unsigned integers (JSON numbers). 32-bit fields for the
+GPRs and EIP, 16-bit for the segment registers. Use `f"{regs['cs']:04x}"`
+to print as hex.
+
+This is the supported replacement for the `R` and `R EAX` commands many
+clients reach for — there is no `R` handler in `ParseCommand`, and the
+curses register pane is drawn directly to ncurses windows (not capturable
+through the agent). Prefer `regs.get` over the legacy `EV <register>`
+expression-reader, which only returns one register per call.
+
+### `mem.read`
+
+Read up to 64 KB of guest memory at a time. Returns base64-encoded bytes.
+
+```json
+{"id": 1, "cmd": "mem.read",
+ "args": {"kind": "seg:off", "addr": "1000:0100", "len": 256}}
+```
+
+- `kind` (required, string) — one of:
+  - `"seg:off"` — real-mode address. `addr` must be `"SEG:OFF"` in hex.
+    Translated to linear = `seg<<4 + off`, then read through the paging
+    layer (so it works in both real and protected mode).
+  - `"linear"` — paged/virtual linear address. `addr` is hex. Goes through
+    the CPU's TLB; respects the current page tables when paging is on.
+  - `"physical"` — bypasses paging entirely. `addr` is hex, treated as a
+    direct physical RAM offset. Reads past end-of-memory return `0xFF`.
+- `addr` (required, string) — hex, with or without `0x` prefix.
+- `len` (required, integer) — 0 to 65536. Larger reads must be chunked.
+
+Reply: `{"bytes": "<base64>", "len": <N>}` — `len` echoes the requested
+length; `bytes` is `base64.b64decode(...)` away from raw bytes.
+
+```python
+import base64
+res = a.call("mem.read", kind="seg:off", addr="0040:0017", len=2)
+keyboard_flags = base64.b64decode(res["bytes"])  # BIOS data area
+```
+
+This is the supported replacement for `MEMDUMP` (which writes
+`MEMDUMP.TXT` to DOSBox-X's cwd) and the curses `D`/`DV`/`DP` data panes
+(which render into invisible ncurses windows). Use `mem.read` for any
+inline byte access.
+
 ### `debugger.command`
 
-Pass any text the curses debugger would accept — `BP CS:IP`,
-`BPINT 21 4C`, `BPM RW 1000:0`, `BPLIST`, `BPDEL 3`, `D DS:SI 64`,
-`MEMDUMP 1000:0 100`, `R EAX`, `R`, `INT 21 4C00`, `IDT`, `GDT`,
-`CALLBACKS`, `KERN`, … — and read back whatever `DEBUG_ShowMsg` would
-have printed.
+Pass any text the curses debugger would accept (`BPLIST`, `BP CS:IP`,
+`BPINT 21 4C`, `BPM RW 1000:0`, `BPDEL 3`, `EV EAX`, `INT 21 4C00`,
+`IDT`, `GDT`, `CALLBACKS`, `KERN`, `DOS MCBS`, `BIOS MEM`, …) and read
+back whatever `DEBUG_ShowMsg` produces.
 
 - `text` (required, string) — the debugger command line.
-- `output` (string) — captured output, newlines preserved between lines.
-- `recognized` (bool) — `ParseCommand`'s return value. `false` means the
-  command itself didn't match anything; the agent will still reply OK.
+- `output` (string) — captured `DEBUG_ShowMsg` output. **Will be empty
+  for commands that don't emit through `DEBUG_ShowMsg`** — see "What is
+  not capturable" below.
+- `recognized` (bool) — `ParseCommand`'s return value. `false` means
+  `ParseCommand` rejected the command name; the agent still replies OK.
+  Note: many recognised commands also return `false` from `ParseCommand`
+  (it's not a strict success indicator) — trust `output` over this flag.
 
-This is the wide door. Until Phase 2 lands, lean on this for breakpoints,
-memory dumps, register reads, disassembly, stepping, anything you'd type
-into the curses debugger. The `BPLIST` output is the canonical way to
-enumerate breakpoints.
+Use this for breakpoint management (`BPLIST`, `BP*`, `BPDEL`), interrupt
+inspection (`INT`), descriptor tables (`IDT`, `GDT`), DOS internals
+(`DOS MCBS/DEVS/XMS/EMS/FNKEY`, `BIOS MEM`, `CALLBACKS`, `KERN`), and
+the `EV` expression evaluator. **Do not** use it for register dumps
+(no `R` command exists) or memory dumps (`MEMDUMP` writes a file). Use
+`regs.get` / `mem.read` instead.
 
 ### `cpu.pause` / `cpu.run`
 
@@ -147,9 +222,11 @@ enumerate breakpoints.
 window pops). `cpu.run` resumes. Both reply immediately with `{}`; watch
 `state.paused` / `state.running` events for the actual transitions.
 
-Most `debugger.command` calls that *inspect* state (`BPLIST`, `D`, `R`)
-are safe whether the CPU is running or paused. Commands that **mutate**
-the loop (`RUN`, `RUNWATCH`, `T`/`P` step) should be issued while paused.
+`regs.get` and `mem.read` are safe whether the CPU is running or paused
+(they snapshot in-place). `debugger.command` is safe for inspection
+commands (`BPLIST`, `EV`, `IDT`, `GDT`, …) at any time; commands that
+*mutate* loop state (`RUN`, `RUNWATCH`, `T`/`P` step) should only be
+issued while paused.
 
 ### `keyboard.type`
 
@@ -252,6 +329,46 @@ When a request fails the reply is `{"id": N, "ok": false, "error": {code, messag
 Malformed JSON gets an unsolicited `agent.error` event (no `id` to reply
 to). The connection stays up; just send the next request.
 
+## What is *not* capturable
+
+The Phase-1 surface deliberately covers what `ParseCommand` can route
+through `DEBUG_ShowMsg` plus the two structured queries `regs.get` /
+`mem.read`. Several things the curses debugger does **cannot** be reached
+through the agent:
+
+- **Curses pane content.** The register pane (`DrawRegisters`),
+  disassembly window, hex/ASCII data view, variables pane, and FPU stack
+  pane all draw directly to ncurses windows. Their contents never go
+  through `DEBUG_ShowMsg` and so produce empty `output` when their
+  setter command is invoked over the agent. Use `regs.get` / `mem.read`
+  instead. There is no Phase-1 disassembly command; if you need one,
+  Phase 2 adds `disasm` via `DasmI386` directly.
+- **Pane-setter commands.** `D`, `DV`, `DP` (data overview),
+  `C` (code overview), `SHOWWIN`/`HIDEWIN`, `MOVEWINDN`/`MOVEWINUP`
+  only mutate which curses window shows what. They reply with a short
+  status string (`"DEBUG: Set data overview to F000:D106"`) — the
+  actual hex dump never crosses the agent boundary.
+- **File-output commands.** `MEMDUMP` and `MEMDUMPBIN` write
+  `MEMDUMP.TXT` / `MEMDUMP.BIN` in DOSBox-X's current working directory.
+  `LOG`/`LOGS`/`LOGL`/`LOGC` write CPU trace logs to disk. The agent
+  sees only a one-line "success" message. Use `mem.read` for byte
+  access.
+- **Single-stepping with structured output.** `T`/`P` step commands
+  exist in `ParseCommand`, but the resulting register/code-view refresh
+  goes to the curses panes. Phase 2's `cpu.step` / `cpu.step_over`
+  will return structured state.
+- **The `R` register-dump command.** It doesn't exist in
+  `ParseCommand` at all (the curses key `R` is a UI handler). Use
+  `regs.get`.
+- **Anything that needs the curses window to be visible.** Pages of
+  scrollable content (`BPLIST` over many entries, long `IDT`/`GDT`
+  listings) are still fully captured — the paging is purely a curses
+  display concept and `DEBUG_ShowMsg` writes each line.
+
+If you discover something else that emits to a pane rather than
+`DEBUG_ShowMsg`, that's a candidate for a Phase-2 typed command. File
+an issue.
+
 ## Recipes
 
 ### Run a DOS command and wait for the prompt
@@ -266,9 +383,11 @@ There is no "wait for prompt" primitive in Phase 1. If you need
 synchronization, set a breakpoint on `INT 21 / AH=08` (keyboard input with
 echo) or just sleep generously.
 
-### Set a code breakpoint, run, wait for it
+### Set a code breakpoint, run, wait for it, inspect state
 
 ```python
+import base64
+
 a.debugger_command("BP CS:0100")        # breakpoint at current CS:0100
 a.cpu_run()
 while True:
@@ -277,9 +396,14 @@ while True:
     if ev.get("event") == "bp.hit":
         print(f"hit bp {ev['bp_index']} at {ev['seg']:04x}:{ev['off']:08x}")
         break
-# CPU is now paused; subsequent debugger.command calls inspect state
-print(a.debugger_command("R")["output"])
-print(a.debugger_command("D DS:SI 32")["output"])
+# CPU is now paused. Use the typed snapshot commands to inspect state.
+regs = a.call("regs.get")
+print(f"EAX={regs['eax']:08x} EBX={regs['ebx']:08x} CS:EIP={regs['cs']:04x}:{regs['eip']:08x}")
+mem = a.call("mem.read", kind="seg:off",
+             addr=f"{regs['ds']:04x}:{regs['esi']:04x}", len=32)
+print(base64.b64decode(mem["bytes"]).hex())
+# Or list breakpoints via the text passthrough:
+print(a.debugger_command("BPLIST")["output"])
 a.cpu_run()                              # resume
 ```
 
@@ -311,7 +435,7 @@ for ev in a.events(timeout=None):         # block forever
 a.cpu_pause()
 # drain the debugger.entered / state.paused events
 while a.next_event(timeout=0.1) is not None: pass
-print(a.debugger_command("R")["output"])
+print(a.call("regs.get"))
 print(a.debugger_command("BPLIST")["output"])
 a.cpu_run()
 ```
@@ -327,7 +451,10 @@ a.keyboard_release("leftctrl")
 ## Gotchas
 
 - **Wait for the portfile.** The listener is started during DOS init, not
-  at process spawn. Poll for the file before connecting.
+  at process spawn. Poll for the file's existence before connecting.
+  The file is written atomically (write+rename) so once it appears,
+  reading it returns a complete port number — no need to retry on empty
+  reads.
 - **Bind shows as `0.0.0.0` in `netstat`.** SDL_net's bind API can only
   bind to `INADDR_ANY`; loopback enforcement happens per-accept by
   inspecting the peer address. Non-loopback peers are dropped immediately.
@@ -341,8 +468,9 @@ a.keyboard_release("leftctrl")
   debugger interactively.
 - **`debugger.command` is text in, text out.** Output formatting matches
   the curses debugger and can change between versions. Don't write
-  brittle parsers; for stable structured access, wait for Phase 2 typed
-  commands.
+  brittle parsers on top of it; for registers and memory use the typed
+  `regs.get` / `mem.read` commands, and for everything else wait for
+  Phase 2 to add a typed equivalent.
 - **`keyboard.type` is ASCII only.** Non-ASCII input is silently mangled
   by the paste driver. For non-ASCII or modifier combos, use `press` /
   `release` / `tap` with named keys.
@@ -357,13 +485,14 @@ a.keyboard_release("leftctrl")
 
 ## Reference client
 
-`contrib/agent-client/dbxagent.py` (273 lines, stdlib only). Sync
-`call(cmd, **args)` plus typed helpers (`vm_version`, `cpu_pause`,
-`cpu_run`, `keyboard_type`, `keyboard_tap`, `keyboard_press`,
+`contrib/agent-client/dbxagent.py` (stdlib only). Sync `call(cmd, **args)`
+plus typed helpers (`vm_version`, `cpu_pause`, `cpu_run`, `regs_get`,
+`mem_read`, `keyboard_type`, `keyboard_tap`, `keyboard_press`,
 `keyboard_release`, `debugger_command`, `log_subscribe`,
-`log_unsubscribe`). Events arrive via `next_event(timeout)` /
-`events(timeout)`. Reader is a daemon thread; closing the socket unblocks
-it; use as a context manager (`with DbxAgent(...) as a:`).
+`log_unsubscribe`). `mem_read` decodes the base64 for you and returns
+raw `bytes`. Events arrive via `next_event(timeout)` / `events(timeout)`.
+Reader is a daemon thread; closing the socket unblocks it; use as a
+context manager (`with DbxAgent(...) as a:`).
 
 CLI demo:
 

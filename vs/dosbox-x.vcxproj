@@ -1160,6 +1160,7 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClCompile Include="..\src\agent\agent_json.cpp" />
     <ClCompile Include="..\src\agent\agent_keyboard.cpp" />
     <ClCompile Include="..\src\agent\agent_events.cpp" />
+    <ClCompile Include="..\src\agent\agent_cpu.cpp" />
     <ClCompile Include="..\src\dosbox.cpp" />
     <ClCompile Include="..\src\dos\cdrom.cpp" />
     <ClCompile Include="..\src\dos\cdrom_aspi_win32.cpp" />

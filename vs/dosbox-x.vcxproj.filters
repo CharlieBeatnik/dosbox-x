@@ -843,6 +843,9 @@
     <ClCompile Include="..\src\agent\agent_events.cpp">
       <Filter>Sources\agent</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\agent\agent_cpu.cpp">
+      <Filter>Sources\agent</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\dosbox.cpp">
       <Filter>Sources</Filter>
     </ClCompile>

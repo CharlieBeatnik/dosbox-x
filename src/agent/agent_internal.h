@@ -149,6 +149,10 @@ JsonValue handleKeyboardPress(double id, const JsonValue &args);
 JsonValue handleKeyboardRelease(double id, const JsonValue &args);
 JsonValue handleKeyboardTap(double id, const JsonValue &args);
 
+/* Dispatch entry points implemented in agent_cpu.cpp. */
+JsonValue handleRegsGet(double id, const JsonValue &args);
+JsonValue handleMemRead(double id, const JsonValue &args);
+
 /* Reply helpers shared between agent.cpp and agent_keyboard.cpp. */
 JsonValue makeReplyOk(double id, JsonObject result);
 JsonValue makeReplyError(double id, const std::string &code, const std::string &message);

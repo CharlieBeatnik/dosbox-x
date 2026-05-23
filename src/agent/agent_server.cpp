@@ -38,6 +38,7 @@
 
 #if defined(_WIN32)
 # include <winsock2.h>   /* SOCKET / getsockname for the ephemeral-port readback */
+# include <windows.h>    /* MoveFileExA for atomic portfile publish */
 #else
 # include <sys/types.h>
 # include <sys/socket.h>
@@ -98,13 +99,34 @@ void closeClient() {
 
 void writePortFile() {
     if (g.portfile.empty()) return;
-    FILE *f = fopen(g.portfile.c_str(), "wb");
+    /* Atomic publish: write to a sibling .tmp then rename onto the
+     * destination. This stops a polling client from seeing an empty file
+     * if it reads between fopen() and the first fprintf(). */
+    std::string tmp = g.portfile + ".tmp";
+    FILE *f = fopen(tmp.c_str(), "wb");
     if (!f) {
-        LOG(LOG_MISC, LOG_WARN)("agent: cannot write portfile '%s'", g.portfile.c_str());
+        LOG(LOG_MISC, LOG_WARN)("agent: cannot write portfile '%s'", tmp.c_str());
         return;
     }
     fprintf(f, "%u\n", static_cast<unsigned>(g.listenPort));
+    fflush(f);
     fclose(f);
+
+#if defined(_WIN32)
+    /* Windows std::rename() fails if the destination exists. MoveFileExA
+     * with REPLACE_EXISTING is the portable atomic-on-same-volume swap. */
+    if (!MoveFileExA(tmp.c_str(), g.portfile.c_str(),
+                     MOVEFILE_REPLACE_EXISTING)) {
+        LOG(LOG_MISC, LOG_WARN)("agent: cannot publish portfile '%s'", g.portfile.c_str());
+        remove(tmp.c_str());
+    }
+#else
+    /* POSIX rename() is atomic and replaces an existing destination. */
+    if (rename(tmp.c_str(), g.portfile.c_str()) != 0) {
+        LOG(LOG_MISC, LOG_WARN)("agent: cannot publish portfile '%s'", g.portfile.c_str());
+        remove(tmp.c_str());
+    }
+#endif
 }
 
 void removePortFile() {

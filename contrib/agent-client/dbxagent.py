@@ -172,6 +172,27 @@ class DbxAgent:
     def cpu_run(self) -> dict:
         return self.call("cpu.run")
 
+    def regs_get(self) -> dict:
+        """Snapshot all CPU registers in one structured reply.
+
+        Keys: eax/ebx/ecx/edx/esi/edi/ebp/esp/eip (32-bit unsigned ints),
+        cs/ds/es/fs/gs/ss (16-bit), and eflags. All values are decoded as
+        Python ints — format as hex client-side if needed.
+        """
+        return self.call("regs.get")
+
+    def mem_read(self, kind: str, addr: str, length: int) -> bytes:
+        """Read up to 64 KB of guest memory.
+
+        ``kind`` is ``"seg:off"``, ``"linear"``, or ``"physical"``; ``addr``
+        is the hex address string (``"1000:0100"`` for seg:off, otherwise
+        plain hex with or without ``0x`` prefix). Returns the raw bytes
+        directly — the wire format's base64 is decoded for you.
+        """
+        import base64
+        res = self.call("mem.read", kind=kind, addr=addr, len=length)
+        return base64.b64decode(res["bytes"])
+
     def keyboard_type(self, text: str) -> dict:
         return self.call("keyboard.type", text=text)
 
