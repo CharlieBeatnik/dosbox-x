@@ -141,3 +141,5 @@ contrib/macos/dosbox-x.plist
 # ignore default dosbox config files (used for manual testing)
 /dosbox-x.conf
 /src/dosbox-x.conf
+out.xml
+contrib/agent-client/__pycache__/dbxagent.cpython-314.pyc

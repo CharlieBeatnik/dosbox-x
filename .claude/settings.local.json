@@ -1,0 +1,36 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find D:\\\\data\\\\Git\\\\dosbox-x\\\\src *)",
+      "Bash(cd *)",
+      "Bash(xargs grep -l \"socket\\\\|select\\\\|accept\\\\|listen\")",
+      "Bash(git switch *)",
+      "Bash(mkdir -p docs/agent-interface)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Read(//mingw64/bin/**)",
+      "Read(//c/Program Files/Microsoft Visual Studio/**)",
+      "Bash(cmd /c '\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Enterprise\\\\Common7\\\\Tools\\\\VsDevCmd.bat\" && msbuild vs\\\\dosbox-x.sln /property:GenerateFullPaths=true /p:Configuration=Debug /p:Platform=x64 /p:PlatformToolset=v143 -m')",
+      "Bash(cmd //c \"\\\\\"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Enterprise\\\\Common7\\\\Tools\\\\VsDevCmd.bat\\\\\" -arch=amd64 && cd /d D:\\\\data\\\\Git\\\\dosbox-x && msbuild vs\\\\dosbox-x.sln /property:GenerateFullPaths=true /p:Configuration=Debug /p:Platform=x64 /p:PlatformToolset=v143 -m\")",
+      "Bash(grep -E \"agent\\\\\\\\\\\\\\\\agent|src.agent|agent\\\\.cpp|agent_server\\\\.cpp|agent_json\\\\.cpp|agent_internal\" \"C:/Users/andy/.claude/projects/D--data-Git-dosbox-x/e236ae01-a81e-43b8-9772-be2a52542db1/tool-results/b6jwmco1z.txt\")",
+      "Bash(\"D:/data/Git/dosbox-x/bin/x64/Debug/dosbox-x.exe\" -tests --gtest_filter='AgentProtocol*')",
+      "Bash(\"D:/data/Git/dosbox-x/bin/x64/Debug/dosbox-x.exe\" -gtest_list_tests)",
+      "Bash(\"D:/data/Git/dosbox-x/bin/x64/Debug/dosbox-x.exe\" -tests)",
+      "Bash(taskkill //F //IM dosbox-x.exe)",
+      "Bash(\"./bin/x64/Debug/dosbox-x.exe\" -tests \"--gtest_filter=AgentProtocol*\" \"--gtest_output=xml:agent_test.xml\")",
+      "Bash(echo \"exit=$?\")",
+      "Bash(tasklist //FI \"IMAGENAME eq dosbox-x.exe\")",
+      "Bash(git push *)",
+      "Bash(\"./bin/x64/Debug/dosbox-x.exe\" -tests \"--gtest_filter=Agent*\" \"--gtest_output=xml:agent_test.xml\")",
+      "Bash(\"./bin/x64/Debug/dosbox-x.exe\" -agent-listen 127.0.0.1:0 -agent-portfile dbxport.txt -fastlaunch)",
+      "Bash(python contrib/agent-client/dbxagent.py --portfile dbxport.txt)",
+      "Bash(echo \"---exit:$?\")",
+      "Bash(\"./bin/x64/Debug/dosbox-x.exe\" -agent-listen 127.0.0.1:0 -agent-portfile dbxport.txt -fastlaunch -console)",
+      "Bash(netstat -ano)",
+      "Bash(tasklist //FI \"IMAGENAME eq dosbox-x.exe\" //FO CSV //NH)",
+      "Bash(python contrib/agent-client/dbxagent.py --portfile dbxport.txt --subscribe --type 'DIR\\\\r' --events 2)",
+      "Bash(\"./bin/x64/Debug/dosbox-x.exe\" -fastlaunch)",
+      "Bash(python -c ' *)"
+    ]
+  }
+}
