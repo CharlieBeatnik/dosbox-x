@@ -2,6 +2,9 @@
 
 **Phase 1 is done.** The PR opens this branch against `master`.
 
+> **If you are here to *use* the agent channel, not extend it, read
+> [`USAGE.md`](USAGE.md) instead.** This file is the development handover.
+
 ## State
 
 - **Branch:** `agent-interface`.
