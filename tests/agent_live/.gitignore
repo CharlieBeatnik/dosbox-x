@@ -1,0 +1,9 @@
+# Build artefacts from `_build.dosbox-x.conf` (TASM 1.0 + TLINK /T):
+BPTEST.OBJ
+BPTEST.LST
+BPTEST.MAP
+BUILD.LOG
+
+# DOSBox-X transient state:
+*.dosbox-x.log
+__pycache__/
