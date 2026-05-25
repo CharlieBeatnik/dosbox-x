@@ -121,6 +121,8 @@ events don't. The reference client does this in a single reader thread.
 | `keyboard.tap`      | `{key}`                       | `{}`                                |
 | `log.subscribe`     | none                          | `{subscribed: true}`                |
 | `log.unsubscribe`   | none                          | `{subscribed: false}`               |
+| `farcall.watch`     | `{target_seg}`                | `{watching, target_seg}`            |
+| `farcall.unwatch`   | none                          | `{watching: false}`                 |
 
 ### `vm.version`
 
@@ -286,6 +288,51 @@ After subscribing, the server pushes a `log.line` event for every
 There is **no replay** of lines emitted before subscribe; subscribe at
 connect time if you want everything.
 
+### `farcall.watch` / `farcall.unwatch`
+
+Watch for CPU far transfers (`CALL FAR`, `JMP FAR`, `RETF`) whose
+destination CS equals a sentinel segment. Use this to identify the
+*caller* when something lands at an unexpected `CS:IP` — set the
+sentinel, run, wait for the first `farcall.transfer` event, and the
+event tells you which instruction in which source location did the
+transfer.
+
+- `target_seg` (required) — `u16` decimal number, or hex string with or
+  without `0x` prefix (`"483C"`, `"0x483C"`, `18492` all mean the same
+  segment).
+- Pass `target_seg: null` to clear the watch (equivalent to
+  `farcall.unwatch`).
+- Single-sentinel for now; calling `farcall.watch` again replaces the
+  previous sentinel.
+
+Reply: `{watching: true|false, target_seg: <u16>}`. Idempotent — calling
+again with the same segment is a no-op.
+
+Emits a `farcall.transfer` event per matching transfer:
+
+```json
+{"event": "farcall.transfer",
+ "target_seg": 18492, "target_off": 4068,
+ "from_cs": 2084, "from_ip": 24576,
+ "kind": "call_far_direct"}
+```
+
+`kind` is one of: `"call_far_direct"` (opcode `0x9A`),
+`"call_far_indirect"` (`0xFF /3`), `"jmp_far_direct"` (`0xEA`),
+`"jmp_far_indirect"` (`0xFF /5`), `"retf"` (`0xCA` / `0xCB`),
+`"iret"` (`0xCF`).
+
+`from_cs` / `from_ip` are the source instruction's CS:IP (before the
+transfer); `target_seg` / `target_off` are the destination. For RETF
+the target is read from the stack frame the RETF pops, which is the
+authoritative answer to "who's about to return here?"
+
+The watch is a single u16 compare per far transfer (only on the handful
+of opcodes listed above), so it has negligible cost; you can leave it
+set across long-running guest code. The intended workflow is "set
+before the suspect window, drain events while reproducing, unwatch
+afterwards".
+
 ## Events
 
 | Event              | Fields                          | When                                                            |
@@ -295,6 +342,7 @@ connect time if you want everything.
 | `bp.hit`           | `{seg, off, bp_index}`          | Just before the debugger entry that a breakpoint triggered      |
 | `debugger.entered` | `{reason}`                      | After `bp.hit`, or any other debugger entry                     |
 | `log.line`         | `{text}`                        | While subscribed                                                |
+| `farcall.transfer` | `{target_seg, target_off, from_cs, from_ip, kind}` | A `CALL FAR` / `JMP FAR` / `RETF` whose target CS matched the active `farcall.watch` sentinel |
 | `agent.error`      | `{code, message}`               | Malformed input from your side (no `id` available to reply on)  |
 | `agent.overflow`   | none                            | Outbox hit its 1 MB cap; lines were dropped                     |
 | `busy`             | none                            | A second client tried to connect; that connection is closed     |
@@ -440,6 +488,32 @@ print(a.debugger_command("BPLIST")["output"])
 a.cpu_run()
 ```
 
+### Find the caller of a far transfer to a known segment
+
+When the CPU lands at an unexpected `CS:EIP` (e.g. mid-data execution
+after a corrupted `CALL FAR`), set a far-transfer watch on the
+destination segment *before* the bad transfer happens, then drain
+events while reproducing:
+
+```python
+a.call("farcall.watch", target_seg="483C")    # or 0x483C, or 18492
+a.keyboard_tap("space")                       # trigger whatever reproduces
+while True:
+    ev = a.next_event(timeout=10.0)
+    if ev is None: raise TimeoutError("no far-transfer to 483C in 10s")
+    if ev.get("event") == "farcall.transfer":
+        print(f"{ev['kind']} from {ev['from_cs']:04x}:{ev['from_ip']:04x} "
+              f"-> {ev['target_seg']:04x}:{ev['target_off']:04x}")
+        break
+a.call("farcall.unwatch")
+# now snapshot regs/stack and dig
+```
+
+The first matching event names the *source* of the bad far transfer —
+that's the instruction to start working backwards from. The cost is one
+u16 compare per far transfer (only on the listed opcodes), so leaving
+the watch set across long runs is fine.
+
 ### Hold Ctrl while pressing C
 
 ```python
@@ -476,6 +550,14 @@ a.keyboard_release("leftctrl")
   `release` / `tap` with named keys.
 - **`bp_index` is not stable.** If you `BPDEL 2`, the indices of all
   later breakpoints shift down. Re-read `BPLIST` after any mutation.
+- **BPs added via `debugger.command` activate immediately.** The pause-
+  set-resume pattern below still works, but is no longer required —
+  setting `BP CS:IP`, `BPM`, `BPINT`, `BPPM`, `BPLM`, or `FM` while the
+  CPU is running takes effect on the very next instruction fetch / int
+  vector / memory access. Earlier builds had a bug where BPs added
+  while running stayed inactive until the next explicit `cpu.run` cycle;
+  if you wrote driver code that pauses, sets, then runs solely to work
+  around that, the pause is now optional.
 - **`agent.overflow` means lines were dropped.** Outbox cap is 1 MB
   per client. If you see this, you're producing events faster than you're
   reading them — drain `events()` more aggressively, or unsubscribe from
