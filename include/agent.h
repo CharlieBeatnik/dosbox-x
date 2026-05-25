@@ -54,6 +54,18 @@ void AGENT_EmitLog(const char *line);
 void AGENT_EmitDebuggerEntered(const char *reason);
 void AGENT_EmitStateRunning(void);
 void AGENT_EmitStatePaused(void);
+void AGENT_EmitFarTransfer(uint16_t target_seg, uint16_t target_ip,
+                           uint16_t from_cs,     uint16_t from_ip,
+                           const char *kind);
+
+/* Far-transfer watch. CPU core hot-path queries AGENT_FarWatchMatches()
+ * for every CALL FAR / JMP FAR / RETF; when it returns true, the core
+ * calls AGENT_EmitFarTransfer(). Single-segment sentinel today; the
+ * predicate stays as a one-u16-compare-plus-flag-test so it's safe to
+ * call unconditionally from the dispatch loop. */
+bool AGENT_FarWatchMatches(uint16_t seg);
+void AGENT_FarWatchSet(uint16_t seg);
+void AGENT_FarWatchClear(void);
 
 /* Notified when DOSBOX_SetNormalLoop / DOSBOX_SetLoop changes the main
  * loop. Used so we know when to flip state.paused <-> state.running. */
@@ -73,6 +85,12 @@ static inline void AGENT_EmitLog(const char * /*line*/) {}
 static inline void AGENT_EmitDebuggerEntered(const char * /*reason*/) {}
 static inline void AGENT_EmitStateRunning(void) {}
 static inline void AGENT_EmitStatePaused(void) {}
+static inline void AGENT_EmitFarTransfer(uint16_t /*target_seg*/, uint16_t /*target_ip*/,
+                                         uint16_t /*from_cs*/,    uint16_t /*from_ip*/,
+                                         const char * /*kind*/) {}
+static inline bool AGENT_FarWatchMatches(uint16_t /*seg*/) { return false; }
+static inline void AGENT_FarWatchSet(uint16_t /*seg*/) {}
+static inline void AGENT_FarWatchClear(void) {}
 static inline void AGENT_OnLoopChange(void) {}
 static inline bool AGENT_IsHeadless(void) { return false; }
 

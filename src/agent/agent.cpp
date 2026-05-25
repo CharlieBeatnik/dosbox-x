@@ -39,6 +39,13 @@
 #include <vector>
 
 namespace agent {
+
+/* Far-transfer watch state — file-scope so the public AGENT_FarWatch*
+ * helpers below can mutate it without going through dispatch. Read on the
+ * CPU dispatch hot path; written only from the main thread. */
+bool     g_farWatchEnabled = false;
+uint16_t g_farWatchSeg     = 0;
+
 namespace {
 
 bool g_started        = false;     /* did we register the tick handler / start the server? */
@@ -178,6 +185,61 @@ JsonValue handleCpuRun(double id, const JsonValue & /*args*/) {
     return makeReplyOk(id, JsonObject{});
 }
 
+/* Accept target_seg as a JSON number (e.g. 18492) or a hex string
+ * ("0x483C" / "483C") to match mem.read's accept-either convention. */
+bool parseSegArg(const JsonValue &v, uint32_t &out)
+{
+    if (v.isNumber()) {
+        if (v.n < 0 || v.n > 0xFFFF) return false;
+        out = (uint32_t)v.n;
+        return true;
+    }
+    if (v.isString()) {
+        const std::string &s = v.s;
+        size_t skip = 0;
+        if (s.size() >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) skip = 2;
+        if (s.size() == skip) return false;
+        char *end = nullptr;
+        unsigned long val = strtoul(s.c_str() + skip, &end, 16);
+        if (!end || *end != '\0') return false;
+        if (val > 0xFFFF) return false;
+        out = (uint32_t)val;
+        return true;
+    }
+    return false;
+}
+
+JsonValue handleFarcallWatch(double id, const JsonValue &args) {
+    const JsonValue *seg = args.get("target_seg");
+    if (!seg) {
+        return makeReplyError(id, "bad_args",
+            "expected {\"target_seg\":<u16 or hex string>} (null to clear)");
+    }
+    if (seg->isNull()) {
+        AGENT_FarWatchClear();
+        JsonObject r;
+        r.emplace("watching", JsonValue::makeBool(false));
+        return makeReplyOk(id, std::move(r));
+    }
+    uint32_t segValue = 0;
+    if (!parseSegArg(*seg, segValue)) {
+        return makeReplyError(id, "bad_args",
+            "target_seg must be u16 number or hex string");
+    }
+    AGENT_FarWatchSet((uint16_t)segValue);
+    JsonObject r;
+    r.emplace("watching",   JsonValue::makeBool(true));
+    r.emplace("target_seg", JsonValue::makeNumber(segValue));
+    return makeReplyOk(id, std::move(r));
+}
+
+JsonValue handleFarcallUnwatch(double id, const JsonValue & /*args*/) {
+    AGENT_FarWatchClear();
+    JsonObject r;
+    r.emplace("watching", JsonValue::makeBool(false));
+    return makeReplyOk(id, std::move(r));
+}
+
 }  /* anonymous namespace */
 
 JsonValue makeReplyOk(double id, JsonObject result) {
@@ -237,6 +299,8 @@ std::string dispatchLine(const std::string &line) {
     if (cmd->s == "cpu.run")           return jsonEncode(handleCpuRun(id, a));
     if (cmd->s == "regs.get")          return jsonEncode(handleRegsGet(id, a));
     if (cmd->s == "mem.read")          return jsonEncode(handleMemRead(id, a));
+    if (cmd->s == "farcall.watch")     return jsonEncode(handleFarcallWatch(id, a));
+    if (cmd->s == "farcall.unwatch")   return jsonEncode(handleFarcallUnwatch(id, a));
 
     return jsonEncode(makeReplyError(id, "unknown_cmd",
         std::string("unknown command: ") + cmd->s));
@@ -294,6 +358,20 @@ bool AGENT_IsHeadless(void) {
      * revisited later; the loss is that pressing Alt-Pause with the agent
      * active no longer pops a curses window. */
     return agent::g_started;
+}
+
+bool AGENT_FarWatchMatches(uint16_t seg) {
+    return agent::g_farWatchEnabled && seg == agent::g_farWatchSeg;
+}
+
+void AGENT_FarWatchSet(uint16_t seg) {
+    agent::g_farWatchSeg     = seg;
+    agent::g_farWatchEnabled = true;
+}
+
+void AGENT_FarWatchClear(void) {
+    agent::g_farWatchEnabled = false;
+    agent::g_farWatchSeg     = 0;
 }
 
 #endif /* C_DEBUG */

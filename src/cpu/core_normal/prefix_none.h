@@ -779,12 +779,22 @@
 		if (reg_ax & 0x8000) reg_dx=0xffff;else reg_dx=0;
 		break;
 	CASE_W(0x9a)												/* CALL Ap */
-		{ 
+		{
 			FillFlags();
 			uint16_t newip=Fetchw();uint16_t newcs=Fetchw();
+#if C_DEBUG
+			extern bool AGENT_FarWatchMatches(uint16_t);
+			extern void AGENT_EmitFarTransfer(uint16_t, uint16_t, uint16_t, uint16_t, const char*);
+			uint16_t agent_oldcs = SegValue(cs);
+			uint16_t agent_oldip = (uint16_t)GETIP;
+#endif
 			CPU_CALL(false,newcs,newip,GETIP);
+#if C_DEBUG
+			if (AGENT_FarWatchMatches(newcs))
+				AGENT_EmitFarTransfer(newcs, newip, agent_oldcs, agent_oldip, "call_far_direct");
+#endif
 #if CPU_TRAP_CHECK
-			if (GETFLAG(TF)) {	
+			if (GETFLAG(TF)) {
 				cpudecoder=CPU_TRAP_DECODER;
 				return CBRET_NONE;
 			}
@@ -1033,16 +1043,44 @@
 #endif
 			Bitu words=Fetchw();
 			FillFlags();
+#if C_DEBUG
+			extern bool AGENT_FarWatchMatches(uint16_t);
+			extern void AGENT_EmitFarTransfer(uint16_t, uint16_t, uint16_t, uint16_t, const char*);
+			uint16_t agent_oldcs = SegValue(cs);
+			uint16_t agent_oldip = (uint16_t)GETIP;
+#endif
 			CPU_RET(false,words,GETIP);
+#if C_DEBUG
+			{
+				uint16_t agent_newcs = SegValue(cs);
+				if (AGENT_FarWatchMatches(agent_newcs))
+					AGENT_EmitFarTransfer(agent_newcs, (uint16_t)reg_eip, agent_oldcs, agent_oldip, "retf");
+			}
+#endif
 			continue;
 		}
 	CASE_W(0xcb)												/* RETF */
+		{
 #if CPU_CORE < CPU_ARCHTYPE_80186
         opcode_cb:
 #endif
-		FillFlags();
-		CPU_RET(false,0,GETIP);
-		continue;
+			FillFlags();
+#if C_DEBUG
+			extern bool AGENT_FarWatchMatches(uint16_t);
+			extern void AGENT_EmitFarTransfer(uint16_t, uint16_t, uint16_t, uint16_t, const char*);
+			uint16_t agent_oldcs = SegValue(cs);
+			uint16_t agent_oldip = (uint16_t)GETIP;
+#endif
+			CPU_RET(false,0,GETIP);
+#if C_DEBUG
+			{
+				uint16_t agent_newcs = SegValue(cs);
+				if (AGENT_FarWatchMatches(agent_newcs))
+					AGENT_EmitFarTransfer(agent_newcs, (uint16_t)reg_eip, agent_oldcs, agent_oldip, "retf");
+			}
+#endif
+			continue;
+		}
 	CASE_B(0xcc)												/* INT3 */
 #if C_DEBUG	
 		FillFlags();
@@ -1082,9 +1120,22 @@
 		break;
 	CASE_W(0xcf)												/* IRET */
 		{
+#if C_DEBUG
+			extern bool AGENT_FarWatchMatches(uint16_t);
+			extern void AGENT_EmitFarTransfer(uint16_t, uint16_t, uint16_t, uint16_t, const char*);
+			uint16_t agent_oldcs = SegValue(cs);
+			uint16_t agent_oldip = (uint16_t)GETIP;
+#endif
 			CPU_IRET(false,GETIP);
+#if C_DEBUG
+			{
+				uint16_t agent_newcs = SegValue(cs);
+				if (AGENT_FarWatchMatches(agent_newcs))
+					AGENT_EmitFarTransfer(agent_newcs, (uint16_t)reg_eip, agent_oldcs, agent_oldip, "iret");
+			}
+#endif
 #if CPU_TRAP_CHECK
-			if (GETFLAG(TF)) {	
+			if (GETFLAG(TF)) {
 				cpudecoder=CPU_TRAP_DECODER;
 				return CBRET_NONE;
 			}
@@ -1275,13 +1326,23 @@
 			continue;
 		}
 	CASE_W(0xea)												/* JMP Ap */
-		{ 
+		{
 			uint16_t newip=Fetchw();
 			uint16_t newcs=Fetchw();
 			FillFlags();
+#if C_DEBUG
+			extern bool AGENT_FarWatchMatches(uint16_t);
+			extern void AGENT_EmitFarTransfer(uint16_t, uint16_t, uint16_t, uint16_t, const char*);
+			uint16_t agent_oldcs = SegValue(cs);
+			uint16_t agent_oldip = (uint16_t)GETIP;
+#endif
 			CPU_JMP(false,newcs,newip,GETIP);
+#if C_DEBUG
+			if (AGENT_FarWatchMatches(newcs))
+				AGENT_EmitFarTransfer(newcs, newip, agent_oldcs, agent_oldip, "jmp_far_direct");
+#endif
 #if CPU_TRAP_CHECK
-			if (GETFLAG(TF)) {	
+			if (GETFLAG(TF)) {
 				cpudecoder=CPU_TRAP_DECODER;
 				return CBRET_NONE;
 			}
@@ -1546,9 +1607,19 @@
 					uint16_t newip=LoadMw(eaa);
 					uint16_t newcs=LoadMw(eaa+2);
 					FillFlags();
+#if C_DEBUG
+					extern bool AGENT_FarWatchMatches(uint16_t);
+					extern void AGENT_EmitFarTransfer(uint16_t, uint16_t, uint16_t, uint16_t, const char*);
+					uint16_t agent_oldcs = SegValue(cs);
+					uint16_t agent_oldip = (uint16_t)GETIP;
+#endif
 					CPU_CALL(false,newcs,newip,GETIP);
+#if C_DEBUG
+					if (AGENT_FarWatchMatches(newcs))
+						AGENT_EmitFarTransfer(newcs, newip, agent_oldcs, agent_oldip, "call_far_indirect");
+#endif
 #if CPU_TRAP_CHECK
-					if (GETFLAG(TF)) {	
+					if (GETFLAG(TF)) {
 						cpudecoder=CPU_TRAP_DECODER;
 						return CBRET_NONE;
 					}
@@ -1556,20 +1627,30 @@
 					continue;
 				}
 				break;
-			case 0x04:										/* JMP Ev */	
+			case 0x04:										/* JMP Ev */
 				if (rm >= 0xc0 ) {GetEArw;reg_eip=*earw;}
 				else {GetEAa;reg_eip=LoadMw(eaa);}
 				continue;
-			case 0x05:										/* JMP Ep */	
+			case 0x05:										/* JMP Ep */
 				{
 					if (rm >= 0xc0) goto illegal_opcode;
 					GetEAa;
 					uint16_t newip=LoadMw(eaa);
 					uint16_t newcs=LoadMw(eaa+2);
 					FillFlags();
+#if C_DEBUG
+					extern bool AGENT_FarWatchMatches(uint16_t);
+					extern void AGENT_EmitFarTransfer(uint16_t, uint16_t, uint16_t, uint16_t, const char*);
+					uint16_t agent_oldcs = SegValue(cs);
+					uint16_t agent_oldip = (uint16_t)GETIP;
+#endif
 					CPU_JMP(false,newcs,newip,GETIP);
+#if C_DEBUG
+					if (AGENT_FarWatchMatches(newcs))
+						AGENT_EmitFarTransfer(newcs, newip, agent_oldcs, agent_oldip, "jmp_far_indirect");
+#endif
 #if CPU_TRAP_CHECK
-					if (GETFLAG(TF)) {	
+					if (GETFLAG(TF)) {
 						cpudecoder=CPU_TRAP_DECODER;
 						return CBRET_NONE;
 					}

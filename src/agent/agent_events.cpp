@@ -89,4 +89,24 @@ void AGENT_EmitStatePaused(void)
     agent::serverBroadcastLine("{\"event\":\"state.paused\"}");
 }
 
+void AGENT_EmitFarTransfer(uint16_t target_seg, uint16_t target_ip,
+                           uint16_t from_cs,    uint16_t from_ip,
+                           const char *kind)
+{
+    /* `kind` is one of a fixed set of literals from the CPU core hooks
+     * ("call_far_direct", "call_far_indirect", "jmp_far_direct",
+     * "jmp_far_indirect", "retf"). No escaping needed; buffer sized for
+     * the longest. */
+    char buf[192];
+    snprintf(buf, sizeof(buf),
+        "{\"event\":\"farcall.transfer\","
+        "\"target_seg\":%u,\"target_off\":%u,"
+        "\"from_cs\":%u,\"from_ip\":%u,"
+        "\"kind\":\"%s\"}",
+        static_cast<unsigned>(target_seg), static_cast<unsigned>(target_ip),
+        static_cast<unsigned>(from_cs),    static_cast<unsigned>(from_ip),
+        kind ? kind : "unknown");
+    agent::serverBroadcastLine(buf);
+}
+
 #endif /* C_DEBUG */
