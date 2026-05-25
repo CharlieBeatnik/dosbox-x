@@ -678,6 +678,9 @@ CBreakpoint* CBreakpoint::AddBreakpoint(uint16_t seg, uint32_t off, bool once)
 	bp->SetAddress		(seg,off);
 	bp->SetOnce			(once);
 	BPoints.push_front	(bp);
+	// Activate immediately so BPs added while the CPU is running (e.g. via
+	// the agent's debugger.command path) fire without a subsequent RUN.
+	bp->Activate(true);
 	return bp;
 }
 
@@ -687,6 +690,7 @@ CBreakpoint* CBreakpoint::AddIntBreakpoint(uint8_t intNum, uint16_t ah, uint16_t
 	bp->SetInt			(intNum,ah,al);
 	bp->SetOnce			(once);
 	BPoints.push_front	(bp);
+	bp->Activate(true);
 	return bp;
 }
 
@@ -697,6 +701,7 @@ CBreakpoint* CBreakpoint::AddMemBreakpoint(uint16_t seg, uint32_t off)
 	bp->SetOnce			(false);
 	bp->SetType			(BKPNT_MEMORY);
 	BPoints.push_front	(bp);
+	bp->Activate(true);
 	return bp;
 }
 
