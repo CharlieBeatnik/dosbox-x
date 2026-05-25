@@ -30,7 +30,11 @@
       "Bash(tasklist //FI \"IMAGENAME eq dosbox-x.exe\" //FO CSV //NH)",
       "Bash(python contrib/agent-client/dbxagent.py --portfile dbxport.txt --subscribe --type 'DIR\\\\r' --events 2)",
       "Bash(\"./bin/x64/Debug/dosbox-x.exe\" -fastlaunch)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(git *)",
+      "PowerShell(msbuild vs\\\\dosbox-x.sln /property:GenerateFullPaths=true /p:Configuration=Debug /p:Platform=x64 /p:PlatformToolset=v143 -m 2>&1)",
+      "Bash(tasklist /FI \"IMAGENAME eq dosbox-x.exe\" /FO CSV /NH)",
+      "PowerShell(Get-Process dosbox-x -ErrorAction SilentlyContinue)"
     ]
   }
 }
