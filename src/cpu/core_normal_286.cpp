@@ -249,7 +249,12 @@ Bits CPU_Core286_Normal_Trap_Run(void) {
 	cpu.trap_skip = false;
 
 	Bits ret=CPU_Core286_Normal_Run();
-	if (!cpu.trap_skip) CPU_DebugException(DBINT_STEP,reg_eip);
+	bool surrender = false;
+#if C_DEBUG
+	extern Bitu debugCallback;
+	if (ret == (Bits)debugCallback) surrender = true;
+#endif
+	if (!cpu.trap_skip && !surrender) CPU_DebugException(DBINT_STEP,reg_eip);
 	CPU_Cycles = oldCycles-1;
 	cpudecoder = &CPU_Core286_Normal_Run;
 
