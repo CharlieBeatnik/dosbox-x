@@ -123,6 +123,8 @@ events don't. The reference client does this in a single reader thread.
 | `log.unsubscribe`   | none                          | `{subscribed: false}`               |
 | `farcall.watch`     | `{target_seg}`                | `{watching, target_seg}`            |
 | `farcall.unwatch`   | none                          | `{watching: false}`                 |
+| `cpu.watch_target`  | `{target_seg, target_off}`    | `{watching, target_seg, target_off}`|
+| `cpu.unwatch_target`| none                          | `{watching: false}`                 |
 
 ### `vm.version`
 
@@ -333,6 +335,56 @@ set across long-running guest code. The intended workflow is "set
 before the suspect window, drain events while reproducing, unwatch
 afterwards".
 
+### `cpu.watch_target` / `cpu.unwatch_target`
+
+The NEAR-transfer sibling of `farcall.watch`. Use this when you know the
+exact `(CS, IP)` the CPU is landing at and want to identify the *NEAR*
+instruction that jumped/called/returned there. Covers every direct and
+indirect NEAR transfer plus taken `Jcc` / `LOOP` / `JCXZ` and `RETN`.
+NEAR transfers are much more common than FAR, so the sentinel is a
+`(seg, off)` pair (not just a segment) — only the exact destination
+fires an event.
+
+- `target_seg`, `target_off` (both required when setting) — `u16`
+  decimal numbers or hex strings, same convention as `farcall.watch`.
+- Pass `target_seg: null` to clear (same as `cpu.unwatch_target`).
+- Single sentinel — calling again replaces the previous one.
+
+Reply: `{watching: true|false, target_seg, target_off}`.
+
+Emits a `cpu.transfer` event per matching transfer:
+
+```json
+{"event": "cpu.transfer",
+ "target_seg": 2084, "target_off": 59598,
+ "from_cs": 2084, "from_ip": 8512,
+ "kind": "jmp_near_indirect"}
+```
+
+`kind` is one of:
+
+| `kind`                | Opcode group                                          |
+|-----------------------|-------------------------------------------------------|
+| `call_near_direct`    | `0xE8` (rel16)                                        |
+| `jmp_near_direct`     | `0xE9` (rel16)                                        |
+| `jmp_short`           | `0xEB` (rel8)                                         |
+| `call_near_indirect`  | `0xFF /2`                                             |
+| `jmp_near_indirect`   | `0xFF /4`                                             |
+| `retn`                | `0xC3`                                                |
+| `retn_imm`            | `0xC2 imm16`                                          |
+| `jcc_short`           | `0x70..0x7F` (taken) — also `LOOP`/`LOOPZ`/`LOOPNZ`/`JCXZ` |
+| `jcc_near`            | `0x0F 0x80..0x8F` (taken, 386+)                       |
+
+Conditional jumps only emit when the branch is **taken** (same convention
+as the FAR Jcc hooks). `from_cs` is always equal to `target_seg` — a
+NEAR transfer can't change CS. `from_ip` is the post-operand IP (i.e.,
+the return address) of the instruction that branched, so disassembling
+backwards from `from_ip` finds the source instruction.
+
+Cost is one `(seg, off)` compare per NEAR transfer when the watch is
+set; the test compiles to a flag check plus two u16 compares, which is
+cheap enough to leave in place across long-running guest code.
+
 ## Events
 
 | Event              | Fields                          | When                                                            |
@@ -343,6 +395,7 @@ afterwards".
 | `debugger.entered` | `{reason}`                      | After `bp.hit`, or any other debugger entry                     |
 | `log.line`         | `{text}`                        | While subscribed                                                |
 | `farcall.transfer` | `{target_seg, target_off, from_cs, from_ip, kind}` | A `CALL FAR` / `JMP FAR` / `RETF` whose target CS matched the active `farcall.watch` sentinel |
+| `cpu.transfer`     | `{target_seg, target_off, from_cs, from_ip, kind}` | A NEAR `CALL`/`JMP`/taken `Jcc`/`RETN` whose `(CS, IP)` matched the active `cpu.watch_target` sentinel |
 | `agent.error`      | `{code, message}`               | Malformed input from your side (no `id` available to reply on)  |
 | `agent.overflow`   | none                            | Outbox hit its 1 MB cap; lines were dropped                     |
 | `busy`             | none                            | A second client tried to connect; that connection is closed     |

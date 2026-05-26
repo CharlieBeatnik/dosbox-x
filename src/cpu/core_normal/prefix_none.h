@@ -928,6 +928,9 @@
 #endif
 			uint32_t old_esp = reg_esp;
 
+#if C_DEBUG
+			const uint16_t agent_from_ip = (uint16_t)GETIP;
+#endif
 			try {
 				/* this is structured either to complete RET or leave registers unmodified if interrupted by page fault */
 				uint32_t new_eip = Pop_16();
@@ -939,10 +942,22 @@
 				reg_esp = old_esp; /* restore stack pointer */
 				throw;
 			}
+#if C_DEBUG
+			AGENT_NEAR_HOOK("retn_imm", agent_from_ip, reg_eip);
+#endif
 		} continue;
 	CASE_W(0xc3)												/* RETN */
+#if C_DEBUG
+		{
+			const uint16_t agent_from_ip = (uint16_t)GETIP;
+			reg_eip=Pop_16();
+			AGENT_NEAR_HOOK("retn", agent_from_ip, reg_eip);
+			continue;
+		}
+#else
 		reg_eip=Pop_16();
 		continue;
+#endif
 	CASE_W(0xc4)												/* LES */
 		{
 			GetEAaNDEF;
@@ -1309,20 +1324,29 @@
 			break;
 		}
 	CASE_W(0xe8)												/* CALL Jw */
-		{ 
+		{
 			/* must not adjust (E)IP until we have completed the instruction.
 			 * if interrupted by a page fault, EIP must be unmodified. */
 			uint16_t addip=(uint16_t)Fetchws();
 			uint16_t here=GETIP;
 			Push_16(here);
 			reg_eip=(uint16_t)(addip+here);
+#if C_DEBUG
+			AGENT_NEAR_HOOK("call_near_direct", here, reg_eip);
+#endif
 			continue;
 		}
 	CASE_W(0xe9)												/* JMP Jw */
-		{ 
+		{
 			uint16_t addip=(uint16_t)Fetchws();
 			SAVEIP;
+#if C_DEBUG
+			const uint16_t agent_from_ip = (uint16_t)reg_eip;
+#endif
 			reg_eip=(uint16_t)(reg_eip+addip);
+#if C_DEBUG
+			AGENT_NEAR_HOOK("jmp_near_direct", agent_from_ip, reg_eip);
+#endif
 			continue;
 		}
 	CASE_W(0xea)												/* JMP Ap */
@@ -1350,10 +1374,16 @@
 			continue;
 		}
 	CASE_W(0xeb)												/* JMP Jb */
-		{ 
+		{
 			int16_t addip=Fetchbs();
 			SAVEIP;
+#if C_DEBUG
+			const uint16_t agent_from_ip = (uint16_t)reg_eip;
+#endif
 			reg_eip=(uint16_t)(reg_eip+(uint32_t)addip);
+#if C_DEBUG
+			AGENT_NEAR_HOOK("jmp_short", agent_from_ip, reg_eip);
+#endif
 			continue;
 		}
 	CASE_B(0xec)												/* IN AL,DX */
@@ -1596,8 +1626,14 @@
 					uint16_t new_eip;
 					if (rm >= 0xc0 ) {GetEArw;new_eip=*earw;}
 					else {GetEAa;new_eip=LoadMw(eaa);}
+#if C_DEBUG
+					const uint16_t agent_from_ip = (uint16_t)GETIP;
+#endif
 					Push_16(GETIP); /* <- PF may happen here */
 					reg_eip = new_eip;
+#if C_DEBUG
+					AGENT_NEAR_HOOK("call_near_indirect", agent_from_ip, reg_eip);
+#endif
 				}
 				continue;
 			case 0x03:										/* CALL Ep */
@@ -1628,9 +1664,19 @@
 				}
 				break;
 			case 0x04:										/* JMP Ev */
+#if C_DEBUG
+				{
+					const uint16_t agent_from_ip = (uint16_t)GETIP;
+					if (rm >= 0xc0 ) {GetEArw;reg_eip=*earw;}
+					else {GetEAa;reg_eip=LoadMw(eaa);}
+					AGENT_NEAR_HOOK("jmp_near_indirect", agent_from_ip, reg_eip);
+					continue;
+				}
+#else
 				if (rm >= 0xc0 ) {GetEArw;reg_eip=*earw;}
 				else {GetEAa;reg_eip=LoadMw(eaa);}
 				continue;
+#endif
 			case 0x05:										/* JMP Ep */
 				{
 					if (rm >= 0xc0) goto illegal_opcode;

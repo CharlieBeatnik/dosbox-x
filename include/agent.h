@@ -58,6 +58,14 @@ void AGENT_EmitFarTransfer(uint16_t target_seg, uint16_t target_ip,
                            uint16_t from_cs,     uint16_t from_ip,
                            const char *kind);
 
+/* Near-transfer event (proposal 4.4). Same shape as the FAR variant but
+ * always within a single CS; emitted as `cpu.transfer`. `kind` is a short
+ * literal naming the source opcode group ("jmp_near_indirect",
+ * "call_near_indirect", "retn", ...). */
+void AGENT_EmitTransfer(const char *kind,
+                        uint16_t target_seg, uint16_t target_off,
+                        uint16_t from_cs,    uint16_t from_ip);
+
 /* Far-transfer watch. CPU core hot-path queries AGENT_FarWatchMatches()
  * for every CALL FAR / JMP FAR / RETF; when it returns true, the core
  * calls AGENT_EmitFarTransfer(). Single-segment sentinel today; the
@@ -66,6 +74,16 @@ void AGENT_EmitFarTransfer(uint16_t target_seg, uint16_t target_ip,
 bool AGENT_FarWatchMatches(uint16_t seg);
 void AGENT_FarWatchSet(uint16_t seg);
 void AGENT_FarWatchClear(void);
+
+/* Near-transfer watch (proposal 4.4). Sentinel is a (seg, off) pair so
+ * the hot path can filter aggressively — NEAR transfers are far more
+ * frequent than FAR. CPU core queries AGENT_TargetWatchMatches() at
+ * every CALL NEAR / JMP NEAR (direct + indirect), every taken Jcc /
+ * LOOP / JCXZ, and every RETN; on a match it calls AGENT_EmitTransfer()
+ * with a `cpu.transfer` event. */
+bool AGENT_TargetWatchMatches(uint16_t seg, uint16_t off);
+void AGENT_TargetWatchSet(uint16_t seg, uint16_t off);
+void AGENT_TargetWatchClear(void);
 
 /* Notified when DOSBOX_SetNormalLoop / DOSBOX_SetLoop changes the main
  * loop. Used so we know when to flip state.paused <-> state.running. */
@@ -88,9 +106,15 @@ static inline void AGENT_EmitStatePaused(void) {}
 static inline void AGENT_EmitFarTransfer(uint16_t /*target_seg*/, uint16_t /*target_ip*/,
                                          uint16_t /*from_cs*/,    uint16_t /*from_ip*/,
                                          const char * /*kind*/) {}
+static inline void AGENT_EmitTransfer(const char * /*kind*/,
+                                      uint16_t /*target_seg*/, uint16_t /*target_off*/,
+                                      uint16_t /*from_cs*/,    uint16_t /*from_ip*/) {}
 static inline bool AGENT_FarWatchMatches(uint16_t /*seg*/) { return false; }
 static inline void AGENT_FarWatchSet(uint16_t /*seg*/) {}
 static inline void AGENT_FarWatchClear(void) {}
+static inline bool AGENT_TargetWatchMatches(uint16_t /*seg*/, uint16_t /*off*/) { return false; }
+static inline void AGENT_TargetWatchSet(uint16_t /*seg*/, uint16_t /*off*/) {}
+static inline void AGENT_TargetWatchClear(void) {}
 static inline void AGENT_OnLoopChange(void) {}
 static inline bool AGENT_IsHeadless(void) { return false; }
 

@@ -109,4 +109,24 @@ void AGENT_EmitFarTransfer(uint16_t target_seg, uint16_t target_ip,
     agent::serverBroadcastLine(buf);
 }
 
+void AGENT_EmitTransfer(const char *kind,
+                        uint16_t target_seg, uint16_t target_off,
+                        uint16_t from_cs,    uint16_t from_ip)
+{
+    /* `kind` is a fixed-set literal from the CPU core hooks
+     * ("jmp_near_indirect", "call_near_indirect", "retn", "retn_imm",
+     * "call_near_direct", "jmp_near_direct", "jmp_short", "jcc_short",
+     * "jcc_near"). No escaping needed. */
+    char buf[192];
+    snprintf(buf, sizeof(buf),
+        "{\"event\":\"cpu.transfer\","
+        "\"target_seg\":%u,\"target_off\":%u,"
+        "\"from_cs\":%u,\"from_ip\":%u,"
+        "\"kind\":\"%s\"}",
+        static_cast<unsigned>(target_seg), static_cast<unsigned>(target_off),
+        static_cast<unsigned>(from_cs),    static_cast<unsigned>(from_ip),
+        kind ? kind : "unknown");
+    agent::serverBroadcastLine(buf);
+}
+
 #endif /* C_DEBUG */

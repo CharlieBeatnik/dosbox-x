@@ -46,6 +46,13 @@ namespace agent {
 bool     g_farWatchEnabled = false;
 uint16_t g_farWatchSeg     = 0;
 
+/* Near-transfer watch state (proposal 4.4). Same single-thread invariants
+ * as the FAR watch above; the (seg, off) pair filters the much higher
+ * NEAR-transfer rate down to one event per matching arrival. */
+bool     g_targetWatchEnabled = false;
+uint16_t g_targetWatchSeg     = 0;
+uint16_t g_targetWatchOff     = 0;
+
 namespace {
 
 bool g_started        = false;     /* did we register the tick handler / start the server? */
@@ -240,6 +247,49 @@ JsonValue handleFarcallUnwatch(double id, const JsonValue & /*args*/) {
     return makeReplyOk(id, std::move(r));
 }
 
+/* cpu.watch_target — set (or clear, via target_seg=null) the NEAR-transfer
+ * sentinel. Mirrors farcall.watch's accept-either-number-or-hex-string
+ * convention; target_off is required only when target_seg is non-null. */
+JsonValue handleCpuWatchTarget(double id, const JsonValue &args) {
+    const JsonValue *seg = args.get("target_seg");
+    if (!seg) {
+        return makeReplyError(id, "bad_args",
+            "expected {\"target_seg\":<u16 or hex string>, \"target_off\":<u16 or hex string>}"
+            " (target_seg=null to clear)");
+    }
+    if (seg->isNull()) {
+        AGENT_TargetWatchClear();
+        JsonObject r;
+        r.emplace("watching", JsonValue::makeBool(false));
+        return makeReplyOk(id, std::move(r));
+    }
+    const JsonValue *off = args.get("target_off");
+    if (!off) {
+        return makeReplyError(id, "bad_args",
+            "target_off required when target_seg is set");
+    }
+    uint32_t segValue = 0, offValue = 0;
+    if (!parseSegArg(*seg, segValue))
+        return makeReplyError(id, "bad_args",
+            "target_seg must be u16 number or hex string");
+    if (!parseSegArg(*off, offValue))
+        return makeReplyError(id, "bad_args",
+            "target_off must be u16 number or hex string");
+    AGENT_TargetWatchSet((uint16_t)segValue, (uint16_t)offValue);
+    JsonObject r;
+    r.emplace("watching",   JsonValue::makeBool(true));
+    r.emplace("target_seg", JsonValue::makeNumber(segValue));
+    r.emplace("target_off", JsonValue::makeNumber(offValue));
+    return makeReplyOk(id, std::move(r));
+}
+
+JsonValue handleCpuUnwatchTarget(double id, const JsonValue & /*args*/) {
+    AGENT_TargetWatchClear();
+    JsonObject r;
+    r.emplace("watching", JsonValue::makeBool(false));
+    return makeReplyOk(id, std::move(r));
+}
+
 }  /* anonymous namespace */
 
 JsonValue makeReplyOk(double id, JsonObject result) {
@@ -301,6 +351,8 @@ std::string dispatchLine(const std::string &line) {
     if (cmd->s == "mem.read")          return jsonEncode(handleMemRead(id, a));
     if (cmd->s == "farcall.watch")     return jsonEncode(handleFarcallWatch(id, a));
     if (cmd->s == "farcall.unwatch")   return jsonEncode(handleFarcallUnwatch(id, a));
+    if (cmd->s == "cpu.watch_target")  return jsonEncode(handleCpuWatchTarget(id, a));
+    if (cmd->s == "cpu.unwatch_target")return jsonEncode(handleCpuUnwatchTarget(id, a));
 
     return jsonEncode(makeReplyError(id, "unknown_cmd",
         std::string("unknown command: ") + cmd->s));
@@ -372,6 +424,24 @@ void AGENT_FarWatchSet(uint16_t seg) {
 void AGENT_FarWatchClear(void) {
     agent::g_farWatchEnabled = false;
     agent::g_farWatchSeg     = 0;
+}
+
+bool AGENT_TargetWatchMatches(uint16_t seg, uint16_t off) {
+    return agent::g_targetWatchEnabled
+        && seg == agent::g_targetWatchSeg
+        && off == agent::g_targetWatchOff;
+}
+
+void AGENT_TargetWatchSet(uint16_t seg, uint16_t off) {
+    agent::g_targetWatchSeg     = seg;
+    agent::g_targetWatchOff     = off;
+    agent::g_targetWatchEnabled = true;
+}
+
+void AGENT_TargetWatchClear(void) {
+    agent::g_targetWatchEnabled = false;
+    agent::g_targetWatchSeg     = 0;
+    agent::g_targetWatchOff     = 0;
 }
 
 #endif /* C_DEBUG */

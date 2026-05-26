@@ -55,35 +55,75 @@ static INLINE int32_t Fetchds() {
 		continue;											\
 	}
 
+/* Agent NEAR-transfer hook (proposal 4.4). Compiles to nothing when
+ * C_DEBUG is off so the cycle cost stays zero in release builds. KIND is
+ * a string literal naming the opcode group; FROM_IP is the post-operand
+ * IP (i.e., the return address of the instruction that just branched);
+ * TARGET_IP is the destination offset within the current CS. */
+#if C_DEBUG
+extern bool AGENT_TargetWatchMatches(uint16_t seg, uint16_t off);
+extern void AGENT_EmitTransfer(const char *kind,
+                               uint16_t target_seg, uint16_t target_off,
+                               uint16_t from_cs,    uint16_t from_ip);
+#define AGENT_NEAR_HOOK(KIND, FROM_IP, TARGET_IP) do {                                  \
+    if (AGENT_TargetWatchMatches((uint16_t)SegValue(cs), (uint16_t)(TARGET_IP)))        \
+        AGENT_EmitTransfer((KIND), (uint16_t)SegValue(cs), (uint16_t)(TARGET_IP),       \
+                           (uint16_t)SegValue(cs), (uint16_t)(FROM_IP));                \
+} while (0)
+#else
+#define AGENT_NEAR_HOOK(KIND, FROM_IP, TARGET_IP) do { (void)(FROM_IP); (void)(TARGET_IP); } while (0)
+#endif
+
 /* NTS: At first glance, this looks like code that will only fetch the delta for conditional jumps
  *      if the condition is true. Further examination shows that DOSBox's core has two different
  *      CS:IP variables, reg_ip and core.cseip which Fetchb() modifies. */
 //TODO Could probably make all byte operands fast?
+/* The agent hook fires on taken branches only — matches the existing FAR
+ * Jcc convention. KIND defaults to "jcc_short" for the byte-displacement
+ * macro; LOOP/LOOPZ/LOOPNZ/JCXZ share that label since they're also
+ * near-conditional transfers and the from_cs:from_ip already identifies
+ * the exact opcode. */
 #define JumpCond16_b(COND) {						\
 	const uint32_t adj=(uint32_t)Fetchbs();						\
 	SAVEIP;								\
-	if (COND) reg_ip+=adj;						\
+	if (COND) {								\
+		const uint16_t agent_from_ip = (uint16_t)reg_ip;	\
+		reg_ip+=adj;							\
+		AGENT_NEAR_HOOK("jcc_short", agent_from_ip, reg_ip);	\
+	}									\
 	continue;							\
 }
 
 #define JumpCond16_w(COND) {						\
 	const uint32_t adj=(uint32_t)Fetchws();						\
 	SAVEIP;								\
-	if (COND) reg_ip+=adj;						\
+	if (COND) {								\
+		const uint16_t agent_from_ip = (uint16_t)reg_ip;	\
+		reg_ip+=adj;							\
+		AGENT_NEAR_HOOK("jcc_near", agent_from_ip, reg_ip);	\
+	}									\
 	continue;							\
 }
 
 #define JumpCond32_b(COND) {						\
 	const uint32_t adj=(uint32_t)Fetchbs();						\
 	SAVEIP;								\
-	if (COND) reg_eip+=adj;						\
+	if (COND) {								\
+		const uint16_t agent_from_ip = (uint16_t)reg_eip;	\
+		reg_eip+=adj;							\
+		AGENT_NEAR_HOOK("jcc_short", agent_from_ip, reg_eip);	\
+	}									\
 	continue;							\
 }
 
 #define JumpCond32_d(COND) {						\
 	const uint32_t adj=(uint32_t)Fetchds();						\
 	SAVEIP;								\
-	if (COND) reg_eip+=adj;						\
+	if (COND) {								\
+		const uint16_t agent_from_ip = (uint16_t)reg_eip;	\
+		reg_eip+=adj;							\
+		AGENT_NEAR_HOOK("jcc_near", agent_from_ip, reg_eip);	\
+	}									\
 	continue;							\
 }
 
