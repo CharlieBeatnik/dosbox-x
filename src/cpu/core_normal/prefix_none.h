@@ -1068,8 +1068,13 @@
 #if C_DEBUG
 			{
 				uint16_t agent_newcs = SegValue(cs);
+				uint16_t agent_newip = (uint16_t)reg_eip;
 				if (AGENT_FarWatchMatches(agent_newcs))
-					AGENT_EmitFarTransfer(agent_newcs, (uint16_t)reg_eip, agent_oldcs, agent_oldip, "retf");
+					AGENT_EmitFarTransfer(agent_newcs, agent_newip, agent_oldcs, agent_oldip, "retf");
+				/* Same-CS RETF Iw is still a control transfer to the popped (CS, IP);
+				 * fire the NEAR watch too so cpu.watch_target catches it. */
+				if (AGENT_TargetWatchMatches(agent_newcs, agent_newip))
+					AGENT_EmitTransfer("retf", agent_newcs, agent_newip, agent_oldcs, agent_oldip);
 			}
 #endif
 			continue;
@@ -1090,8 +1095,11 @@
 #if C_DEBUG
 			{
 				uint16_t agent_newcs = SegValue(cs);
+				uint16_t agent_newip = (uint16_t)reg_eip;
 				if (AGENT_FarWatchMatches(agent_newcs))
-					AGENT_EmitFarTransfer(agent_newcs, (uint16_t)reg_eip, agent_oldcs, agent_oldip, "retf");
+					AGENT_EmitFarTransfer(agent_newcs, agent_newip, agent_oldcs, agent_oldip, "retf");
+				if (AGENT_TargetWatchMatches(agent_newcs, agent_newip))
+					AGENT_EmitTransfer("retf", agent_newcs, agent_newip, agent_oldcs, agent_oldip);
 			}
 #endif
 			continue;
@@ -1104,7 +1112,7 @@
 		if (DEBUG_IntBreakpoint(3))
 			return (Bits)debugCallback;
 #endif			
-		CPU_SW_Interrupt_NoIOPLCheck(3,GETIP);
+		CPU_SW_Interrupt_NoIOPLCheck(3,GETIP,"int3");
 #if CPU_TRAP_CHECK
 		cpu.trap_skip=true;
 #endif
@@ -1118,7 +1126,7 @@
 				return (Bits)debugCallback;
 			}
 #endif
-			CPU_SW_Interrupt(num,GETIP);
+			CPU_SW_Interrupt(num,GETIP,"int_sw");
 #if CPU_TRAP_CHECK
 			cpu.trap_skip=true;
 #endif
@@ -1126,7 +1134,7 @@
 		}
 	CASE_B(0xce)												/* INTO */
 		if (get_OF()) {
-			CPU_SW_Interrupt(4,GETIP);
+			CPU_SW_Interrupt(4,GETIP,"into");
 #if CPU_TRAP_CHECK
 			cpu.trap_skip=true;
 #endif
@@ -1145,8 +1153,12 @@
 #if C_DEBUG
 			{
 				uint16_t agent_newcs = SegValue(cs);
+				uint16_t agent_newip = (uint16_t)reg_eip;
 				if (AGENT_FarWatchMatches(agent_newcs))
-					AGENT_EmitFarTransfer(agent_newcs, (uint16_t)reg_eip, agent_oldcs, agent_oldip, "iret");
+					AGENT_EmitFarTransfer(agent_newcs, agent_newip, agent_oldcs, agent_oldip, "iret");
+				/* Same-CS IRET is still a control transfer; fire the NEAR watch too. */
+				if (AGENT_TargetWatchMatches(agent_newcs, agent_newip))
+					AGENT_EmitTransfer("iret", agent_newcs, agent_newip, agent_oldcs, agent_oldip);
 			}
 #endif
 #if CPU_TRAP_CHECK
@@ -1412,7 +1424,7 @@
 		break;
 #if CPU_CORE >= CPU_ARCHTYPE_80186
 	CASE_B(0xf1)												/* ICEBP */
-		CPU_SW_Interrupt_NoIOPLCheck(1,GETIP);
+		CPU_SW_Interrupt_NoIOPLCheck(1,GETIP,"int_icebp");
 #if CPU_TRAP_CHECK
 		cpu.trap_skip=true;
 #endif

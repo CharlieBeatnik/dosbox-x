@@ -322,7 +322,10 @@ Emits a `farcall.transfer` event per matching transfer:
 `kind` is one of: `"call_far_direct"` (opcode `0x9A`),
 `"call_far_indirect"` (`0xFF /3`), `"jmp_far_direct"` (`0xEA`),
 `"jmp_far_indirect"` (`0xFF /5`), `"retf"` (`0xCA` / `0xCB`),
-`"iret"` (`0xCF`).
+`"iret"` (`0xCF`), or one of the interrupt-source labels listed in the
+**Interrupt-sourced transfers** section below (`"int3"`, `"int_sw"`,
+`"into"`, `"int_hw"`, `"int_exception"`, `"int_step_trap"`,
+`"int_nmi"`, `"int_icebp"`).
 
 `from_cs` / `from_ip` are the source instruction's CS:IP (before the
 transfer); `target_seg` / `target_off` are the destination. For RETF
@@ -330,10 +333,10 @@ the target is read from the stack frame the RETF pops, which is the
 authoritative answer to "who's about to return here?"
 
 The watch is a single u16 compare per far transfer (only on the handful
-of opcodes listed above), so it has negligible cost; you can leave it
-set across long-running guest code. The intended workflow is "set
-before the suspect window, drain events while reproducing, unwatch
-afterwards".
+of opcodes listed above, plus every interrupt dispatch), so it has
+negligible cost; you can leave it set across long-running guest code.
+The intended workflow is "set before the suspect window, drain events
+while reproducing, unwatch afterwards".
 
 ### `cpu.watch_target` / `cpu.unwatch_target`
 
@@ -365,25 +368,65 @@ Emits a `cpu.transfer` event per matching transfer:
 
 | `kind`                | Opcode group                                          |
 |-----------------------|-------------------------------------------------------|
-| `call_near_direct`    | `0xE8` (rel16)                                        |
-| `jmp_near_direct`     | `0xE9` (rel16)                                        |
+| `call_near_direct`    | `0xE8` (rel16, plus 32-bit rel32 under `0x66` prefix) |
+| `jmp_near_direct`     | `0xE9` (rel16, plus 32-bit rel32 under `0x66` prefix) |
 | `jmp_short`           | `0xEB` (rel8)                                         |
-| `call_near_indirect`  | `0xFF /2`                                             |
-| `jmp_near_indirect`   | `0xFF /4`                                             |
-| `retn`                | `0xC3`                                                |
-| `retn_imm`            | `0xC2 imm16`                                          |
+| `call_near_indirect`  | `0xFF /2` (16-bit and 32-bit operand size)            |
+| `jmp_near_indirect`   | `0xFF /4` (16-bit and 32-bit operand size)            |
+| `retn`                | `0xC3` (16-bit and 32-bit operand size)               |
+| `retn_imm`            | `0xC2 imm16` (16-bit and 32-bit operand size)         |
 | `jcc_short`           | `0x70..0x7F` (taken) — also `LOOP`/`LOOPZ`/`LOOPNZ`/`JCXZ` |
-| `jcc_near`            | `0x0F 0x80..0x8F` (taken, 386+)                       |
+| `jcc_near`            | `0x0F 0x80..0x8F` (taken, 386+, 16-bit and 32-bit displacement) |
+| `retf`                | `0xCA` / `0xCB` (popped CS happens to equal current CS) |
+| `iret`                | `0xCF` (popped CS happens to equal current CS)        |
+| `int3`                | `0xCC` software int 3                                 |
+| `int_sw`              | `0xCD ib` software interrupt                          |
+| `into`                | `0xCE` overflow trap (when `OF=1`)                    |
+| `int_hw`              | PIC-injected hardware interrupt (`CPU_HW_Interrupt`)  |
+| `int_exception`       | CPU fault dispatch (`CPU_Exception` — illegal opcode, #GP, #PF, ...) |
+| `int_step_trap`       | `TF=1` single-step trap (`CPU_DebugException`)        |
+| `int_nmi`             | NMI (`CPU_NMI_Interrupt`)                             |
+| `int_icebp`           | `0xF1` ICEBP                                          |
 
 Conditional jumps only emit when the branch is **taken** (same convention
-as the FAR Jcc hooks). `from_cs` is always equal to `target_seg` — a
-NEAR transfer can't change CS. `from_ip` is the post-operand IP (i.e.,
-the return address) of the instruction that branched, so disassembling
-backwards from `from_ip` finds the source instruction.
+as the FAR Jcc hooks). For all opcode-driven NEAR kinds `from_cs` equals
+`target_seg` — a NEAR transfer can't change CS. For the `int_*` / `retf` /
+`iret` kinds the target CS *can* differ from the source CS; the entry
+arrives via the same NEAR sentinel `(seg, off)` match, because every
+interrupt dispatch and every same-CS far return is also a transfer to a
+specific `(CS, IP)`. `from_ip` is the post-operand IP (i.e., the return
+address) of the instruction that branched, so disassembling backwards
+from `from_ip` finds the source instruction. For interrupts `from_ip` is
+the IP at which the interrupt was taken (which is also the return address
+pushed onto the stack).
 
-Cost is one `(seg, off)` compare per NEAR transfer when the watch is
-set; the test compiles to a flag check plus two u16 compares, which is
-cheap enough to leave in place across long-running guest code.
+Cost is one `(seg, off)` compare per NEAR transfer (and per interrupt
+dispatch / same-CS far return) when the watch is set; the test compiles
+to a flag check plus two u16 compares, which is cheap enough to leave in
+place across long-running guest code.
+
+#### Interrupt-sourced transfers
+
+Both `cpu.watch_target` and `farcall.watch` also fire on every interrupt
+dispatch the CPU performs — `INT 3` / `INT N` / `INTO` / `ICEBP`,
+PIC-injected hardware interrupts (`INT 8`, `INT 9`, …), CPU exceptions
+(illegal opcode, #GP, #PF, …), the single-step trap when `TF=1`, and
+NMI. The `kind` field tells you which source raised the interrupt; see
+the table above. This means:
+
+- Set `farcall.watch target_seg=<game_cs>` and you will see every timer
+  ISR dispatch to that segment (one `kind="int_hw"` event per ~55 ms),
+  plus every `INT 21h` / `INT 10h` / etc. whose IVT entry points into
+  that segment.
+- Set `cpu.watch_target target_seg=<game_cs> target_off=<entry>` and
+  you will see exactly the interrupt that landed at that handler entry
+  point — useful for pinning down "who's the caller" when the bad
+  transfer is a software `INT N` rather than a `CALL`/`JMP`.
+
+If the same dispatch is converted to an exception mid-flight (e.g., the
+gate descriptor is missing, so `CPU_Exception(#GP)` runs instead), only
+the exception event fires — the suppressed outer event would otherwise
+double-count the same landing.
 
 ## Events
 
@@ -394,8 +437,8 @@ cheap enough to leave in place across long-running guest code.
 | `bp.hit`           | `{seg, off, bp_index}`          | Just before the debugger entry that a breakpoint triggered      |
 | `debugger.entered` | `{reason}`                      | After `bp.hit`, or any other debugger entry                     |
 | `log.line`         | `{text}`                        | While subscribed                                                |
-| `farcall.transfer` | `{target_seg, target_off, from_cs, from_ip, kind}` | A `CALL FAR` / `JMP FAR` / `RETF` whose target CS matched the active `farcall.watch` sentinel |
-| `cpu.transfer`     | `{target_seg, target_off, from_cs, from_ip, kind}` | A NEAR `CALL`/`JMP`/taken `Jcc`/`RETN` whose `(CS, IP)` matched the active `cpu.watch_target` sentinel |
+| `farcall.transfer` | `{target_seg, target_off, from_cs, from_ip, kind}` | A `CALL FAR` / `JMP FAR` / `RETF` / `IRET` / interrupt dispatch whose target CS matched the active `farcall.watch` sentinel |
+| `cpu.transfer`     | `{target_seg, target_off, from_cs, from_ip, kind}` | A NEAR `CALL`/`JMP`/taken `Jcc`/`RETN` / same-CS `RETF` / `IRET` / interrupt dispatch whose `(CS, IP)` matched the active `cpu.watch_target` sentinel |
 | `agent.error`      | `{code, message}`               | Malformed input from your side (no `id` available to reply on)  |
 | `agent.overflow`   | none                            | Outbox hit its 1 MB cap; lines were dropped                     |
 | `busy`             | none                            | A second client tried to connect; that connection is closed     |

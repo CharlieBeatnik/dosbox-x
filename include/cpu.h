@@ -179,18 +179,22 @@ extern bool CPU_NMI_pending;
 
 extern bool do_seg_limits;
 
-void CPU_Interrupt(Bitu num,Bitu type,uint32_t oldeip);
+/* `kind` labels the source of the interrupt so the agent control channel
+ * (proposal 4.5) can distinguish int3 / int_sw / into / int_hw / int_exception
+ * / int_step_trap / int_nmi when reporting transfers. Callers that don't care
+ * accept the default. */
+void CPU_Interrupt(Bitu num,Bitu type,uint32_t oldeip,const char *kind = "int");
 void CPU_Check_NMI();
 void CPU_Raise_NMI();
 void CPU_NMI_Interrupt();
 static INLINE void CPU_HW_Interrupt(Bitu num) {
-	CPU_Interrupt(num,0,reg_eip);
+	CPU_Interrupt(num,0,reg_eip,"int_hw");
 }
-static INLINE void CPU_SW_Interrupt(Bitu num,uint32_t oldeip) {
-	CPU_Interrupt(num,CPU_INT_SOFTWARE,oldeip);
+static INLINE void CPU_SW_Interrupt(Bitu num,uint32_t oldeip,const char *kind="int_sw") {
+	CPU_Interrupt(num,CPU_INT_SOFTWARE,oldeip,kind);
 }
-static INLINE void CPU_SW_Interrupt_NoIOPLCheck(Bitu num,uint32_t oldeip) {
-	CPU_Interrupt(num,CPU_INT_SOFTWARE|CPU_INT_NOIOPLCHECK,oldeip);
+static INLINE void CPU_SW_Interrupt_NoIOPLCheck(Bitu num,uint32_t oldeip,const char *kind="int_sw") {
+	CPU_Interrupt(num,CPU_INT_SOFTWARE|CPU_INT_NOIOPLCHECK,oldeip,kind);
 }
 
 bool CPU_PrepareException(Bitu which,Bitu error);

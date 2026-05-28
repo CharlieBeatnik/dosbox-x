@@ -6528,7 +6528,7 @@ static Bitu INT8_PC98_Handler(void) {
         /* ack IRQ 0 */
         IO_WriteB(0x00,0x20);
         /* INT 07h */
-        CPU_Interrupt(7,CPU_INT_SOFTWARE,reg_eip);
+        CPU_Interrupt(7,CPU_INT_SOFTWARE,reg_eip,"int_sw");
     }
     else {
         /* ack IRQ 0 */

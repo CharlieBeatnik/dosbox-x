@@ -486,7 +486,9 @@
 	CASE_D(0xc2)												/* RETN Iw */
 		{
 			uint32_t old_esp = reg_esp;
-
+#if C_DEBUG
+			const uint16_t agent_from_ip = (uint16_t)GETIP;
+#endif
 			try {
 				/* this is structured either to complete RET or leave registers unmodified if interrupted by page fault */
 				uint32_t new_eip = Pop_32();
@@ -498,10 +500,22 @@
 				reg_esp = old_esp; /* restore stack pointer */
 				throw;
 			}
+#if C_DEBUG
+			AGENT_NEAR_HOOK("retn_imm", agent_from_ip, reg_eip);
+#endif
 		} continue;
 	CASE_D(0xc3)												/* RETN */
+#if C_DEBUG
+		{
+			const uint16_t agent_from_ip = (uint16_t)GETIP;
+			reg_eip=Pop_32();
+			AGENT_NEAR_HOOK("retn", agent_from_ip, reg_eip);
+			continue;
+		}
+#else
 		reg_eip=Pop_32();
 		continue;
+#endif
 	CASE_D(0xc4)												/* LES */
 		{	
 			GetRMrd;
@@ -619,20 +633,29 @@
 			break;
 		}
 	CASE_D(0xe8)												/* CALL Jd */
-		{ 
+		{
 			/* must not adjust (E)IP until we have completed the instruction.
 			 * if interrupted by a page fault, EIP must be unmodified. */
 			int32_t addip=Fetchds();
 			uint32_t here=GETIP;
 			Push_32(here);
 			reg_eip=(uint32_t)((uint32_t)addip+here);
+#if C_DEBUG
+			AGENT_NEAR_HOOK("call_near_direct", (uint16_t)here, reg_eip);
+#endif
 			continue;
 		}
 	CASE_D(0xe9)												/* JMP Jd */
-		{ 
+		{
 			int32_t addip=Fetchds();
 			SAVEIP;
+#if C_DEBUG
+			const uint16_t agent_from_ip = (uint16_t)reg_eip;
+#endif
 			reg_eip+=(uint32_t)addip;
+#if C_DEBUG
+			AGENT_NEAR_HOOK("jmp_near_direct", agent_from_ip, reg_eip);
+#endif
 			continue;
 		}
 	CASE_D(0xea)												/* JMP Ad */
@@ -650,10 +673,16 @@
 			continue;
 		}
 	CASE_D(0xeb)												/* JMP Jb */
-		{ 
+		{
 			int32_t addip=Fetchbs();
 			SAVEIP;
+#if C_DEBUG
+			const uint16_t agent_from_ip = (uint16_t)reg_eip;
+#endif
 			reg_eip+=(uint32_t)addip;
+#if C_DEBUG
+			AGENT_NEAR_HOOK("jmp_short", agent_from_ip, reg_eip);
+#endif
 			continue;
 		}
 	CASE_D(0xed)												/* IN EAX,DX */
@@ -723,8 +752,14 @@
 					uint32_t new_eip;
 					if (rm >= 0xc0 ) {GetEArd;new_eip=*eard;}
 					else {GetEAa;new_eip=LoadMd(eaa);}
+#if C_DEBUG
+					const uint16_t agent_from_ip = (uint16_t)GETIP;
+#endif
 					Push_32(GETIP); /* <- PF can happen here */
 					reg_eip = new_eip;
+#if C_DEBUG
+					AGENT_NEAR_HOOK("call_near_indirect", agent_from_ip, reg_eip);
+#endif
 				}
 				continue;
 			case 0x03:											/* CALL FAR Ed */
@@ -743,10 +778,20 @@
 #endif
 					continue;
 				}
-			case 0x04:											/* JMP NEAR Ed */	
+			case 0x04:											/* JMP NEAR Ed */
+#if C_DEBUG
+				{
+					const uint16_t agent_from_ip = (uint16_t)GETIP;
+					if (rm >= 0xc0 ) {GetEArd;reg_eip=*eard;}
+					else {GetEAa;reg_eip=LoadMd(eaa);}
+					AGENT_NEAR_HOOK("jmp_near_indirect", agent_from_ip, reg_eip);
+					continue;
+				}
+#else
 				if (rm >= 0xc0 ) {GetEArd;reg_eip=*eard;}
 				else {GetEAa;reg_eip=LoadMd(eaa);}
 				continue;
+#endif
 			case 0x05:											/* JMP FAR Ed */	
 				{
 					if (rm >= 0xc0) goto illegal_opcode;

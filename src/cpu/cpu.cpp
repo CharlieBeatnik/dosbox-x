@@ -30,6 +30,7 @@
 #include "control.h"
 #include "logging.h"
 #include "pic.h"
+#include "agent.h"
 
 // TODO: #ifdef FPU...
 #include "fpu.h"
@@ -596,7 +597,7 @@ void CPU_NMI_Interrupt() {
 	if (CPU_NMI_active) E_Exit("CPU_NMI_Interrupt() called while NMI already active");
 	CPU_NMI_active = true;
 	CPU_NMI_pending = false;
-    CPU_Interrupt(2/*INT 2 = NMI*/,0,reg_eip);
+    CPU_Interrupt(2/*INT 2 = NMI*/,0,reg_eip,"int_nmi");
 }
 
 void CPU_Raise_NMI() {
@@ -1112,7 +1113,7 @@ doexception:
 
 void CPU_DebugException(uint32_t triggers,Bitu oldeip) {
   cpu.drx[6] = (cpu.drx[6] & 0xFFFF1FF0) | triggers;
-  CPU_Interrupt(EXCEPTION_DB,CPU_INT_EXCEPTION,(uint32_t)oldeip);
+  CPU_Interrupt(EXCEPTION_DB,CPU_INT_EXCEPTION,(uint32_t)oldeip,"int_step_trap");
 }
 
 #include <stack>
@@ -1178,7 +1179,7 @@ void CPU_Exception(Bitu which,Bitu error ) {
 	}
 
 	cpu.exception.error=error;
-	CPU_Interrupt(which,CPU_INT_EXCEPTION | ((which>=8) ? CPU_INT_HAS_ERROR : 0),reg_eip);
+	CPU_Interrupt(which,CPU_INT_EXCEPTION | ((which>=8) ? CPU_INT_HAS_ERROR : 0),reg_eip,"int_exception");
 
 	/* allow recursive page faults. required for multitasking OSes like Windows 95.
 	 * we set this AFTER CPU_Interrupt so that if CPU_Interrupt faults while starting
@@ -1197,11 +1198,48 @@ void CPU_Exception(Bitu which,Bitu error ) {
 }
 
 uint8_t lastint;
-void CPU_Interrupt(Bitu num,Bitu type,uint32_t oldeip) {
+
+#if C_DEBUG
+/* Tracks how many interrupt dispatches have been emitted via the agent hook.
+ * The CPU_Interrupt wrapper fires the hook only if no nested dispatch already
+ * incremented the counter — this avoids double-firing when the outer interrupt
+ * is converted to an inner exception (e.g., CPU_CHECK_COND failures inside
+ * CPU_Interrupt_Inner that raise CPU_Exception → recursive CPU_Interrupt). */
+static uint32_t agent_int_dispatch_seq = 0;
+#endif
+
+static void CPU_Interrupt_Inner(Bitu num,Bitu type,uint32_t oldeip);
+
+void CPU_Interrupt(Bitu num,Bitu type,uint32_t oldeip,const char *kind) {
     if (num == EXCEPTION_DB && (type&CPU_INT_EXCEPTION) == 0) {
       CPU_DebugException(0,oldeip); // DR6 bits need updating
       return;
     }
+#if C_DEBUG
+    const uint16_t agent_oldcs = SegValue(cs);
+    const uint16_t agent_oldip = (uint16_t)oldeip;
+    const uint32_t my_seq = agent_int_dispatch_seq;
+#endif
+    CPU_Interrupt_Inner(num,type,oldeip);
+#if C_DEBUG
+    /* If a nested CPU_Interrupt already emitted the hook (e.g., a CPU_Exception
+     * fired during dispatch), suppress this outer event so consumers see exactly
+     * one transfer per landed CS:IP. */
+    if (agent_int_dispatch_seq == my_seq) {
+        const uint16_t new_cs = SegValue(cs);
+        const uint16_t new_ip = (uint16_t)reg_eip;
+        if (new_cs != agent_oldcs || new_ip != agent_oldip) {
+            agent_int_dispatch_seq++;
+            if (AGENT_TargetWatchMatches(new_cs,new_ip))
+                AGENT_EmitTransfer(kind,new_cs,new_ip,agent_oldcs,agent_oldip);
+            if (AGENT_FarWatchMatches(new_cs))
+                AGENT_EmitFarTransfer(new_cs,new_ip,agent_oldcs,agent_oldip,kind);
+        }
+    }
+#endif
+}
+
+static void CPU_Interrupt_Inner(Bitu num,Bitu type,uint32_t oldeip) {
 	lastint=(uint8_t)num;
 	FillFlags();
 #if C_DEBUG
