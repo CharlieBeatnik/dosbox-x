@@ -374,11 +374,28 @@ img_path = pathlib.Path(res["path"])         # absolute path on disk
 data = img_path.read_bytes()                 # PNG bytes
 ```
 
+**`raw=true` requires an animating screen.** The raw VGA capture is
+driven by `VGA_DrawRawLine`, which only fires while the VGA emulator
+is actively drawing scanlines. On a static screen (e.g. a paused
+title screen or a level-load splash with no animation) DOSBox-X's
+on-demand renderer skips redrawing unchanged frames, so the raw
+pipeline waits indefinitely for scanlines that never arrive. The
+agent enforces a 2-second wall-clock deadline (measured with
+`steady_clock`, so it fires even while the CPU is paused) — after
+that the pending request gets a `timeout` error and the slot is
+freed. For static screens **use `raw=false`** (the cooked render
+path runs every frame regardless of changes, so it captures static
+screens fine; the trade-off is that the output may have the scaler
+/ aspect correction applied).
+
 Errors:
 - `bad_args` — `raw` is set to a non-bool value.
 - `bad_state` — `[dosbox] captures=` is empty/unset.
 - `busy` — another `screen.capture` is still pending; wait for its
   reply or `screen.captured` event before issuing another.
+- `timeout` — the capture didn't complete within 2s (the static-screen
+  failure mode above, or the CPU was paused so no rendering happened).
+  Retry with `raw=false` for static screens.
 
 ### `cpu.watch_target` / `cpu.unwatch_target`
 

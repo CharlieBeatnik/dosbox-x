@@ -33,8 +33,10 @@
 #include "logging.h"
 #include "setup.h"
 #include "timer.h"
+#include "pic.h"
 
 #include <cstdio>
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -67,12 +69,17 @@ uint16_t g_targetWatchOff     = 0;
 /* screen.capture pending-request state (proposal 4.7). The handler returns
  * an empty string so the protocol layer queues no immediate reply, then
  * AGENT_OnScreenCaptured (called from the capture subsystem after fclose)
- * sends the deferred reply. -1 means no capture is pending. Single-slot
- * because Phase 1 is single-client and the capture subsystem itself only
- * handles one screenshot at a time. */
-double g_screenCaptureId = -1.0;
-bool   g_screenCaptureRaw = false;
-bool   g_screenCapturePending = false;
+ * sends the deferred reply. Single-slot because Phase 1 is single-client
+ * and the capture subsystem itself only handles one screenshot at a time.
+ *
+ * The deadline uses `steady_clock` (wall time) not PIC_Ticks because the
+ * raw=true failure mode includes "CPU paused, no scanlines drawn" — and
+ * PIC_Ticks freezes whenever the CPU is paused, so a PIC-based deadline
+ * would never fire in exactly the case we need it to. */
+double                                          g_screenCaptureId = -1.0;
+bool                                            g_screenCaptureRaw = false;
+bool                                            g_screenCapturePending = false;
+std::chrono::steady_clock::time_point           g_screenCaptureDeadline;
 
 namespace {
 
@@ -85,8 +92,36 @@ void agentShutdown(Section * /*sec*/) {
     ::AGENT_Stop();
 }
 
+/* If a screen.capture request has been pending past its deadline (the
+ * "raw=true on a static screen" failure mode that never fires
+ * VGA_DrawRawLine), fail it explicitly so the client sees an error
+ * instead of timing out on the wire and so the next caller doesn't see
+ * a `busy` from a stuck slot. Called from both tickPoll (while running)
+ * and AGENT_Poll (while the CPU is paused — wall time still advances). */
+void checkScreenCaptureTimeout(void) {
+    if (!g_screenCapturePending) return;
+    if (std::chrono::steady_clock::now() < g_screenCaptureDeadline) return;
+
+    char idBuf[32];
+    if (g_screenCaptureId == static_cast<int64_t>(g_screenCaptureId))
+        snprintf(idBuf, sizeof(idBuf), "%lld", static_cast<long long>(g_screenCaptureId));
+    else
+        snprintf(idBuf, sizeof(idBuf), "%g", g_screenCaptureId);
+    std::string reply;
+    reply.append("{\"id\":");
+    reply.append(idBuf);
+    reply.append(",\"ok\":false,\"error\":{\"code\":\"timeout\",\"message\":\""
+        "screen.capture did not complete within 2s — likely a static screen with "
+        "raw=true (which only renders during active VGA scanline draws); retry with "
+        "raw=false");
+    reply.append("\"}}");
+    serverBroadcastLine(reply);
+    g_screenCapturePending = false;
+}
+
 void tickPoll(void) {
     serverPoll();
+    checkScreenCaptureTimeout();
 }
 
 /* Map the MachineType enum to a stable lowercase string suitable for
@@ -341,6 +376,15 @@ std::string handleScreenCapture(double id, const JsonValue &args) {
     g_screenCaptureId = id;
     g_screenCaptureRaw = raw;
     g_screenCapturePending = true;
+    /* Static screens that don't animate never trigger VGA_DrawRawLine, so
+     * a raw capture would hang forever. Set a 2s deadline; the timeout
+     * check (fired from both tickPoll while running and AGENT_Poll while
+     * paused) sends the error reply and frees the slot if no capture
+     * lands. 2s is generous enough for slow guests and small enough that
+     * an interactive client noticing the hang can fall back to raw=false
+     * quickly. */
+    g_screenCaptureDeadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(2);
 
     if (raw)
         CAPTURE_RawScreenShotEvent(true);
@@ -463,6 +507,11 @@ void AGENT_Poll(bool /*paused*/) {
      * the same drain logic, so route both through the same entry. */
     if (!agent::g_started) return;
     agent::serverPoll();
+    /* Wall-clock screen.capture deadline (proposal 4.7): also check from
+     * the paused branch since PIC ticks freeze but the wall clock doesn't,
+     * and we don't want a request issued just before pause to wait
+     * forever for the user to resume. */
+    agent::checkScreenCaptureTimeout();
 }
 
 void AGENT_OnLoopChange(void) {

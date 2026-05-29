@@ -8,6 +8,10 @@ prompt to land, calls screen.capture (raw and cooked), and verifies:
     has the PNG signature in the first 8 bytes.
   * A screen.captured event arrives carrying the same path.
   * The raw and cooked variants land at distinct files.
+  * If raw=True is requested while the CPU is paused (so the VGA render
+    path cannot fire), the request times out cleanly with an error
+    instead of leaving the pending slot stuck so subsequent callers see
+    `busy`.
 
 Usage:
     python tests/agent_live/test_screen_capture.py [--dosbox PATH]
@@ -175,6 +179,42 @@ def run(argv: list[str] | None = None) -> int:
             # The two paths should differ (different filenames).
             if 'raw_path' in dir() and 'cooked_path' in dir() and raw_path == cooked_path:
                 print("  FAIL: raw and cooked paths are the same", flush=True)
+                ok = False
+
+            # ---- Phase C: raw on paused CPU should time out cleanly ----
+            # Pausing the CPU stops VGA scanline rendering — the exact
+            # failure mode the X2RE agent reports for static screens.
+            print("\nPhase C: raw capture while CPU paused -> expect timeout", flush=True)
+            from dbxagent import AgentError  # noqa: E402
+            agent.cpu_pause()
+            # Drain debugger.entered / state.paused events.
+            while agent.next_event(timeout=0.1) is not None:
+                pass
+            t0 = time.monotonic()
+            timed_out = False
+            err_code = None
+            try:
+                agent.call("screen.capture", timeout=5.0, raw=True)
+            except AgentError as e:
+                timed_out = True
+                err_code = e.code
+            except TimeoutError:
+                timed_out = False  # We want a SERVER-side timeout reply.
+            dt = time.monotonic() - t0
+            agent.cpu_run()
+            if timed_out and err_code == "timeout" and dt < 4.0:
+                print(f"  OK: server returned timeout in {dt*1000:.0f}ms", flush=True)
+            else:
+                print(f"  FAIL: timed_out={timed_out} err_code={err_code} dt={dt*1000:.0f}ms",
+                      flush=True)
+                ok = False
+            # Verify the slot is now free — a fresh raw=false call must succeed.
+            try:
+                res = agent.call("screen.capture", timeout=10.0, raw=False)
+                print(f"  follow-up cooked OK: {res['path']}", flush=True)
+            except AgentError as e:
+                print(f"  FAIL: follow-up call got error: {e.code} ({e.message})",
+                      flush=True)
                 ok = False
 
         if proc is not None:
