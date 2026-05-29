@@ -584,6 +584,36 @@ If you discover something else that emits to a pane rather than
 `DEBUG_ShowMsg`, that's a candidate for a Phase-2 typed command. File
 an issue.
 
+### BPM on VGA memory (A0000–BFFFF) — partial coverage
+
+`BPM A000:xxxx` (or any `BPM` in the VGA memory window) is a
+**single-byte value-change watch**, not a write intercept. It works
+fine for normal RAM, but for VGA memory it carries two caveats that
+make it unreliable as a way to find "who's writing to the framebuffer":
+
+1. **It only fires when the byte the BPM reads back changes.** The
+   per-instruction check calls `mem_readb_checked` to compare the
+   current byte against the stored value. In planar VGA modes (mode
+   0x0D, 0x0E, 0x10, 0x12) the readback returns the byte from the
+   current Read-Map-Select plane — so a write that affects only other
+   planes leaves the BPM read unchanged and the BPM never fires.
+   Idempotent writes (writing the same value back) also produce no
+   change and so produce no event.
+2. **Even when it fires, it fires at the *next* instruction boundary
+   after the change**, not at the writer's `CS:IP`. For a single
+   `mov` write the difference is the next instruction; for a `rep
+   stosb` filling the whole framebuffer the BPM only fires once the
+   `rep` retires, so the reported `CS:IP` is whatever follows the
+   `rep`, not the writer site.
+
+For the "find the code writing to the framebuffer" use case the
+robust workaround is to grep the disassembly for `mov ax, 0A000h` /
+`mov ax, 0xa0` literals (or whatever segment constant the game's
+source uses), set a regular `BP` on each candidate site, and run.
+`cpu.watch_target` works too if you only care about one specific
+landing IP. A proper write-intercept BPM that hooks the VGA page
+handlers' `writeb` would be a Phase-3 addition.
+
 ## Recipes
 
 ### Run a DOS command and wait for the prompt
