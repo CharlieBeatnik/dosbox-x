@@ -214,6 +214,20 @@ class DbxAgent:
     def log_unsubscribe(self) -> dict:
         return self.call("log.unsubscribe")
 
+    def screen_capture(self, raw: bool = True, timeout: float = 10.0) -> dict:
+        """Trigger a PNG screenshot and block until written.
+
+        Returns ``{"path": <abs PNG path>, "raw": <bool>}``. ``raw=True``
+        (the default) captures the native VGA scan-line image; ``raw=False``
+        captures the post-scaler render output. Requires ``[dosbox]
+        captures=`` to be set in the configuration and the CPU to be
+        running so the VGA render path can fire ``CAPTURE_AddImage`` /
+        ``WriteRawImage``. Raises ``AgentError("bad_state")`` if the
+        captures directory isn't configured, ``AgentError("busy")`` if a
+        previous ``screen_capture`` call is still pending.
+        """
+        return self.call("screen.capture", timeout=timeout, raw=raw)
+
     # ---- Internals ---------------------------------------------------
 
     def _read_loop(self) -> None:

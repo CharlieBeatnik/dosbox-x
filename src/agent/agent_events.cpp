@@ -27,6 +27,14 @@
 #include "agent_internal.h"
 
 #include <cstdio>
+#include <string>
+
+#if defined(WIN32)
+# include <windows.h>
+#elif defined(HAVE_REALPATH) || defined(__unix__) || defined(__APPLE__)
+# include <limits.h>
+# include <stdlib.h>
+#endif
 
 namespace agent {
 
@@ -118,6 +126,37 @@ void AGENT_EmitFarTransfer(uint16_t target_seg, uint16_t target_ip,
     agent::serverBroadcastLine(buf);
 }
 
+/* Inline JSON-string-escape into `out`. The capture path passes absolute
+ * file paths which on Windows contain backslashes — those MUST be escaped
+ * or the consumer's JSON parser rejects the line. We don't worry about
+ * non-ASCII here; PNG paths under the configured captures directory are
+ * almost always ASCII. */
+static void appendJsonEscaped(std::string &out, const char *s)
+{
+    if (!s) return;
+    for (; *s; ++s) {
+        unsigned char c = static_cast<unsigned char>(*s);
+        switch (c) {
+            case '"':  out.append("\\\""); break;
+            case '\\': out.append("\\\\"); break;
+            case '\b': out.append("\\b");  break;
+            case '\f': out.append("\\f");  break;
+            case '\n': out.append("\\n");  break;
+            case '\r': out.append("\\r");  break;
+            case '\t': out.append("\\t");  break;
+            default:
+                if (c < 0x20) {
+                    char esc[8];
+                    snprintf(esc, sizeof(esc), "\\u%04x", c);
+                    out.append(esc);
+                } else {
+                    out.push_back(static_cast<char>(c));
+                }
+                break;
+        }
+    }
+}
+
 void AGENT_EmitTransfer(const char *kind,
                         uint16_t target_seg, uint16_t target_off,
                         uint16_t from_cs,    uint16_t from_ip)
@@ -136,6 +175,72 @@ void AGENT_EmitTransfer(const char *kind,
         static_cast<unsigned>(from_cs),    static_cast<unsigned>(from_ip),
         kind ? kind : "unknown");
     agent::serverBroadcastLine(buf);
+}
+
+namespace agent {
+/* Defined in agent.cpp — single-slot pending screen.capture request state.
+ * Touched only on the main (CPU) thread, so no locking required. */
+extern double g_screenCaptureId;
+extern bool   g_screenCaptureRaw;
+extern bool   g_screenCapturePending;
+}  /* namespace agent */
+
+void AGENT_OnScreenCaptured(const char *path, bool raw)
+{
+    /* Translate the file path to an absolute path so consumers don't have
+     * to know the agent's cwd. On Windows: GetFullPathName. On POSIX:
+     * realpath (the captures dir is usually already absolute, but this
+     * collapses any relative segments). */
+    std::string abs = path ? path : "";
+#if defined(WIN32)
+    if (!abs.empty()) {
+        char fullpath[260];  /* MAX_PATH */
+        if (GetFullPathNameA(abs.c_str(), sizeof(fullpath), fullpath, NULL))
+            abs = fullpath;
+    }
+#elif defined(HAVE_REALPATH) || defined(__unix__) || defined(__APPLE__)
+    if (!abs.empty()) {
+        char fullpath[PATH_MAX];
+        if (realpath(abs.c_str(), fullpath) != NULL)
+            abs = fullpath;
+    }
+#endif
+
+    /* Always emit the screen.captured event for anyone subscribing. */
+    {
+        std::string ev;
+        ev.reserve(64 + abs.size());
+        ev.append("{\"event\":\"screen.captured\",\"path\":\"");
+        appendJsonEscaped(ev, abs.c_str());
+        ev.append("\",\"raw\":");
+        ev.append(raw ? "true" : "false");
+        ev.append("}");
+        agent::serverBroadcastLine(ev);
+    }
+
+    /* If a screen.capture request is pending, send its deferred reply now.
+     * The raw flag must match (otherwise this is a different capture, e.g.
+     * a user pressing the screenshot hotkey while no request is pending). */
+    if (agent::g_screenCapturePending && agent::g_screenCaptureRaw == raw) {
+        std::string reply;
+        reply.reserve(96 + abs.size());
+        char idBuf[32];
+        /* The protocol stores id as a number; reproduce the same encoding
+         * the json encoder uses (integer when whole, otherwise %g). */
+        if (agent::g_screenCaptureId == static_cast<int64_t>(agent::g_screenCaptureId))
+            snprintf(idBuf, sizeof(idBuf), "%lld", static_cast<long long>(agent::g_screenCaptureId));
+        else
+            snprintf(idBuf, sizeof(idBuf), "%g", agent::g_screenCaptureId);
+        reply.append("{\"id\":");
+        reply.append(idBuf);
+        reply.append(",\"ok\":true,\"result\":{\"path\":\"");
+        appendJsonEscaped(reply, abs.c_str());
+        reply.append("\",\"raw\":");
+        reply.append(raw ? "true" : "false");
+        reply.append("}}");
+        agent::serverBroadcastLine(reply);
+        agent::g_screenCapturePending = false;
+    }
 }
 
 #endif /* C_DEBUG */

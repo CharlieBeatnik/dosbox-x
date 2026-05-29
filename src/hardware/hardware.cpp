@@ -38,6 +38,7 @@
 #include "render.h"
 #include "cross.h"
 #include "wave_mmreg.h"
+#include "agent.h"
 
 #if (C_SSHOT) || (C_AVCODEC)
 #include <zlib.h>
@@ -985,7 +986,10 @@ void CAPTURE_AddImage(Bitu width, Bitu height, Bitu bpp, Bitu pitch, Bitu flags,
 		/*close file*/
 		fclose(fp);
 		if (show_recorded_filename && pathscr.size()) systemmessagebox("Recording completed",("Saved screenshot to the file:\n\n"+pathscr).c_str(),"ok", "info", 1);
-
+		/* Notify the agent control channel (proposal 4.7) so any pending
+		 * screen.capture request gets its deferred reply and any subscriber
+		 * sees a screen.captured event. Compiled out in release builds. */
+		AGENT_OnScreenCaptured(pathscr.c_str(), false);
 	}
 	pathscr = "";
 skip_shot:

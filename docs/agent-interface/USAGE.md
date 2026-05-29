@@ -125,6 +125,7 @@ events don't. The reference client does this in a single reader thread.
 | `farcall.unwatch`   | none                          | `{watching: false}`                 |
 | `cpu.watch_target`  | `{target_seg, target_off}`    | `{watching, target_seg, target_off}`|
 | `cpu.unwatch_target`| none                          | `{watching: false}`                 |
+| `screen.capture`    | `{raw?: bool}`                | `{path, raw}` (deferred — see below) |
 
 ### `vm.version`
 
@@ -338,6 +339,47 @@ negligible cost; you can leave it set across long-running guest code.
 The intended workflow is "set before the suspect window, drain events
 while reproducing, unwatch afterwards".
 
+### `screen.capture`
+
+Trigger DOSBox-X's existing screenshot path and return the absolute
+path of the written PNG. Reuses the same encoder the keyboard-mapper
+hotkeys (`Host+P`, `Host+Ctrl+P`) drive, so the captured pixels are
+identical to what those produce.
+
+- `raw` (optional, bool, default **true**) — `true` writes the raw VGA
+  scan-line capture (native resolution, true palette, no output scaler,
+  filename suffix `.raw1.png`); `false` writes the cooked render-output
+  capture (post-scaler, `.png`). Default raw keeps pixel offsets honest
+  for RE / shift analysis. Both end up as standard PNGs.
+- The `[dosbox] captures=` config setting must be non-empty (the
+  command returns `bad_state` otherwise). Files are auto-numbered:
+  `<lowercased running program>_NNN[.raw1].png` under that directory.
+
+**The reply is deferred.** `screen.capture` returns no immediate reply
+from the dispatcher. The screenshot encoder runs on the next VGA frame;
+once `fclose` returns the agent sends both:
+
+1. The reply for your `id`: `{"path": "<abs>", "raw": <bool>}`.
+2. A `screen.captured` event with the same fields.
+
+This means **the CPU must be running** for the capture to land — the
+render path doesn't fire while the CPU is paused in the debugger. The
+default `dbxagent.call("screen.capture", ...)` blocks transparently
+until the reply arrives, so callers don't need to handle the timing.
+Typical round-trip is ~30ms on a clean repro.
+
+```python
+res = a.call("screen.capture")              # raw=True by default
+img_path = pathlib.Path(res["path"])         # absolute path on disk
+data = img_path.read_bytes()                 # PNG bytes
+```
+
+Errors:
+- `bad_args` — `raw` is set to a non-bool value.
+- `bad_state` — `[dosbox] captures=` is empty/unset.
+- `busy` — another `screen.capture` is still pending; wait for its
+  reply or `screen.captured` event before issuing another.
+
 ### `cpu.watch_target` / `cpu.unwatch_target`
 
 The NEAR-transfer sibling of `farcall.watch`. Use this when you know the
@@ -450,6 +492,7 @@ COMMAND.COM stop callbacks. None of these touch a hooked opcode.
 | `log.line`         | `{text}`                        | While subscribed                                                |
 | `farcall.transfer` | `{target_seg, target_off, from_cs, from_ip, kind}` | A `CALL FAR` / `JMP FAR` / `RETF` / `IRET` / interrupt dispatch whose target CS matched the active `farcall.watch` sentinel |
 | `cpu.transfer`     | `{target_seg, target_off, from_cs, from_ip, kind}` | A NEAR `CALL`/`JMP`/taken `Jcc`/`RETN` / same-CS `RETF` / `IRET` / interrupt dispatch whose `(CS, IP)` matched the active `cpu.watch_target` sentinel |
+| `screen.captured`  | `{path, raw}`                   | A `screen.capture` PNG was fully written. Same payload as the command's deferred reply. Fires even for screenshots triggered by keyboard mapper (`Host+P` etc.), so subscribe-and-filter on `path` if you only care about your own requests. |
 | `agent.error`      | `{code, message}`               | Malformed input from your side (no `id` available to reply on)  |
 | `agent.overflow`   | none                            | Outbox hit its 1 MB cap; lines were dropped                     |
 | `busy`             | none                            | A second client tried to connect; that connection is closed     |

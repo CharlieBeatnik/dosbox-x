@@ -47,6 +47,7 @@
 #include "pc98_cg.h"
 #include "pc98_gdc.h"
 #include "pc98_gdc_const.h"
+#include "agent.h"
 
 #if (C_SSHOT) || (C_AVCODEC)
 #include <zlib.h>
@@ -5932,6 +5933,9 @@ void WriteARawImage(rawscreenshot &rawimg,rawscreenshot &rawpal,const char *ext)
 	fclose(fp);
     std::string message = formatString(MSG_Get("SAVE_SCREENSHOT"), pathscr.c_str());
 	if (show_recorded_filename && pathscr.size()) systemmessagebox("Recording completed",("Saved screenshot to the file:\n\n"+pathscr).c_str(),"ok", "info", 1);
+	/* Notify the agent control channel (proposal 4.7) — see the matching
+	 * call in CAPTURE_AddImage. Compiled out in release builds. */
+	AGENT_OnScreenCaptured(pathscr.c_str(), true);
 }
 #endif
 #endif

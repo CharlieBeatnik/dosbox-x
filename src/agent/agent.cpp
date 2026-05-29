@@ -38,6 +38,17 @@
 #include <string>
 #include <vector>
 
+/* Forward declarations of capture-subsystem globals — these aren't in
+ * any public header. The screenshot triggers are defined in
+ * hardware.cpp (line ~1610) and the path/dir globals at line 74. They
+ * live at global scope, so the externs must be at global scope too —
+ * extern inside `namespace agent` would link against `agent::pathscr`
+ * which doesn't exist. */
+extern void CAPTURE_ScreenShotEvent(bool pressed);
+extern void CAPTURE_RawScreenShotEvent(bool pressed);
+extern std::string capturedir;
+extern std::string pathscr;
+
 namespace agent {
 
 /* Far-transfer watch state — file-scope so the public AGENT_FarWatch*
@@ -52,6 +63,16 @@ uint16_t g_farWatchSeg     = 0;
 bool     g_targetWatchEnabled = false;
 uint16_t g_targetWatchSeg     = 0;
 uint16_t g_targetWatchOff     = 0;
+
+/* screen.capture pending-request state (proposal 4.7). The handler returns
+ * an empty string so the protocol layer queues no immediate reply, then
+ * AGENT_OnScreenCaptured (called from the capture subsystem after fclose)
+ * sends the deferred reply. -1 means no capture is pending. Single-slot
+ * because Phase 1 is single-client and the capture subsystem itself only
+ * handles one screenshot at a time. */
+double g_screenCaptureId = -1.0;
+bool   g_screenCaptureRaw = false;
+bool   g_screenCapturePending = false;
 
 namespace {
 
@@ -290,6 +311,47 @@ JsonValue handleCpuUnwatchTarget(double id, const JsonValue & /*args*/) {
     return makeReplyOk(id, std::move(r));
 }
 
+/* `screen.capture` — trigger DOSBox-X's existing screenshot path and
+ * defer the reply until the PNG is fully written by the VGA render path.
+ * Returns an empty string from dispatchLine so no immediate reply is
+ * queued; AGENT_OnScreenCaptured below sends the reply (and the
+ * `screen.captured` event) once fclose has returned. */
+std::string handleScreenCapture(double id, const JsonValue &args) {
+    bool raw = true;
+    if (const JsonValue *rawArg = args.get("raw")) {
+        if (!rawArg->isBool())
+            return jsonEncode(makeReplyError(id, "bad_args", "'raw' must be a bool"));
+        raw = rawArg->b;
+    }
+
+    if (g_screenCapturePending)
+        return jsonEncode(makeReplyError(id, "busy",
+            "another screen.capture is already pending; wait for its reply"));
+
+    if (capturedir.empty())
+        return jsonEncode(makeReplyError(id, "bad_state",
+            "no [dosbox] captures= directory configured"));
+
+    /* Clear pathscr so we can use a non-empty post-capture pathscr as a
+     * sanity signal. The cooked path also clears at the top of
+     * OpenCaptureFile but the raw path doesn't — clear both unconditionally
+     * here so the next capture starts from a clean slate. */
+    pathscr.clear();
+
+    g_screenCaptureId = id;
+    g_screenCaptureRaw = raw;
+    g_screenCapturePending = true;
+
+    if (raw)
+        CAPTURE_RawScreenShotEvent(true);
+    else
+        CAPTURE_ScreenShotEvent(true);
+
+    /* No immediate reply — AGENT_OnScreenCaptured sends it once the file
+     * is written by the render path. */
+    return std::string();
+}
+
 }  /* anonymous namespace */
 
 JsonValue makeReplyOk(double id, JsonObject result) {
@@ -353,6 +415,9 @@ std::string dispatchLine(const std::string &line) {
     if (cmd->s == "farcall.unwatch")   return jsonEncode(handleFarcallUnwatch(id, a));
     if (cmd->s == "cpu.watch_target")  return jsonEncode(handleCpuWatchTarget(id, a));
     if (cmd->s == "cpu.unwatch_target")return jsonEncode(handleCpuUnwatchTarget(id, a));
+    /* screen.capture returns "" so the protocol layer queues no immediate
+     * reply; the deferred reply is sent from AGENT_OnScreenCaptured. */
+    if (cmd->s == "screen.capture")    return handleScreenCapture(id, a);
 
     return jsonEncode(makeReplyError(id, "unknown_cmd",
         std::string("unknown command: ") + cmd->s));

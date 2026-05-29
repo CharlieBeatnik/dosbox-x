@@ -95,6 +95,15 @@ void AGENT_TargetWatchClear(void);
  * loop. Used so we know when to flip state.paused <-> state.running. */
 void AGENT_OnLoopChange(void);
 
+/* Notified by the capture subsystem after a screenshot PNG has been fully
+ * written (fclose returned). `path` is the just-written file (the global
+ * `pathscr` while it's still set); `raw` distinguishes the raw VGA
+ * scan-line capture from the post-scaler render. The agent uses this to
+ * (a) emit a `screen.captured` event for any subscriber, and (b) send the
+ * deferred reply for a `screen.capture` request whose handler returned
+ * empty pending the file write. */
+void AGENT_OnScreenCaptured(const char *path, bool raw);
+
 /* True when the agent is running in "headless debugger" mode, i.e. the
  * caller should skip curses init in DEBUG_EnableDebugger. */
 bool AGENT_IsHeadless(void);
@@ -123,6 +132,7 @@ static inline bool AGENT_TargetWatchMatches(uint16_t /*seg*/, uint16_t /*off*/) 
 static inline void AGENT_TargetWatchSet(uint16_t /*seg*/, uint16_t /*off*/) {}
 static inline void AGENT_TargetWatchClear(void) {}
 static inline void AGENT_OnLoopChange(void) {}
+static inline void AGENT_OnScreenCaptured(const char * /*path*/, bool /*raw*/) {}
 static inline bool AGENT_IsHeadless(void) { return false; }
 
 #endif /* C_DEBUG */
