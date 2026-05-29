@@ -734,6 +734,9 @@ void CBreakpoint::ActivateBreakpointsExceptAt(PhysPt adr)
 	}
 }
 
+uint16_t DEBUG_GetPrevCS(void);
+uint16_t DEBUG_GetPrevIP(void);
+
 bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
 // Checks if breakpoint is valid and should stop execution
 {
@@ -747,7 +750,10 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
 
 		if ((bp->GetType() == BKPNT_PHYSICAL) && bp->IsActive() &&
 		    (bp->GetLocation() == GetAddress(seg, off))) {
-			AGENT_EmitBpHit(seg, off, bp_index);
+			/* Pass the previous instruction's CS:IP so consumers can attribute
+			 * the transfer source even when the source opcode isn't hooked. */
+			AGENT_EmitBpHit(seg, off, bp_index,
+			                DEBUG_GetPrevCS(), DEBUG_GetPrevIP());
 			// Found
 			if (bp->GetOnce()) {
 				// delete it, if it should only be used once
@@ -791,7 +797,8 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
                         return false;
                     }
 					DEBUG_ShowMsg("DEBUG: Memory breakpoint %s: %04X:%04X - %02X -> %02X\n",(bp->GetType()==BKPNT_MEMORY_PROT)?"(Prot)":"",bp->GetSegment(),bp->GetOffset(),bp->GetValue(),value);
-					AGENT_EmitBpHit(seg, off, bp_index);
+					AGENT_EmitBpHit(seg, off, bp_index,
+					                DEBUG_GetPrevCS(), DEBUG_GetPrevIP());
 					bp->SetValue(value);
 					return true;
 				}
@@ -817,7 +824,8 @@ bool CBreakpoint::CheckIntBreakpoint(PhysPt adr, uint8_t intNr, uint16_t ahValue
 		CBreakpoint* bp = (*i);
 		if ((bp->GetType()==BKPNT_INTERRUPT) && bp->IsActive() && (bp->GetIntNr()==intNr)) {
 			if (((bp->GetValue()==BPINT_ALL) || (bp->GetValue()==ahValue)) && ((bp->GetOther()==BPINT_ALL) || (bp->GetOther()==alValue))) {
-				AGENT_EmitBpHit(SegValue(cs), reg_eip, bp_index);
+				AGENT_EmitBpHit(SegValue(cs), reg_eip, bp_index,
+				                DEBUG_GetPrevCS(), DEBUG_GetPrevIP());
 				// Ignore it once ?
 				// Found
 				if (bp->GetOnce()) {
@@ -6113,7 +6121,25 @@ void DEBUG_HeavyWriteLogInstruction(void) {
 	DEBUG_ShowMsg("DEBUG: Done.\n");
 }
 
+/* Previous-instruction CS:IP tracker. Captured at the START of every heavy-
+ * debug check, BEFORE the BP/watch comparison runs. Next call sees the prior
+ * call's saved values — i.e., where the CPU was when the *previous*
+ * instruction was about to fetch — and uses them to attribute a "from" for
+ * bp.hit and the cpu.watch_target execution fallback. */
+static uint16_t g_dbg_prev_cs = 0;
+static uint16_t g_dbg_prev_ip = 0;
+
+uint16_t DEBUG_GetPrevCS(void) { return g_dbg_prev_cs; }
+uint16_t DEBUG_GetPrevIP(void) { return g_dbg_prev_ip; }
+
 bool DEBUG_HeavyIsBreakpoint(void) {
+	const uint16_t cur_cs = SegValue(cs);
+	const uint16_t cur_ip = (uint16_t)reg_eip;
+	const uint16_t prev_cs = g_dbg_prev_cs;
+	const uint16_t prev_ip = g_dbg_prev_ip;
+	g_dbg_prev_cs = cur_cs;
+	g_dbg_prev_ip = cur_ip;
+
 	if (cpuLog) {
 		if (cpuLogCounter>0) {
 			LogInstruction(SegValue(cs),reg_eip,cpuLogFile);
@@ -6144,7 +6170,18 @@ bool DEBUG_HeavyIsBreakpoint(void) {
 		skipFirstInstruction = false;
 		return false;
 	}
-	if (!CBreakpoint::BPoints.empty() && CBreakpoint::CheckBreakpoint(SegValue(cs),reg_eip)) {
+
+	/* Heavy-debug execution fallback for cpu.watch_target. If the watch
+	 * matches the current (CS, IP) and the previous instruction was at a
+	 * different (CS, IP), fire a `cpu.transfer` event with kind="hbp_exec".
+	 * This catches transfers whose opcode/CPU_Interrupt site isn't hooked
+	 * — useful when investigating "BP fires here but watch doesn't". */
+	if ((prev_cs != cur_cs || prev_ip != cur_ip) &&
+	    AGENT_TargetWatchMatches(cur_cs, cur_ip)) {
+		AGENT_EmitTransfer("hbp_exec", cur_cs, cur_ip, prev_cs, prev_ip);
+	}
+
+	if (!CBreakpoint::BPoints.empty() && CBreakpoint::CheckBreakpoint(cur_cs, reg_eip)) {
 		return true;
 	}
 	return false;

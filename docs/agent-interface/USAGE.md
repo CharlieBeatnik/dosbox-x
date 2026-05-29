@@ -389,6 +389,7 @@ Emits a `cpu.transfer` event per matching transfer:
 | `int_icebp`           | `0xF1` ICEBP                                          |
 | `callback_far`        | C++-side `CALLBACK_RunRealFar` direct CS:IP dispatch (DOS device strategy/interrupt, XMS callback, shell exec, etc.) |
 | `callback_far_int`    | C++-side `CALLBACK_RunRealFarInt` direct CS:IP dispatch (INT 16 wrap, etc.) |
+| `hbp_exec`            | Heavy-debug execution fallback: CPU reached the watched (CS, IP) via *some* transfer that the opcode/`CPU_Interrupt`/`CALLBACK_*` hooks didn't catch. `from_cs`/`from_ip` are the previous instruction's address (the source of the unhooked transfer). |
 
 Conditional jumps only emit when the branch is **taken** (same convention
 as the FAR Jcc hooks). For all opcode-driven NEAR kinds `from_cs` equals
@@ -444,7 +445,7 @@ COMMAND.COM stop callbacks. None of these touch a hooked opcode.
 |--------------------|---------------------------------|-----------------------------------------------------------------|
 | `state.running`    | none                            | CPU resumed (after `cpu.run`, RUN, RUNWATCH, or auto-resume)    |
 | `state.paused`     | none                            | CPU halted (paired with `debugger.entered`)                     |
-| `bp.hit`           | `{seg, off, bp_index}`          | Just before the debugger entry that a breakpoint triggered      |
+| `bp.hit`           | `{seg, off, bp_index[, from_cs, from_ip]}` | Just before the debugger entry that a breakpoint triggered. In heavy-debug builds `from_cs`/`from_ip` carry the previous instruction's CS:IP (the source of the transfer to `seg:off`). |
 | `debugger.entered` | `{reason}`                      | After `bp.hit`, or any other debugger entry                     |
 | `log.line`         | `{text}`                        | While subscribed                                                |
 | `farcall.transfer` | `{target_seg, target_off, from_cs, from_ip, kind}` | A `CALL FAR` / `JMP FAR` / `RETF` / `IRET` / interrupt dispatch whose target CS matched the active `farcall.watch` sentinel |

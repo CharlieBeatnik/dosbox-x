@@ -54,12 +54,21 @@ void emitLogLine(const char *line) {
 
 /* ---- Public surface ----------------------------------------------------- */
 
-void AGENT_EmitBpHit(uint16_t seg, uint32_t off, int bp_index)
+void AGENT_EmitBpHit(uint16_t seg, uint32_t off, int bp_index,
+                     uint16_t from_cs, uint16_t from_ip)
 {
-    char buf[128];
-    snprintf(buf, sizeof(buf),
-        "{\"event\":\"bp.hit\",\"seg\":%u,\"off\":%u,\"bp_index\":%d}",
-        static_cast<unsigned>(seg), static_cast<unsigned>(off), bp_index);
+    char buf[192];
+    if (from_cs == 0 && from_ip == 0) {
+        snprintf(buf, sizeof(buf),
+            "{\"event\":\"bp.hit\",\"seg\":%u,\"off\":%u,\"bp_index\":%d}",
+            static_cast<unsigned>(seg), static_cast<unsigned>(off), bp_index);
+    } else {
+        snprintf(buf, sizeof(buf),
+            "{\"event\":\"bp.hit\",\"seg\":%u,\"off\":%u,\"bp_index\":%d,"
+            "\"from_cs\":%u,\"from_ip\":%u}",
+            static_cast<unsigned>(seg), static_cast<unsigned>(off), bp_index,
+            static_cast<unsigned>(from_cs), static_cast<unsigned>(from_ip));
+    }
     agent::serverBroadcastLine(buf);
 }
 

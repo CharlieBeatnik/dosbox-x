@@ -49,7 +49,13 @@ void AGENT_Poll(bool paused);
 /* Event emitters. All are cheap (string-format + push to a deque); they
  * never touch sockets directly, so they are safe to call from BP-check
  * context. */
-void AGENT_EmitBpHit(uint16_t seg, uint32_t off, int bp_index);
+/* `from_cs` / `from_ip` are the (CS, IP) of the *previous* instruction
+ * that just finished executing — i.e., the source of the transfer that
+ * landed the CPU at (seg, off). Heavy-debug builds populate them via
+ * DEBUG_HeavyIsBreakpoint's per-instruction tracker. Non-heavy callers
+ * pass 0/0 (not meaningful). */
+void AGENT_EmitBpHit(uint16_t seg, uint32_t off, int bp_index,
+                     uint16_t from_cs = 0, uint16_t from_ip = 0);
 void AGENT_EmitLog(const char *line);
 void AGENT_EmitDebuggerEntered(const char *reason);
 void AGENT_EmitStateRunning(void);
@@ -98,7 +104,8 @@ bool AGENT_IsHeadless(void);
 static inline void AGENT_StartIfRequested(void) {}
 static inline void AGENT_Stop(void) {}
 static inline void AGENT_Poll(bool /*paused*/) {}
-static inline void AGENT_EmitBpHit(uint16_t /*seg*/, uint32_t /*off*/, int /*bp_index*/) {}
+static inline void AGENT_EmitBpHit(uint16_t /*seg*/, uint32_t /*off*/, int /*bp_index*/,
+                                   uint16_t /*from_cs*/ = 0, uint16_t /*from_ip*/ = 0) {}
 static inline void AGENT_EmitLog(const char * /*line*/) {}
 static inline void AGENT_EmitDebuggerEntered(const char * /*reason*/) {}
 static inline void AGENT_EmitStateRunning(void) {}
