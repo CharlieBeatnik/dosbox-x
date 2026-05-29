@@ -24,6 +24,7 @@
 #include "logging.h"
 #include "bios.h"
 #include "cpu.h"
+#include "agent.h"
 
 #if C_EMSCRIPTEN
 # include <emscripten.h>
@@ -189,6 +190,16 @@ void CALLBACK_RunRealFarInt(uint16_t seg,uint16_t off) {
 	uint16_t oldcs=SegValue(cs);
 	reg_eip=off;
 	SegSet16(cs,seg);
+#if C_DEBUG
+	/* This direct CS:IP write doesn't go through any hooked opcode, so fire
+	 * the watches here so consumers can see C++-side dispatches into guest
+	 * code (DOS device strategy/interrupt entry points, XMS callbacks, the
+	 * INT16 wrap, etc.). */
+	if (AGENT_TargetWatchMatches(seg,off))
+		AGENT_EmitTransfer("callback_far_int",seg,off,oldcs,(uint16_t)oldeip);
+	if (AGENT_FarWatchMatches(seg))
+		AGENT_EmitFarTransfer(seg,off,oldcs,(uint16_t)oldeip,"callback_far_int");
+#endif
 	DOSBOX_RunMachine();
 	reg_eip=oldeip;
 	SegSet16(cs,oldcs);
@@ -210,6 +221,12 @@ void CALLBACK_RunRealFar(uint16_t seg,uint16_t off) {
 	uint16_t oldcs=SegValue(cs);
 	reg_eip=off;
 	SegSet16(cs,seg);
+#if C_DEBUG
+	if (AGENT_TargetWatchMatches(seg,off))
+		AGENT_EmitTransfer("callback_far",seg,off,oldcs,(uint16_t)oldeip);
+	if (AGENT_FarWatchMatches(seg))
+		AGENT_EmitFarTransfer(seg,off,oldcs,(uint16_t)oldeip,"callback_far");
+#endif
 	DOSBOX_RunMachine();
 	reg_eip=oldeip;
 	SegSet16(cs,oldcs);

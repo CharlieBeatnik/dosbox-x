@@ -387,6 +387,8 @@ Emits a `cpu.transfer` event per matching transfer:
 | `int_step_trap`       | `TF=1` single-step trap (`CPU_DebugException`)        |
 | `int_nmi`             | NMI (`CPU_NMI_Interrupt`)                             |
 | `int_icebp`           | `0xF1` ICEBP                                          |
+| `callback_far`        | C++-side `CALLBACK_RunRealFar` direct CS:IP dispatch (DOS device strategy/interrupt, XMS callback, shell exec, etc.) |
+| `callback_far_int`    | C++-side `CALLBACK_RunRealFarInt` direct CS:IP dispatch (INT 16 wrap, etc.) |
 
 Conditional jumps only emit when the branch is **taken** (same convention
 as the FAR Jcc hooks). For all opcode-driven NEAR kinds `from_cs` equals
@@ -427,6 +429,14 @@ If the same dispatch is converted to an exception mid-flight (e.g., the
 gate descriptor is missing, so `CPU_Exception(#GP)` runs instead), only
 the exception event fires — the suppressed outer event would otherwise
 double-count the same landing.
+
+`callback_far` and `callback_far_int` fire when DOSBox-X's C++ code
+synthetically sets `CS:IP` to invoke a guest routine without going
+through any opcode (DOS device strategy/interrupt entry points, XMS
+callbacks, `INT 16` wrap, shell exec, etc.). Examples of paths these
+catch: `dos_devices.cpp` dispatching a CHARACTER device's strategy
+routine; `bios_keyboard.cpp:INT16_Handler_Wrap`; `shell` running
+COMMAND.COM stop callbacks. None of these touch a hooked opcode.
 
 ## Events
 
