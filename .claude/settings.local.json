@@ -36,7 +36,14 @@
       "Bash(tasklist /FI \"IMAGENAME eq dosbox-x.exe\" /FO CSV /NH)",
       "PowerShell(Get-Process dosbox-x -ErrorAction SilentlyContinue)",
       "PowerShell(Stop-Process -Force)",
-      "PowerShell(\"done\")"
+      "PowerShell(\"done\")",
+      "PowerShell(python tests\\\\agent_live\\\\test_int_hooks.py 2>&1)",
+      "PowerShell(python tests\\\\agent_live\\\\test_bps.py 2>&1)",
+      "PowerShell($out = msbuild vs\\\\dosbox-x.sln /property:GenerateFullPaths=true /p:Configuration=Debug /p:Platform=x64 /p:PlatformToolset=v143 -m; $err = $out | Where-Object { $_ -match 'error C' } | Select-Object -First 30; if \\($err\\) { $err } else { $out | Select-Object -Last 6 })",
+      "PowerShell($out = msbuild vs\\\\dosbox-x.sln /property:GenerateFullPaths=true /p:Configuration=Debug /p:Platform=x64 /p:PlatformToolset=v143 -m; $err = $out | Where-Object { $_ -match 'error LNK|error C' } | Select-Object -First 30; $err)",
+      "PowerShell(python tests\\\\agent_live\\\\test_screen_capture.py 2>&1)",
+      "PowerShell(\"---\")",
+      "PowerShell(python tests\\\\agent_live\\\\test_watch_range.py 2>&1)"
     ]
   }
 }
