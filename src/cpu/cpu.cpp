@@ -1234,6 +1234,8 @@ void CPU_Interrupt(Bitu num,Bitu type,uint32_t oldeip,const char *kind) {
                 AGENT_EmitTransfer(kind,new_cs,new_ip,agent_oldcs,agent_oldip);
             if (AGENT_FarWatchMatches(new_cs))
                 AGENT_EmitFarTransfer(new_cs,new_ip,agent_oldcs,agent_oldip,kind);
+            if (AGENT_RangeWatchEntry(new_cs,new_ip,agent_oldcs,agent_oldip))
+                AGENT_EmitRangeEnter(kind,new_cs,new_ip,agent_oldcs,agent_oldip);
         }
     }
 #endif

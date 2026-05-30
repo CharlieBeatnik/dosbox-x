@@ -792,6 +792,8 @@
 #if C_DEBUG
 			if (AGENT_FarWatchMatches(newcs))
 				AGENT_EmitFarTransfer(newcs, newip, agent_oldcs, agent_oldip, "call_far_direct");
+			if (AGENT_RangeWatchEntry(newcs, newip, agent_oldcs, agent_oldip))
+				AGENT_EmitRangeEnter("call_far_direct", newcs, newip, agent_oldcs, agent_oldip);
 #endif
 #if CPU_TRAP_CHECK
 			if (GETFLAG(TF)) {
@@ -1075,6 +1077,8 @@
 				 * fire the NEAR watch too so cpu.watch_target catches it. */
 				if (AGENT_TargetWatchMatches(agent_newcs, agent_newip))
 					AGENT_EmitTransfer("retf", agent_newcs, agent_newip, agent_oldcs, agent_oldip);
+				if (AGENT_RangeWatchEntry(agent_newcs, agent_newip, agent_oldcs, agent_oldip))
+					AGENT_EmitRangeEnter("retf", agent_newcs, agent_newip, agent_oldcs, agent_oldip);
 			}
 #endif
 			continue;
@@ -1100,6 +1104,8 @@
 					AGENT_EmitFarTransfer(agent_newcs, agent_newip, agent_oldcs, agent_oldip, "retf");
 				if (AGENT_TargetWatchMatches(agent_newcs, agent_newip))
 					AGENT_EmitTransfer("retf", agent_newcs, agent_newip, agent_oldcs, agent_oldip);
+				if (AGENT_RangeWatchEntry(agent_newcs, agent_newip, agent_oldcs, agent_oldip))
+					AGENT_EmitRangeEnter("retf", agent_newcs, agent_newip, agent_oldcs, agent_oldip);
 			}
 #endif
 			continue;
@@ -1159,6 +1165,8 @@
 				/* Same-CS IRET is still a control transfer; fire the NEAR watch too. */
 				if (AGENT_TargetWatchMatches(agent_newcs, agent_newip))
 					AGENT_EmitTransfer("iret", agent_newcs, agent_newip, agent_oldcs, agent_oldip);
+				if (AGENT_RangeWatchEntry(agent_newcs, agent_newip, agent_oldcs, agent_oldip))
+					AGENT_EmitRangeEnter("iret", agent_newcs, agent_newip, agent_oldcs, agent_oldip);
 			}
 #endif
 #if CPU_TRAP_CHECK
@@ -1376,6 +1384,8 @@
 #if C_DEBUG
 			if (AGENT_FarWatchMatches(newcs))
 				AGENT_EmitFarTransfer(newcs, newip, agent_oldcs, agent_oldip, "jmp_far_direct");
+			if (AGENT_RangeWatchEntry(newcs, newip, agent_oldcs, agent_oldip))
+				AGENT_EmitRangeEnter("jmp_far_direct", newcs, newip, agent_oldcs, agent_oldip);
 #endif
 #if CPU_TRAP_CHECK
 			if (GETFLAG(TF)) {
@@ -1665,6 +1675,8 @@
 #if C_DEBUG
 					if (AGENT_FarWatchMatches(newcs))
 						AGENT_EmitFarTransfer(newcs, newip, agent_oldcs, agent_oldip, "call_far_indirect");
+					if (AGENT_RangeWatchEntry(newcs, newip, agent_oldcs, agent_oldip))
+						AGENT_EmitRangeEnter("call_far_indirect", newcs, newip, agent_oldcs, agent_oldip);
 #endif
 #if CPU_TRAP_CHECK
 					if (GETFLAG(TF)) {
@@ -1706,6 +1718,8 @@
 #if C_DEBUG
 					if (AGENT_FarWatchMatches(newcs))
 						AGENT_EmitFarTransfer(newcs, newip, agent_oldcs, agent_oldip, "jmp_far_indirect");
+					if (AGENT_RangeWatchEntry(newcs, newip, agent_oldcs, agent_oldip))
+						AGENT_EmitRangeEnter("jmp_far_indirect", newcs, newip, agent_oldcs, agent_oldip);
 #endif
 #if CPU_TRAP_CHECK
 					if (GETFLAG(TF)) {

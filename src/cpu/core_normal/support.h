@@ -55,20 +55,40 @@ static INLINE int32_t Fetchds() {
 		continue;											\
 	}
 
-/* Agent NEAR-transfer hook (proposal 4.4). Compiles to nothing when
- * C_DEBUG is off so the cycle cost stays zero in release builds. KIND is
- * a string literal naming the opcode group; FROM_IP is the post-operand
- * IP (i.e., the return address of the instruction that just branched);
- * TARGET_IP is the destination offset within the current CS. */
+/* Agent NEAR-transfer hook (proposal 4.4 + 4.8). Compiles to nothing
+ * when C_DEBUG is off so the cycle cost stays zero in release builds.
+ * KIND is a string literal naming the opcode group; FROM_IP is the
+ * post-operand IP (i.e., the return address of the instruction that
+ * just branched); TARGET_IP is the destination offset within the
+ * current CS.
+ *
+ * Two watch families fire from here:
+ *   - cpu.watch_target (4.4): fires when (CS, IP) matches a sentinel
+ *     pair. Use for "what instruction landed here?"
+ *   - cpu.watch_range  (4.8): fires when target_off enters [lo, hi]
+ *     and FROM_IP is outside [lo, hi]. Use for "what first entered
+ *     this region?" — naturally suppresses intra-range fall-through
+ *     since FROM_IP will be inside the range on subsequent steps. */
 #if C_DEBUG
 extern bool AGENT_TargetWatchMatches(uint16_t seg, uint16_t off);
 extern void AGENT_EmitTransfer(const char *kind,
                                uint16_t target_seg, uint16_t target_off,
                                uint16_t from_cs,    uint16_t from_ip);
+extern bool AGENT_RangeWatchEntry(uint16_t target_seg, uint16_t target_off,
+                                  uint16_t from_seg,   uint16_t from_ip);
+extern void AGENT_EmitRangeEnter(const char *kind,
+                                 uint16_t target_seg, uint16_t target_off,
+                                 uint16_t from_cs,    uint16_t from_ip);
 #define AGENT_NEAR_HOOK(KIND, FROM_IP, TARGET_IP) do {                                  \
-    if (AGENT_TargetWatchMatches((uint16_t)SegValue(cs), (uint16_t)(TARGET_IP)))        \
-        AGENT_EmitTransfer((KIND), (uint16_t)SegValue(cs), (uint16_t)(TARGET_IP),       \
-                           (uint16_t)SegValue(cs), (uint16_t)(FROM_IP));                \
+    const uint16_t _agent_seg = (uint16_t)SegValue(cs);                                 \
+    const uint16_t _agent_tgt = (uint16_t)(TARGET_IP);                                  \
+    const uint16_t _agent_frm = (uint16_t)(FROM_IP);                                    \
+    if (AGENT_TargetWatchMatches(_agent_seg, _agent_tgt))                               \
+        AGENT_EmitTransfer((KIND), _agent_seg, _agent_tgt,                              \
+                           _agent_seg, _agent_frm);                                     \
+    if (AGENT_RangeWatchEntry(_agent_seg, _agent_tgt, _agent_seg, _agent_frm))          \
+        AGENT_EmitRangeEnter((KIND), _agent_seg, _agent_tgt,                            \
+                             _agent_seg, _agent_frm);                                   \
 } while (0)
 #else
 #define AGENT_NEAR_HOOK(KIND, FROM_IP, TARGET_IP) do { (void)(FROM_IP); (void)(TARGET_IP); } while (0)

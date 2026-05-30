@@ -177,6 +177,26 @@ void AGENT_EmitTransfer(const char *kind,
     agent::serverBroadcastLine(buf);
 }
 
+void AGENT_EmitRangeEnter(const char *kind,
+                          uint16_t target_seg, uint16_t target_off,
+                          uint16_t from_cs,    uint16_t from_ip)
+{
+    /* `seg` matches the watched segment (NEAR semantics). `target_off`
+     * is the landing offset inside [lo, hi]. `from_cs`/`from_ip` point
+     * at the source instruction that performed the boundary-crossing
+     * transfer — the one to disassemble to find the divert. */
+    char buf[192];
+    snprintf(buf, sizeof(buf),
+        "{\"event\":\"cpu.range_enter\","
+        "\"seg\":%u,\"target_off\":%u,"
+        "\"from_cs\":%u,\"from_ip\":%u,"
+        "\"kind\":\"%s\"}",
+        static_cast<unsigned>(target_seg), static_cast<unsigned>(target_off),
+        static_cast<unsigned>(from_cs),    static_cast<unsigned>(from_ip),
+        kind ? kind : "unknown");
+    agent::serverBroadcastLine(buf);
+}
+
 namespace agent {
 /* Defined in agent.cpp — single-slot pending screen.capture request state.
  * Touched only on the main (CPU) thread, so no locking required. */

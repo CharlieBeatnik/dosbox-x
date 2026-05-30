@@ -6176,9 +6176,15 @@ bool DEBUG_HeavyIsBreakpoint(void) {
 	 * different (CS, IP), fire a `cpu.transfer` event with kind="hbp_exec".
 	 * This catches transfers whose opcode/CPU_Interrupt site isn't hooked
 	 * — useful when investigating "BP fires here but watch doesn't". */
-	if ((prev_cs != cur_cs || prev_ip != cur_ip) &&
-	    AGENT_TargetWatchMatches(cur_cs, cur_ip)) {
-		AGENT_EmitTransfer("hbp_exec", cur_cs, cur_ip, prev_cs, prev_ip);
+	if (prev_cs != cur_cs || prev_ip != cur_ip) {
+		if (AGENT_TargetWatchMatches(cur_cs, cur_ip))
+			AGENT_EmitTransfer("hbp_exec", cur_cs, cur_ip, prev_cs, prev_ip);
+		/* Range-entry fallback (proposal 4.8): same gate as the target
+		 * watch, but the range predicate's "from outside" guard
+		 * automatically suppresses intra-range steps so the slide
+		 * inside the watched window doesn't flood. */
+		if (AGENT_RangeWatchEntry(cur_cs, cur_ip, prev_cs, prev_ip))
+			AGENT_EmitRangeEnter("hbp_exec", cur_cs, cur_ip, prev_cs, prev_ip);
 	}
 
 	if (!CBreakpoint::BPoints.empty() && CBreakpoint::CheckBreakpoint(cur_cs, reg_eip)) {

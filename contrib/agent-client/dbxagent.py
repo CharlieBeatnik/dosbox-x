@@ -214,6 +214,13 @@ class DbxAgent:
     def log_unsubscribe(self) -> dict:
         return self.call("log.unsubscribe")
 
+    def cpu_watch_range(self, seg: int, lo: int, hi: int) -> dict:
+        """Arm cpu.watch_range — fires on entry into [seg, lo..hi] from outside."""
+        return self.call("cpu.watch_range", seg=seg, lo=lo, hi=hi)
+
+    def cpu_unwatch_range(self) -> dict:
+        return self.call("cpu.unwatch_range")
+
     def screen_capture(self, raw: bool = True, timeout: float = 10.0) -> dict:
         """Trigger a PNG screenshot and block until written.
 

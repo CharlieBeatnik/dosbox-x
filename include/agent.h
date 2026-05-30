@@ -91,6 +91,22 @@ bool AGENT_TargetWatchMatches(uint16_t seg, uint16_t off);
 void AGENT_TargetWatchSet(uint16_t seg, uint16_t off);
 void AGENT_TargetWatchClear(void);
 
+/* Range-entry watch (proposal 4.8). Fires when a control transfer lands
+ * at `seg:target_off` with `lo<=target_off<=hi`, AND the previous
+ * instruction was NOT in the same `[seg, lo..hi]` window. The "from
+ * outside" gate suppresses the intra-range fall-through / LOOP flood —
+ * the entire point is to identify the single transfer that first
+ * crossed into the range. Same seg only (NEAR semantics by default; FAR
+ * landings inherit the gate since from_cs != seg trivially counts as
+ * "from outside"). */
+bool AGENT_RangeWatchEntry(uint16_t target_seg, uint16_t target_off,
+                           uint16_t from_seg,   uint16_t from_ip);
+void AGENT_RangeWatchSet(uint16_t seg, uint16_t lo, uint16_t hi);
+void AGENT_RangeWatchClear(void);
+void AGENT_EmitRangeEnter(const char *kind,
+                          uint16_t target_seg, uint16_t target_off,
+                          uint16_t from_cs,    uint16_t from_ip);
+
 /* Notified when DOSBOX_SetNormalLoop / DOSBOX_SetLoop changes the main
  * loop. Used so we know when to flip state.paused <-> state.running. */
 void AGENT_OnLoopChange(void);
@@ -131,6 +147,13 @@ static inline void AGENT_FarWatchClear(void) {}
 static inline bool AGENT_TargetWatchMatches(uint16_t /*seg*/, uint16_t /*off*/) { return false; }
 static inline void AGENT_TargetWatchSet(uint16_t /*seg*/, uint16_t /*off*/) {}
 static inline void AGENT_TargetWatchClear(void) {}
+static inline bool AGENT_RangeWatchEntry(uint16_t /*target_seg*/, uint16_t /*target_off*/,
+                                         uint16_t /*from_seg*/,   uint16_t /*from_ip*/) { return false; }
+static inline void AGENT_RangeWatchSet(uint16_t /*seg*/, uint16_t /*lo*/, uint16_t /*hi*/) {}
+static inline void AGENT_RangeWatchClear(void) {}
+static inline void AGENT_EmitRangeEnter(const char * /*kind*/,
+                                        uint16_t /*target_seg*/, uint16_t /*target_off*/,
+                                        uint16_t /*from_cs*/,    uint16_t /*from_ip*/) {}
 static inline void AGENT_OnLoopChange(void) {}
 static inline void AGENT_OnScreenCaptured(const char * /*path*/, bool /*raw*/) {}
 static inline bool AGENT_IsHeadless(void) { return false; }

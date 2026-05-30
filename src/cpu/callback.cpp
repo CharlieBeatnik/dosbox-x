@@ -199,6 +199,8 @@ void CALLBACK_RunRealFarInt(uint16_t seg,uint16_t off) {
 		AGENT_EmitTransfer("callback_far_int",seg,off,oldcs,(uint16_t)oldeip);
 	if (AGENT_FarWatchMatches(seg))
 		AGENT_EmitFarTransfer(seg,off,oldcs,(uint16_t)oldeip,"callback_far_int");
+	if (AGENT_RangeWatchEntry(seg,off,oldcs,(uint16_t)oldeip))
+		AGENT_EmitRangeEnter("callback_far_int",seg,off,oldcs,(uint16_t)oldeip);
 #endif
 	DOSBOX_RunMachine();
 	reg_eip=oldeip;
@@ -226,6 +228,8 @@ void CALLBACK_RunRealFar(uint16_t seg,uint16_t off) {
 		AGENT_EmitTransfer("callback_far",seg,off,oldcs,(uint16_t)oldeip);
 	if (AGENT_FarWatchMatches(seg))
 		AGENT_EmitFarTransfer(seg,off,oldcs,(uint16_t)oldeip,"callback_far");
+	if (AGENT_RangeWatchEntry(seg,off,oldcs,(uint16_t)oldeip))
+		AGENT_EmitRangeEnter("callback_far",seg,off,oldcs,(uint16_t)oldeip);
 #endif
 	DOSBOX_RunMachine();
 	reg_eip=oldeip;

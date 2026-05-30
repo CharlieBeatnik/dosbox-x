@@ -125,6 +125,8 @@ events don't. The reference client does this in a single reader thread.
 | `farcall.unwatch`   | none                          | `{watching: false}`                 |
 | `cpu.watch_target`  | `{target_seg, target_off}`    | `{watching, target_seg, target_off}`|
 | `cpu.unwatch_target`| none                          | `{watching: false}`                 |
+| `cpu.watch_range`   | `{seg, lo, hi}`               | `{watching, seg, lo, hi}`           |
+| `cpu.unwatch_range` | none                          | `{watching: false}`                 |
 | `screen.capture`    | `{raw?: bool}`                | `{path, raw}` (deferred — see below) |
 
 ### `vm.version`
@@ -467,6 +469,63 @@ dispatch / same-CS far return) when the watch is set; the test compiles
 to a flag check plus two u16 compares, which is cheap enough to leave in
 place across long-running guest code.
 
+### `cpu.watch_range` / `cpu.unwatch_range`
+
+The boundary-crossing sibling of `cpu.watch_target`. Fires when the CPU
+transfers **into** `[seg, lo..hi]` **from outside** that window. Does
+**not** fire on intra-range transfers — the fall-through after the
+first entry, internal `LOOP`s, intra-range `Jcc`s — even though those
+have a target inside the range. The "from outside" gate is what makes
+this useful: when you're looking for the single instruction that
+diverts execution into a region (a data table being executed as code,
+say, or a sub-procedure body you want to identify the entry point
+of), the watch reports just the entry, not the long slide that
+follows.
+
+- `seg`, `lo`, `hi` (all required when setting) — `u16` decimal numbers
+  or hex strings, same convention as `cpu.watch_target`. `lo` must be
+  `<= hi`.
+- Pass `seg: null` to clear (same as `cpu.unwatch_range`).
+- Single sentinel — calling again replaces the previous one.
+
+Reply: `{watching: true|false, seg, lo, hi}`.
+
+Emits a `cpu.range_enter` event per matching boundary crossing:
+
+```json
+{"event": "cpu.range_enter",
+ "seg": 2084, "target_off": 39274,
+ "from_cs": 2084, "from_ip": 50071,
+ "kind": "jmp_near_indirect"}
+```
+
+`kind` reuses the existing transfer-source classification: any of the
+NEAR kinds (`call_near_direct`, `jmp_near_indirect`, `retn`,
+`jcc_near`, ...), the same-CS `retf` / `iret`, the interrupt sources
+(`int_hw`, `int_sw`, `int_exception`, ...), `callback_far` /
+`callback_far_int`, and the heavy-debug execution fallback
+`hbp_exec`. **A FAR transfer that lands in `seg` from a different
+source segment trivially satisfies the "from outside" gate** — so a
+`call_far_direct` from `1234:5678` to `0824:9600` will fire if the
+range covers `0824:9600`, because the from-segment `1234 != 0824`
+counts as outside.
+
+`seg` in the event mirrors the watched seg (NEAR semantics —
+target_seg always equals it). `from_cs:from_ip` identifies the
+instruction that performed the entry transfer; disassembling backwards
+from `from_ip` reveals the source.
+
+Cost is one segment-compare, two offset-bounds-compares, and one
+"prev_ip in/out of range" test per NEAR transfer when the watch is
+set — slightly more than `cpu.watch_target` but still trivial relative
+to instruction-level emulation cost.
+
+Typical use: find which instruction diverts execution into a script-
+data table that the CPU is fall-through-executing as code. Set
+`cpu.watch_range seg=<game_cs> lo=<table_start> hi=<table_end>`, run
+the repro, take the **first** `cpu.range_enter` event — its
+`from_cs:from_ip` is the divert source.
+
 #### Interrupt-sourced transfers
 
 Both `cpu.watch_target` and `farcall.watch` also fire on every interrupt
@@ -509,6 +568,7 @@ COMMAND.COM stop callbacks. None of these touch a hooked opcode.
 | `log.line`         | `{text}`                        | While subscribed                                                |
 | `farcall.transfer` | `{target_seg, target_off, from_cs, from_ip, kind}` | A `CALL FAR` / `JMP FAR` / `RETF` / `IRET` / interrupt dispatch whose target CS matched the active `farcall.watch` sentinel |
 | `cpu.transfer`     | `{target_seg, target_off, from_cs, from_ip, kind}` | A NEAR `CALL`/`JMP`/taken `Jcc`/`RETN` / same-CS `RETF` / `IRET` / interrupt dispatch whose `(CS, IP)` matched the active `cpu.watch_target` sentinel |
+| `cpu.range_enter`  | `{seg, target_off, from_cs, from_ip, kind}` | A control transfer crossed the boundary into the active `cpu.watch_range` window from outside. Suppressed for intra-range transfers (the slide / loops inside the window). |
 | `screen.captured`  | `{path, raw}`                   | A `screen.capture` PNG was fully written. Same payload as the command's deferred reply. Fires even for screenshots triggered by keyboard mapper (`Host+P` etc.), so subscribe-and-filter on `path` if you only care about your own requests. |
 | `agent.error`      | `{code, message}`               | Malformed input from your side (no `id` available to reply on)  |
 | `agent.overflow`   | none                            | Outbox hit its 1 MB cap; lines were dropped                     |

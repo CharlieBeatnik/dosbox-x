@@ -66,6 +66,14 @@ bool     g_targetWatchEnabled = false;
 uint16_t g_targetWatchSeg     = 0;
 uint16_t g_targetWatchOff     = 0;
 
+/* Range-entry watch state (proposal 4.8). Fires only on a transfer that
+ * lands at [seg, lo..hi] *from outside* that window. Same single-thread
+ * invariants as the other watch globals. */
+bool     g_rangeWatchEnabled = false;
+uint16_t g_rangeWatchSeg     = 0;
+uint16_t g_rangeWatchLo      = 0;
+uint16_t g_rangeWatchHi      = 0;
+
 /* screen.capture pending-request state (proposal 4.7). The handler returns
  * an empty string so the protocol layer queues no immediate reply, then
  * AGENT_OnScreenCaptured (called from the capture subsystem after fclose)
@@ -346,6 +354,58 @@ JsonValue handleCpuUnwatchTarget(double id, const JsonValue & /*args*/) {
     return makeReplyOk(id, std::move(r));
 }
 
+/* cpu.watch_range — fires on the *boundary crossing* into [seg, lo..hi].
+ * Use this when you want to know "what code first enters this region" and
+ * the region itself has a lot of intra-range traffic (a slide / loop /
+ * data-as-code execution) that would otherwise flood cpu.watch_target. */
+JsonValue handleCpuWatchRange(double id, const JsonValue &args) {
+    const JsonValue *seg = args.get("seg");
+    if (!seg) {
+        return makeReplyError(id, "bad_args",
+            "expected {\"seg\":<u16 or hex string>, \"lo\":<u16>, \"hi\":<u16>}"
+            " (seg=null to clear)");
+    }
+    if (seg->isNull()) {
+        AGENT_RangeWatchClear();
+        JsonObject r;
+        r.emplace("watching", JsonValue::makeBool(false));
+        return makeReplyOk(id, std::move(r));
+    }
+    const JsonValue *lo = args.get("lo");
+    const JsonValue *hi = args.get("hi");
+    if (!lo || !hi) {
+        return makeReplyError(id, "bad_args",
+            "lo and hi required when seg is set");
+    }
+    uint32_t segValue = 0, loValue = 0, hiValue = 0;
+    if (!parseSegArg(*seg, segValue))
+        return makeReplyError(id, "bad_args",
+            "seg must be u16 number or hex string");
+    if (!parseSegArg(*lo, loValue))
+        return makeReplyError(id, "bad_args",
+            "lo must be u16 number or hex string");
+    if (!parseSegArg(*hi, hiValue))
+        return makeReplyError(id, "bad_args",
+            "hi must be u16 number or hex string");
+    if (loValue > hiValue)
+        return makeReplyError(id, "bad_args",
+            "lo must be <= hi");
+    AGENT_RangeWatchSet((uint16_t)segValue, (uint16_t)loValue, (uint16_t)hiValue);
+    JsonObject r;
+    r.emplace("watching", JsonValue::makeBool(true));
+    r.emplace("seg",      JsonValue::makeNumber(segValue));
+    r.emplace("lo",       JsonValue::makeNumber(loValue));
+    r.emplace("hi",       JsonValue::makeNumber(hiValue));
+    return makeReplyOk(id, std::move(r));
+}
+
+JsonValue handleCpuUnwatchRange(double id, const JsonValue & /*args*/) {
+    AGENT_RangeWatchClear();
+    JsonObject r;
+    r.emplace("watching", JsonValue::makeBool(false));
+    return makeReplyOk(id, std::move(r));
+}
+
 /* `screen.capture` — trigger DOSBox-X's existing screenshot path and
  * defer the reply until the PNG is fully written by the VGA render path.
  * Returns an empty string from dispatchLine so no immediate reply is
@@ -459,6 +519,8 @@ std::string dispatchLine(const std::string &line) {
     if (cmd->s == "farcall.unwatch")   return jsonEncode(handleFarcallUnwatch(id, a));
     if (cmd->s == "cpu.watch_target")  return jsonEncode(handleCpuWatchTarget(id, a));
     if (cmd->s == "cpu.unwatch_target")return jsonEncode(handleCpuUnwatchTarget(id, a));
+    if (cmd->s == "cpu.watch_range")   return jsonEncode(handleCpuWatchRange(id, a));
+    if (cmd->s == "cpu.unwatch_range") return jsonEncode(handleCpuUnwatchRange(id, a));
     /* screen.capture returns "" so the protocol layer queues no immediate
      * reply; the deferred reply is sent from AGENT_OnScreenCaptured. */
     if (cmd->s == "screen.capture")    return handleScreenCapture(id, a);
@@ -556,6 +618,34 @@ void AGENT_TargetWatchClear(void) {
     agent::g_targetWatchEnabled = false;
     agent::g_targetWatchSeg     = 0;
     agent::g_targetWatchOff     = 0;
+}
+
+bool AGENT_RangeWatchEntry(uint16_t target_seg, uint16_t target_off,
+                           uint16_t from_seg,   uint16_t from_ip) {
+    if (!agent::g_rangeWatchEnabled)                   return false;
+    if (target_seg != agent::g_rangeWatchSeg)          return false;
+    if (target_off < agent::g_rangeWatchLo)            return false;
+    if (target_off > agent::g_rangeWatchHi)            return false;
+    /* "From outside the range" gate. A FAR landing whose source seg is
+     * different from the watched seg is trivially outside. Within the
+     * same seg, the previous instruction's IP must fall outside [lo, hi]. */
+    if (from_seg != agent::g_rangeWatchSeg)            return true;
+    return (from_ip < agent::g_rangeWatchLo) ||
+           (from_ip > agent::g_rangeWatchHi);
+}
+
+void AGENT_RangeWatchSet(uint16_t seg, uint16_t lo, uint16_t hi) {
+    agent::g_rangeWatchSeg     = seg;
+    agent::g_rangeWatchLo      = lo;
+    agent::g_rangeWatchHi      = hi;
+    agent::g_rangeWatchEnabled = true;
+}
+
+void AGENT_RangeWatchClear(void) {
+    agent::g_rangeWatchEnabled = false;
+    agent::g_rangeWatchSeg     = 0;
+    agent::g_rangeWatchLo      = 0;
+    agent::g_rangeWatchHi      = 0;
 }
 
 #endif /* C_DEBUG */
