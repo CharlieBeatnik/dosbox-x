@@ -354,9 +354,12 @@ def phase3_traceback(agent, cs, trace_a, trace_end, rep) -> None:
             agent.cpu_run(); _drain_events(agent)
 
 
-# Must match obstest.asm's WATCH_INITIAL / WATCH_VALUE.
+# Must match obstest.asm's WATCH_INITIAL / WATCH_VALUE / VGA_OFFSET / VGA_VALUE.
 WATCH_INITIAL = 0x0761
 WATCH_VALUE = 0x0853
+VGA_SEG = 0xA000
+VGA_OFFSET = 0x0064
+VGA_VALUE = 0x005A
 
 
 def phase4_memwatch(agent, cs, watch_target, store, rep) -> None:
@@ -419,6 +422,68 @@ def phase4_memwatch(agent, cs, watch_target, store, rep) -> None:
             agent.cpu_run(); _drain_events(agent)
 
 
+def phase5_vga_memwatch(agent, cs, vga_store, rep) -> None:
+    # 4.9.4 (VGA blind spot): the framebuffer used to be invisible to mem.watch
+    # because reading it back to obtain the old value loads the VGA plane
+    # latches. The hook now classifies the destination: side-effecting memory
+    # (VGA/MMIO) is reported WITHOUT reading old (old==null) using only the
+    # new-value predicate. Arm a watch on the single A000:VGA_OFFSET byte with
+    # when new_eq=VGA_VALUE (so the mode-12h BIOS screen clear, which writes 0,
+    # is filtered out), tap '5' to run the one known framebuffer store, and
+    # assert the mem.write event names the storing instruction with
+    # new==VGA_VALUE and old==None.
+    name = "phase5: mem.watch fires on VGA framebuffer write (old=null)"
+    try:
+        _reset(agent)
+        r = agent.call("mem.watch", seg=f"{VGA_SEG:04X}",
+                       lo=f"{VGA_OFFSET:04X}", hi=f"{VGA_OFFSET:04X}",
+                       size=1, when={"new_eq": VGA_VALUE})
+        if not r.get("armed"):
+            rep.record(name, False, f"mem.watch arm reply: {r}")
+            return
+        agent.cpu_run(); _drain_events(agent)
+        agent.keyboard_tap("5")
+        ev = _wait_for_event(agent, "mem.write", timeout=8.0)
+
+        problems = []
+        if ev.get("seg") != VGA_SEG or ev.get("off") != VGA_OFFSET:
+            problems.append(
+                f"addr {ev.get('seg'):04X}:{ev.get('off'):04X} != "
+                f"{VGA_SEG:04X}:{VGA_OFFSET:04X}")
+        if ev.get("from_cs") != cs or ev.get("from_ip") != vga_store:
+            problems.append(
+                f"from {ev.get('from_cs'):04X}:{ev.get('from_ip'):04X} != "
+                f"vga_store {cs:04X}:{vga_store:04X}")
+        # The decisive new behaviour: old is NOT sampled for VGA memory.
+        if ev.get("old") is not None:
+            problems.append(f"old={ev.get('old')!r} expected null (VGA read has side effects)")
+        if ev.get("new") != VGA_VALUE:
+            problems.append(f"new={ev.get('new')} expected {VGA_VALUE}")
+        if ev.get("size") != 1:
+            problems.append(f"size={ev.get('size')} expected 1")
+
+        # And the hit counter surfaces in debug.status (non-event proof).
+        st = agent.call("debug.status")
+        memw = st.get("watches", {}).get("mem", {})
+        if memw.get("hits", 0) < 1:
+            problems.append(f"debug.status mem hits={memw.get('hits')}")
+
+        if problems:
+            rep.record(name, False, "; ".join(problems[:4]))
+        else:
+            rep.record(name, True,
+                       f"VGA store at {cs:04X}:{vga_store:04X} "
+                       f"new={ev['new']:#04x} old=null "
+                       f"'{ev.get('from_text')}'")
+    except Exception as exc:
+        rep.record(name, False, repr(exc))
+    finally:
+        with contextlib.suppress(Exception):
+            agent.cpu_pause(); _drain_events(agent)
+            agent.call("mem.unwatch")
+            agent.cpu_run(); _drain_events(agent)
+
+
 def run(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dosbox", default=str(DEFAULT_DOSBOX))
@@ -452,18 +517,19 @@ def run(argv=None) -> int:
 
             cs = _read_signature(agent)
             print(f"OBSTEST.COM CS=0x{cs:04X}", flush=True)
-            tbl = agent.mem_read("seg:off", f"{cs:04X}:0103", 16)
+            tbl = agent.mem_read("seg:off", f"{cs:04X}:0103", 18)
             (loopbody, disasm, trace_a, trace_end, iters, disasm_end,
-             watch_target, store) = struct.unpack("<8H", tbl)
+             watch_target, store, vga_store) = struct.unpack("<9H", tbl)
             print(f"landmarks: loopbody={loopbody:04X} disasm={disasm:04X} "
                   f"trace_a={trace_a:04X} trace_end={trace_end:04X} iters={iters} "
                   f"disasm_end={disasm_end:04X} watch_target={watch_target:04X} "
-                  f"store={store:04X}", flush=True)
+                  f"store={store:04X} vga_store={vga_store:04X}", flush=True)
 
             phase1_probe_and_counters(agent, cs, loopbody, iters, rep)
             phase2_disasm(agent, cs, disasm, disasm_end, rep)
             phase3_traceback(agent, cs, trace_a, trace_end, rep)
             phase4_memwatch(agent, cs, watch_target, store, rep)
+            phase5_vga_memwatch(agent, cs, vga_store, rep)
 
             with contextlib.suppress(Exception):
                 _reset(agent)

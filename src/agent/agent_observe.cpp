@@ -38,6 +38,7 @@
 
 #include "dosbox.h"
 #include "mem.h"
+#include "paging.h"        /* MEM_GetPageHandler, PFLAG_READABLE, PageHandler */
 #include "regs.h"
 
 #include "agent.h"
@@ -191,6 +192,20 @@ uint32_t sizeMask(int size) {
     return (size >= 4) ? 0xFFFFFFFFu : ((1u << (unsigned(size) * 8u)) - 1u);
 }
 
+/* True when reading `lin_addr` back is side-effect-free, i.e. it resolves to
+ * plain host RAM/ROM whose page handler exposes a direct host read pointer
+ * (PFLAG_READABLE). The VGA framebuffer and MMIO handlers do NOT set
+ * PFLAG_READABLE: a read of VGA memory loads all four plane latches, which
+ * would corrupt a latched copy the guest's very next instruction relies on, so
+ * the write hook must not read those back. mem.watch is a real-mode tool (its
+ * range is the real-mode linear (seg<<4)+off), so `lin_addr` is treated as the
+ * physical page for the handler lookup — exactly how emitMemWrite and the
+ * mem.read "physical" path already treat it. */
+bool memReadIsSideEffectFree(uint32_t lin_addr) {
+    PageHandler *h = MEM_GetPageHandler(lin_addr >> 12);
+    return h != nullptr && (h->getFlags() & PFLAG_READABLE) != 0;
+}
+
 std::string memWatchPredDesc() {
     char buf[80];
     switch (g_memWatchPred) {
@@ -212,8 +227,10 @@ std::string memWatchPredDesc() {
  * heavy-debug previous-instruction tracker — i.e. the instruction that is
  * *currently executing the store* (DEBUG_HeavyIsBreakpoint saves the start of
  * each instruction before it runs). Built through jsonEncode so from_text
- * (disassembly of the storing instruction) is escaped safely. */
-void emitMemWrite(uint32_t lin_addr, uint32_t oldval, uint32_t newval, int size) {
+ * (disassembly of the storing instruction) is escaped safely. `oldKnown` is
+ * false for side-effecting destinations (VGA/MMIO) where the old value was not
+ * sampled; `old` is then reported as JSON null. */
+void emitMemWrite(uint32_t lin_addr, uint32_t oldval, uint32_t newval, int size, bool oldKnown) {
     uint16_t seg = g_memWatchSeg;
     uint16_t off = uint16_t((lin_addr - g_memWatchBase) & 0xFFFFu);
     uint16_t from_cs = DEBUG_GetPrevCS();
@@ -228,7 +245,8 @@ void emitMemWrite(uint32_t lin_addr, uint32_t oldval, uint32_t newval, int size)
     snprintf(addr, sizeof(addr), "%04X:%04X", unsigned(seg), unsigned(off));
     o.emplace("addr",  JsonValue::makeString(addr));
     o.emplace("size",  JsonValue::makeNumber(double(size)));
-    o.emplace("old",   JsonValue::makeNumber(double(oldval & mask)));
+    o.emplace("old",   oldKnown ? JsonValue::makeNumber(double(oldval & mask))
+                                : JsonValue::makeNull());
     o.emplace("new",   JsonValue::makeNumber(double(newval & mask)));
     o.emplace("from_cs", JsonValue::makeNumber(double(from_cs)));
     o.emplace("from_ip", JsonValue::makeNumber(double(from_ip)));
@@ -765,26 +783,68 @@ bool AGENT_MemWatchMatch(uint32_t lin_addr, uint32_t newval, uint32_t oldval, in
     }
 }
 
+/* Predicate variant for writes whose destination cannot be read back without
+ * side effects (the VGA framebuffer, MMIO). The old value is unknown, so this
+ * evaluates only the new-value predicates: new_eq / new_and_mask_eq test the
+ * stored value directly; new_ne_old conservatively matches (we cannot prove an
+ * idempotent store without the old value); none matches every in-scope write.
+ * Like AGENT_MemWatchMatch it self-gates on armed + range/size scope. */
+bool AGENT_MemWatchMatchNoOld(uint32_t lin_addr, uint32_t newval, int size) {
+    if (!AGENT_memWatchArmed) return false;
+    if (!agent::memWatchInScope(lin_addr, size)) return false;
+
+    const uint32_t mask = agent::sizeMask(size);
+    const uint32_t nv = newval & mask;
+    switch (agent::g_memWatchPred) {
+        case agent::MW_PRED_NEW_EQ:
+            return nv == agent::g_memWatchPredVal;
+        case agent::MW_PRED_NEW_AND_MASK_EQ:
+            return (nv & agent::g_memWatchPredMask)
+                 == (agent::g_memWatchPredVal & agent::g_memWatchPredMask);
+        case agent::MW_PRED_NEW_NE_OLD:   /* old unknown -> cannot filter      */
+            return true;
+        case agent::MW_PRED_NONE:
+        default:
+            return true;
+    }
+}
+
 /* Called from the guest memory-write path for every write while armed (the
  * armed flag is checked at the call site so the disarmed cost is one bool
  * load). Runs BEFORE the store, so a plain read returns the old value. On a
- * match, bumps the hit counter and emits the mem.write event. */
+ * match, bumps the hit counter and emits the mem.write event.
+ *
+ * The destination governs whether the old value can be sampled: plain host
+ * RAM/ROM (PFLAG_READABLE) is read back as today; the VGA framebuffer and MMIO
+ * are NOT read back — a VGA read loads the plane latches, which would corrupt a
+ * latched copy the guest's next instruction relies on — so for those old is
+ * left unknown (reported null) and only the new-value predicate is evaluated.
+ * This is what extends mem.watch to the VGA framebuffer (proposal 4.9.4)
+ * without disturbing emulation. */
 void AGENT_MemWatchNote(uint32_t lin_addr, uint32_t newval, int size) {
-    /* Cheap range/size pre-filter before touching memory. */
+    /* Cheap range/size pre-filter before touching anything. */
     if (!agent::memWatchInScope(lin_addr, size)) return;
+    if (size != 1 && size != 2 && size != 4) return;
+
+    const bool oldKnown = agent::memReadIsSideEffectFree(lin_addr);
 
     uint32_t oldval = 0;
-    switch (size) {
-        case 1: oldval = mem_readb(lin_addr); break;
-        case 2: oldval = mem_readw(lin_addr); break;
-        case 4: oldval = mem_readd(lin_addr); break;
-        default: return;
+    bool matched;
+    if (oldKnown) {
+        switch (size) {
+            case 1: oldval = mem_readb(lin_addr); break;
+            case 2: oldval = mem_readw(lin_addr); break;
+            case 4: oldval = mem_readd(lin_addr); break;
+            default: return;   /* unreachable: size validated above */
+        }
+        matched = AGENT_MemWatchMatch(lin_addr, newval, oldval, size);
+    } else {
+        matched = AGENT_MemWatchMatchNoOld(lin_addr, newval, size);
     }
-
-    if (!AGENT_MemWatchMatch(lin_addr, newval, oldval, size)) return;
+    if (!matched) return;
 
     agent::g_memWatchHits++;
-    agent::emitMemWrite(lin_addr, oldval, newval, size);
+    agent::emitMemWrite(lin_addr, oldval, newval, size, oldKnown);
 }
 
 #endif /* C_DEBUG */

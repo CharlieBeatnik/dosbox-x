@@ -6,7 +6,51 @@ Leave-behind for the next agent continuing the **proposal-4.9** work on the
 Source proposal:
 `X2RE/.claude/notes/dosbox-x-fixes/PROPOSAL_4.9_observability_and_trust.md`.
 
-## What shipped this iteration (4.9.4 — `mem.watch` write-intercept)
+## What shipped this iteration (4.9.4-VGA — framebuffer write coverage)
+
+Closed the last 4.9.4 gap: `mem.watch` now covers the **VGA framebuffer**
+(A0000–BFFFF), not just normal RAM, while fixing a latent emulation-corruption
+bug. Built, unit-tested, and verified end-to-end against a booted guest.
+
+| # | Item | Proves | Status |
+|---|------|--------|--------|
+| 4.9.4-VGA | `mem.watch` fires on VGA framebuffer writes (`old:null`) | "*which* instruction writes the framebuffer?" in one run, no latch corruption | ✅ |
+
+### The problem (subtler than "blind spot")
+
+The write hook already fired for VGA writes — the CPU cores reach VGA memory
+through `mem_write{b,w,d}_inline` (paging.h), the very functions the hook sits
+in, before the page handler is dispatched. But `AGENT_MemWatchNote` then read
+the old value back with `mem_readb(lin)`, and **a VGA read loads the plane
+latches** (`vga.latch.d = …` in `VGA_Generic_Read_Handler`,
+`src/hardware/vga_memory.cpp:319`). So arming `mem.watch` on the framebuffer
+corrupted any latched copy the guest's next instruction relied on (mode-X
+copies, "fast clears", page-flip tricks). That's why VGA was documented as a
+gap — using it there was unsafe, not silent.
+
+### The fix (one file, no VGA-handler edits)
+
+`AGENT_MemWatchNote` now classifies the destination before reading: `bool
+oldKnown = memReadIsSideEffectFree(lin)` = `MEM_GetPageHandler(lin>>12)
+->getFlags() & PFLAG_READABLE`. Plain host RAM/ROM sets `PFLAG_READABLE`
+(direct host read, side-effect-free) and is read back exactly as before. VGA
+and MMIO handlers are constructed `PageHandler(PFLAG_NOCODE)` — no
+`PFLAG_READABLE` — so for those the hook **skips the read-back**, evaluates the
+new-value-only predicate `AGENT_MemWatchMatchNoOld`, and emits with `old:null`.
+This catches both the page-handler path and the mapped-host fast path (the hook
+is upstream of the TLB write check), without touching any of the ~20 VGA
+handler classes. `lin` is treated as physical (mem.watch is a real-mode tool).
+
+- `new` is the raw CPU store value (for planar modes, the byte the program
+  wrote before the hardware bit-mask / map-mask / ALU plane expansion).
+- `new_eq` / `new_and_mask_eq` work unchanged; `new_ne_old` degrades to
+  "match every write" when `old` is unknown (can't prove idempotence).
+- Files: `src/agent/agent_observe.cpp` (`memReadIsSideEffectFree`,
+  `AGENT_MemWatchMatchNoOld`, reworked `AGENT_MemWatchNote`, `emitMemWrite`
+  gains an `oldKnown` arg → `old:null`); `include/agent.h` (decl +
+  `#else` no-op). `paging.h` untouched.
+
+## Previously shipped (4.9.4 — `mem.watch` write-intercept, RAM)
 
 The Tier-2 headline item: a real write-intercept (not a value-change poll)
 that reports **the instruction that did the store**, the old/new value, with
@@ -64,30 +108,29 @@ address `(seg<<4)+off`.
 
 ### Tests
 
-- **`tests/agent_observability_tests.cpp`** — 13 new gTests (now 33 in the
-  suite, **92 Agent gTests total, all pass**). The pure predicate
-  `AGENT_MemWatchMatch` is exercised exhaustively (range edges, size filter,
-  all three predicate forms, disarmed→false); plus dispatch arg-validation and
-  `debug.status` reflection. The hook's memory-read + event emission is
+- **`tests/agent_observability_tests.cpp`** — the RAM `mem.watch` iteration
+  added 13 gTests driving the pure predicate `AGENT_MemWatchMatch`
+  exhaustively (range edges, size filter, all three predicate forms,
+  disarmed→false) plus dispatch arg-validation and `debug.status` reflection.
+  **This iteration** added 6 more for `AGENT_MemWatchMatchNoOld` (the
+  new-value-only predicate used when `old` is unsampled): scope/size gating,
+  `new_eq`, `new_and_mask_eq`, `new_ne_old`→always-match, disarmed→false.
+  **98 Agent gTests total, all pass.** The hook's destination classification
+  (`MEM_GetPageHandler`/`PFLAG_READABLE`) and the `old:null` event field are
   MemBase-dependent, so that path is covered live (same split as disasm).
-- **`tests/agent_live/obstest.asm` + `OBSTEST.COM` (rebuilt)** — added Phase 4:
-  a single `mov word ptr [watch_target], 0853h` at `landmark_store`, with the
-  field starting at `0761h`. Repurposed the two reserved landmark-table slots
-  (`+12` = watch_target offset, `+14` = store offset). Rebuilt via
+- **`tests/agent_live/obstest.asm` + `OBSTEST.COM` (rebuilt)** — Phase 4 is the
+  RAM store (`mov word ptr [watch_target],0853h` at `landmark_store`).
+  **This iteration** added Phase 5: switch to planar mode 12h, `mov es:[di],al`
+  (al=`5Ah`) to `A000:0064` at `landmark_vga_store`, restore text mode. Grew
+  the landmark table to 9 entries (`+16` = vga_store). Rebuilt via
   `build_masm.py` (toolchain present on this host: `MASM`/`TASM` env vars set).
-- **`tests/agent_live/test_observability.py`** — Phase 4 arms
-  `mem.watch ... when new_eq=0853`, taps '4', and asserts the `mem.write`
-  event's `from_cs:from_ip == landmark_store`, `old==0761`, `new==0853`,
-  `size==2`, `from_text` contains `mov`, and `debug.status` `watches.mem.hits`
-  ≥ 1. **All 5 phases pass** (`stamp at 0814:016E old=0x0761->new=0x0853
-  'mov  word [0115],0853'`).
-
-### Known gap carried forward
-
-`mem.watch` hooks the generic `mem_write*` path, which covers normal RAM but
-**not the VGA framebuffer** (planar writes go through the VGA page handlers'
-`writeb`/`writew`). Hooking those is the remaining piece of the proposal's
-4.9.4 (the "VGA blind spot"); see USAGE.md §"BPM on VGA memory".
+- **`tests/agent_live/test_observability.py`** — Phase 4 covers the RAM store;
+  **Phase 5** arms `mem.watch A000:0064 size=1 when new_eq=5A` (the value
+  predicate filters the mode-set BIOS screen clear, which writes 0), taps '5',
+  and asserts the `mem.write` event's `from_cs:from_ip == landmark_vga_store`,
+  `new==0x5A`, **`old is None`**, `size==1`, and `debug.status`
+  `watches.mem.hits` ≥ 1. **All 6 phases pass** (`VGA store at 0814:018D
+  new=0x5a old=null 'mov  es:[di],al'`).
 
 ## Previously shipped (Tier 1 + disasm)
 
@@ -191,12 +234,7 @@ python tests/agent_live/test_observability.py
 
 ## Not done / deferred (pick up here, in proposal priority order)
 
-- **4.9.4 VGA sub-item** — `mem.watch` (RAM) shipped this iteration; the one
-  remaining piece is hooking the VGA page handlers' `writeb`/`writew` so a
-  planar framebuffer write reports its real writer CS:IP (the "VGA blind
-  spot"). The RAM hook and event shape are done; this adds the same
-  range/predicate check inside the VGA write callbacks and routes through the
-  existing `emitMemWrite`.
+- **4.9.4 is now complete** (RAM + VGA framebuffer both covered). Next items:
 - **4.9.5 multi-sentinel watches** — let `cpu.watch_target` / `farcall.watch`
   hold a *set* (and `cpu.watch_range` several ranges) with a `which` field on
   events. NOTES flags this ~20 lines (generalize `g_*WatchSeg` to a container).
@@ -235,6 +273,8 @@ python tests/agent_live/test_observability.py
 - 4.9.6 hand-decode removal → phase2 (disasm bytes == `mem.read`).
 - 4.9.4 "name the stamp site" → phase4 (`mem.write` `from_cs:from_ip` ==
   `landmark_store`, old/new == the known transition).
+- 4.9.4-VGA "name the framebuffer writer" → phase5 (`mem.write`
+  `from_cs:from_ip` == `landmark_vga_store`, `new==0x5A`, `old==null`).
 - 4.9.5 / 4.9.8 acceptance tests deferred with those items.
 
 ## Environment note

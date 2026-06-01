@@ -130,13 +130,23 @@ void AGENT_TraceRecord(uint16_t seg, uint16_t off);
  * write *while armed*. AGENT_memWatchArmed is the fast gate so a disarmed
  * watch costs only a single bool load on that very hot path. On a match
  * (linear address in the armed [seg:lo..hi] range, the right access size, and
- * the optional value predicate) AGENT_MemWatchNote reads the old value, bumps
- * the hit counter, and emits a `mem.write` event naming the storing
- * instruction's CS:IP (via DEBUG_GetPrevCS/IP — meaningful only in a
- * heavy-debug build). AGENT_MemWatchMatch is the pure predicate — no memory
- * read, no event, no counter bump — shared by the hook and the unit tests. */
+ * the optional value predicate) AGENT_MemWatchNote bumps the hit counter and
+ * emits a `mem.write` event naming the storing instruction's CS:IP (via
+ * DEBUG_GetPrevCS/IP — meaningful only in a heavy-debug build).
+ *
+ * The old value is read back to populate the event and the new_ne_old
+ * predicate, but only when the destination is plain host RAM/ROM. The VGA
+ * framebuffer (and MMIO) cannot be read back without side effects — a VGA read
+ * latches all four planes, corrupting a latched copy the guest's next
+ * instruction may rely on — so for those the hook skips the read-back, reports
+ * old=null, and uses AGENT_MemWatchMatchNoOld (which evaluates only the
+ * new-value predicates). This is what lets mem.watch cover the VGA framebuffer
+ * without disturbing emulation. AGENT_MemWatchMatch / AGENT_MemWatchMatchNoOld
+ * are the pure predicates — no memory read, no event, no counter bump — shared
+ * by the hook and the unit tests. */
 extern bool AGENT_memWatchArmed;
 bool AGENT_MemWatchMatch(uint32_t lin_addr, uint32_t newval, uint32_t oldval, int size);
+bool AGENT_MemWatchMatchNoOld(uint32_t lin_addr, uint32_t newval, int size);
 void AGENT_MemWatchNote(uint32_t lin_addr, uint32_t newval, int size);
 
 /* Notified when DOSBOX_SetNormalLoop / DOSBOX_SetLoop changes the main
@@ -194,6 +204,7 @@ static inline void AGENT_TraceRecord(uint16_t /*seg*/, uint16_t /*off*/) {}
  * paging.h write hook, which is itself #if C_DEBUG, so the symbol is never
  * referenced when C_DEBUG is off. */
 static inline bool AGENT_MemWatchMatch(uint32_t, uint32_t, uint32_t, int) { return false; }
+static inline bool AGENT_MemWatchMatchNoOld(uint32_t, uint32_t, int) { return false; }
 static inline void AGENT_MemWatchNote(uint32_t, uint32_t, int) {}
 static inline void AGENT_OnLoopChange(void) {}
 static inline void AGENT_OnScreenCaptured(const char * /*path*/, bool /*raw*/) {}

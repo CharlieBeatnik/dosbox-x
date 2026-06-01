@@ -576,7 +576,7 @@ COMMAND.COM stop callbacks. None of these touch a hooked opcode.
 | `farcall.transfer` | `{target_seg, target_off, from_cs, from_ip, kind}` | A `CALL FAR` / `JMP FAR` / `RETF` / `IRET` / interrupt dispatch whose target CS matched the active `farcall.watch` sentinel |
 | `cpu.transfer`     | `{target_seg, target_off, from_cs, from_ip, kind}` | A NEAR `CALL`/`JMP`/taken `Jcc`/`RETN` / same-CS `RETF` / `IRET` / interrupt dispatch whose `(CS, IP)` matched the active `cpu.watch_target` sentinel |
 | `cpu.range_enter`  | `{seg, target_off, from_cs, from_ip, kind}` | A control transfer crossed the boundary into the active `cpu.watch_range` window from outside. Suppressed for intra-range transfers (the slide / loops inside the window). |
-| `mem.write`        | `{seg, off, addr, size, old, new, from_cs, from_ip, from[, from_text]}` | A guest memory write matched the active `mem.watch` (range + size + value predicate). `from_cs:from_ip` is the storing instruction; `from_text` (heavy-debug only) is its disassembly. |
+| `mem.write`        | `{seg, off, addr, size, old, new, from_cs, from_ip, from[, from_text]}` | A guest memory write matched the active `mem.watch` (range + size + value predicate). `from_cs:from_ip` is the storing instruction; `from_text` (heavy-debug only) is its disassembly. `old` is `null` for VGA-framebuffer/MMIO writes (reading them back has side effects). |
 | `screen.captured`  | `{path, raw}`                   | A `screen.capture` PNG was fully written. Same payload as the command's deferred reply. Fires even for screenshots triggered by keyboard mapper (`Host+P` etc.), so subscribe-and-filter on `path` if you only care about your own requests. |
 | `agent.error`      | `{code, message}`               | Malformed input from your side (no `id` available to reply on)  |
 | `agent.overflow`   | none                            | Outbox hit its 1 MB cap; lines were dropped                     |
@@ -742,6 +742,14 @@ reports the storing instruction's own `CS:IP`. Each matching write emits a
   in one run, replacing a 273-site / 106-value static audit.
 - **`old` / `new`** are the pre- and post-write values at the access width
   (`size` bytes). `from_text` is the storing instruction, disassembled.
+  **`old` is `null`** when the destination cannot be read back without side
+  effects — specifically the **VGA framebuffer** (a VGA read loads the plane
+  latches, which would corrupt a latched copy the guest's next instruction
+  relies on) and MMIO. For those `new` is the raw value the CPU instruction
+  stored (for planar VGA modes that is the byte the program wrote, before the
+  hardware bit-mask / map-mask / ALU expansion across planes), and the
+  `new_ne_old` predicate degrades to "match every write" since the old value
+  is unknown.
 - **`size`** filters to 1-, 2-, or 4-byte writes; omit it (or pass `null`) to
   match any access width. The range `[lo, hi]` is matched against the write's
   **starting** offset, computed as the real-mode linear address
@@ -757,10 +765,14 @@ reports the storing instruction's own `CS:IP`. Each matching write emits a
 - The hit counter surfaces in `debug.status` under `watches.mem` so a watch
   that fired (or never did) is provable without consuming the event stream.
 - **`from_cs:from_ip` and `from_text` need a heavy-debug build** (they come
-  from the per-instruction tracker); the event itself, `old`/`new`, and the
-  hit counter work in any `C_DEBUG` build. Like the other watches this is a
-  single sentinel — calling again replaces it. It targets normal RAM; the VGA
-  framebuffer is still a gap (see below).
+  from the per-instruction tracker); the event itself, `new` (and `old` for
+  RAM), and the hit counter work in any `C_DEBUG` build. Like the other watches
+  this is a single sentinel — calling again replaces it. It covers normal RAM
+  **and the VGA framebuffer** (A0000–BFFFF): a planar/chained framebuffer write
+  fires the event and names the storing instruction, with `old: null` as noted
+  above. To isolate one framebuffer write from the thousands a screen clear or
+  `rep stos` produces, arm it with `size` and a `when` predicate (a value
+  predicate filters on the raw stored byte).
 
 ## What is *not* capturable
 
@@ -802,14 +814,17 @@ If you discover something else that emits to a pane rather than
 `DEBUG_ShowMsg`, that's a candidate for a Phase-2 typed command. File
 an issue.
 
-### BPM on VGA memory (A0000–BFFFF) — partial coverage
+### BPM on VGA memory (A0000–BFFFF)
 
-> For **normal RAM**, prefer `mem.watch` (above): it is a true write
-> intercept that reports the storing instruction's `CS:IP`, the old/new
-> value, and supports a value predicate — none of the caveats below apply.
-> The VGA framebuffer is the one region `mem.watch` does **not** yet cover
-> (it hooks the generic `mem_write*` path, not the VGA page handlers), so
-> the `BPM` notes here still stand for A0000–BFFFF.
+> Prefer `mem.watch` (above) for both **normal RAM and the VGA framebuffer**:
+> it is a true write intercept that fires at the instant of the store and
+> reports the storing instruction's `CS:IP`, supports a `size` + value
+> predicate, and (for RAM) the old/new values — none of the `BPM` caveats
+> below apply. On the VGA framebuffer `mem.watch` reports `old: null` and the
+> raw stored `new` value (reading VGA back would load the plane latches), but
+> still names the writer's `CS:IP` — which is exactly the "who's writing to
+> the framebuffer?" answer the `BPM` workaround below was needed for. The
+> `BPM` notes are kept here only for the legacy text-passthrough path.
 
 `BPM A000:xxxx` (or any `BPM` in the VGA memory window) is a
 **single-byte value-change watch**, not a write intercept. It works
@@ -831,14 +846,13 @@ make it unreliable as a way to find "who's writing to the framebuffer":
    `rep` retires, so the reported `CS:IP` is whatever follows the
    `rep`, not the writer site.
 
-For the "find the code writing to the framebuffer" use case the
-robust workaround is to grep the disassembly for `mov ax, 0A000h` /
-`mov ax, 0xa0` literals (or whatever segment constant the game's
-source uses), set a regular `BP` on each candidate site, and run.
-`cpu.watch_target` works too if you only care about one specific
-landing IP. Extending `mem.watch` to hook the VGA page handlers'
-`writeb`/`writew` (so a planar write reports its real writer `CS:IP`)
-is the remaining follow-up.
+For the "find the code writing to the framebuffer" use case, **use
+`mem.watch`** (above) — armed on the framebuffer range with a `size`
+and/or value `when` predicate, it fires at the store and names the
+writer's `CS:IP` directly, without the change-detection and
+next-instruction-boundary caveats `BPM` has here. (If you only care
+about one specific landing IP, `cpu.watch_target` also works; and a
+disassembly grep for `mov ax, 0A000h` literals remains a fallback.)
 
 ## Recipes
 

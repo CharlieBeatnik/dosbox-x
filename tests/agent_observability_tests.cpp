@@ -533,4 +533,66 @@ TEST_F(AgentObservabilityTest, MemWatchRejectsEmptyPredicate)
     EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
 }
 
+/* ---- mem.watch on side-effecting memory (4.9.4 VGA) ------------------ */
+/* When the write destination cannot be read back without side effects (the
+ * VGA framebuffer loads its plane latches on read), AGENT_MemWatchNote skips
+ * the old-value read and evaluates AGENT_MemWatchMatchNoOld instead. That pure
+ * predicate is exercised directly here (it touches no memory); the hook's
+ * destination classification (MEM_GetPageHandler / PFLAG_READABLE) and the
+ * old=null event field are MemBase-dependent and covered by the live test. */
+
+TEST_F(AgentObservabilityTest, MemWatchMatchNoOldRespectsScope)
+{
+    armMemWatch("{\"id\":1,\"cmd\":\"mem.watch\",\"args\":{\"seg\":\"A000\",\"lo\":0,\"hi\":255}}");
+    /* base 0xA0000, range [0xA0000, 0xA00FF]; no predicate -> any in-scope. */
+    EXPECT_FALSE(AGENT_MemWatchMatchNoOld(0x9FFFF, 0x5A, 1));  /* just below */
+    EXPECT_TRUE (AGENT_MemWatchMatchNoOld(0xA0000, 0x5A, 1));  /* at lo      */
+    EXPECT_TRUE (AGENT_MemWatchMatchNoOld(0xA00FF, 0x5A, 1));  /* at hi      */
+    EXPECT_FALSE(AGENT_MemWatchMatchNoOld(0xA0100, 0x5A, 1));  /* just above */
+}
+
+TEST_F(AgentObservabilityTest, MemWatchMatchNoOldSizeFilter)
+{
+    armMemWatch("{\"id\":1,\"cmd\":\"mem.watch\","
+                "\"args\":{\"seg\":\"A000\",\"lo\":0,\"hi\":255,\"size\":1}}");
+    EXPECT_TRUE (AGENT_MemWatchMatchNoOld(0xA0010, 0x5A, 1));   /* byte write  */
+    EXPECT_FALSE(AGENT_MemWatchMatchNoOld(0xA0010, 0x5A, 2));   /* word write  */
+}
+
+TEST_F(AgentObservabilityTest, MemWatchMatchNoOldNewEqPredicate)
+{
+    armMemWatch("{\"id\":1,\"cmd\":\"mem.watch\","
+                "\"args\":{\"seg\":\"A000\",\"lo\":0,\"hi\":255,\"size\":1,"
+                "\"when\":{\"new_eq\":\"5A\"}}}");
+    EXPECT_TRUE (AGENT_MemWatchMatchNoOld(0xA0010, 0x5A, 1));   /* matches the new value */
+    EXPECT_FALSE(AGENT_MemWatchMatchNoOld(0xA0010, 0x5B, 1));   /* wrong value           */
+}
+
+TEST_F(AgentObservabilityTest, MemWatchMatchNoOldAndMaskEqPredicate)
+{
+    armMemWatch("{\"id\":1,\"cmd\":\"mem.watch\","
+                "\"args\":{\"seg\":\"A000\",\"lo\":0,\"hi\":255,\"size\":1,"
+                "\"when\":{\"new_and_mask_eq\":{\"mask\":\"F0\",\"value\":\"50\"}}}}");
+    EXPECT_TRUE (AGENT_MemWatchMatchNoOld(0xA0010, 0x5A, 1));   /* (5A & F0)=50 */
+    EXPECT_FALSE(AGENT_MemWatchMatchNoOld(0xA0010, 0x6A, 1));   /* (6A & F0)=60 */
+}
+
+TEST_F(AgentObservabilityTest, MemWatchMatchNoOldNeOldAlwaysMatches)
+{
+    /* Without the old value we can't prove a store is idempotent, so the
+     * new_ne_old predicate conservatively matches every in-scope write. */
+    armMemWatch("{\"id\":1,\"cmd\":\"mem.watch\","
+                "\"args\":{\"seg\":\"A000\",\"lo\":0,\"hi\":255,\"when\":{\"new_ne_old\":true}}}");
+    EXPECT_TRUE(AGENT_MemWatchMatchNoOld(0xA0010, 0x5A, 1));
+    EXPECT_TRUE(AGENT_MemWatchMatchNoOld(0xA0010, 0x00, 1));
+    /* still scope-gated */
+    EXPECT_FALSE(AGENT_MemWatchMatchNoOld(0xB0000, 0x5A, 1));
+}
+
+TEST_F(AgentObservabilityTest, MemWatchMatchNoOldFalseWhenDisarmed)
+{
+    EXPECT_FALSE(AGENT_memWatchArmed);
+    EXPECT_FALSE(AGENT_MemWatchMatchNoOld(0xA0010, 0x5A, 1));
+}
+
 }  /* anonymous namespace */

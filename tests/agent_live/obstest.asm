@@ -49,6 +49,15 @@
 ;        new==WATCH_VALUE. This is the proposal-4.9.4 "name the stamp site"
 ;        test made concrete. Run once (the field stays WATCH_VALUE after).
 ;
+;   '5'  Phase 5 (mem.watch on VGA framebuffer): switch to planar mode 12h,
+;        store a single known byte into the A000 framebuffer at VGA_OFFSET via
+;        `mov es:[di], al` at landmark_vga_store, then restore text mode. The
+;        driver arms mem.watch on A000:VGA_OFFSET (size 1, when new_eq=VGA_VALUE
+;        so the BIOS mode-set screen clear is filtered out) and asserts the
+;        mem.write event names this instruction with new==VGA_VALUE and
+;        old==null (a VGA read loads the plane latches, so old is not sampled).
+;        This is the proposal-4.9.4 "VGA blind spot" closure made concrete.
+;
 ;   'q'  Exit cleanly via INT 21h AH=4Ch.
 ;
 ; All phases return to main_loop so the driver can run them in any order and
@@ -57,6 +66,8 @@
 LOOP_ITERS      equ     300
 WATCH_INITIAL   equ     0761h           ; watch_target value at load
 WATCH_VALUE     equ     0853h           ; value phase 4 stamps into watch_target
+VGA_OFFSET      equ     0064h           ; phase 5 framebuffer write offset (A000:0064)
+VGA_VALUE       equ     005Ah           ; byte phase 5 stores to the framebuffer
 
 code    segment
         assume  cs:code, ds:code, es:code, ss:code
@@ -65,7 +76,7 @@ code    segment
 start:  jmp     near ptr setup          ; 3 bytes -> table at 103h
 
 ; ---- Landmarks table -- fixed offset 103h --------------------------------
-; The driver reads (8) 16-bit offsets here with one mem.read at CS:0103.
+; The driver reads (9) 16-bit offsets here with one mem.read at CS:0103.
 landmarks_table:
         dw      landmark_loopbody       ; +0  probe / BP / hit-counter target
         dw      landmark_disasm         ; +2  cpu.disasm target (never executed)
@@ -75,6 +86,7 @@ landmarks_table:
         dw      landmark_disasm_end     ; +10 one-past the disasm bytes
         dw      watch_target            ; +12 mem.watch write-target field
         dw      landmark_store          ; +14 the storing instruction (phase 4)
+        dw      landmark_vga_store      ; +16 the VGA storing instruction (phase 5)
 
 ; ---- Variables -----------------------------------------------------------
 loopcount       dw      0
@@ -108,8 +120,12 @@ main_loop:
         cmp     al, '3'
         je      phase3
         cmp     al, '4'
-        jne     chk_q
+        jne     chk_5
         jmp     phase4                  ; near jmp: phase4 is out of je's rel8 range
+chk_5:
+        cmp     al, '5'
+        jne     chk_q
+        jmp     phase5                  ; near jmp: phase5 is out of je's rel8 range
 chk_q:
         cmp     al, 'q'
         je      do_exit
@@ -165,6 +181,29 @@ landmark_trace_end:
 phase4:
 landmark_store:
         mov     word ptr [watch_target], WATCH_VALUE
+        jmp     main_loop
+
+; ---- Phase 5: VGA framebuffer write (mem.watch VGA blind-spot, 4.9.4) -----
+; Switch to planar mode 12h, store one known byte into the A000 framebuffer at
+; VGA_OFFSET, then restore text mode. landmark_vga_store is the storing
+; instruction itself, which the driver compares against the mem.write event's
+; from_cs:from_ip. The value predicate (new_eq=VGA_VALUE) filters out the BIOS
+; mode-set screen clear (which writes 0), so the one matching event is this
+; store. The VGA write handler does not expose a side-effect-free read-back, so
+; the event reports old==null.
+phase5:
+        mov     ax, 0012h               ; 640x480x16 planar (ES window at A000)
+        int     10h
+        mov     ax, 0A000h
+        mov     es, ax
+        mov     di, VGA_OFFSET
+        mov     al, VGA_VALUE
+landmark_vga_store:
+        mov     es:[di], al             ; <- the watched framebuffer store
+        mov     ax, 0003h               ; restore 80x25 colour text
+        int     10h
+        push    cs
+        pop     es                      ; restore ES for the rest of the program
         jmp     main_loop
 
 ; ---- Clean exit ----------------------------------------------------------
