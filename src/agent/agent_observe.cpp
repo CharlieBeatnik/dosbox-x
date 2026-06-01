@@ -75,6 +75,30 @@ static uint16_t                g_traceSeg = 0;
 const uint32_t                 TRACE_MAX_DEPTH = 4096;
 const uint32_t                 TRACE_DEFAULT_DEPTH = 256;
 
+/* ---- mem.watch write-intercept state (4.9.4) ------------------------- */
+/* The armed flag itself is the global AGENT_memWatchArmed (defined at the
+ * bottom of this file) so the paging.h write hook can read it without going
+ * through the agent namespace. Everything else is file-scope here. The
+ * linear range [linLo, linHi] is precomputed from seg:lo..hi on arm so the
+ * hot path compares the incoming linear write address directly. */
+enum MemWatchPred {
+    MW_PRED_NONE = 0,
+    MW_PRED_NEW_EQ,           /* new == val (masked to size)              */
+    MW_PRED_NEW_NE_OLD,       /* new != old (masked to size)              */
+    MW_PRED_NEW_AND_MASK_EQ   /* (new & mask) == (val & mask)             */
+};
+static uint16_t g_memWatchSeg     = 0;
+static uint16_t g_memWatchLo      = 0;
+static uint16_t g_memWatchHi      = 0;
+static uint32_t g_memWatchBase    = 0;   /* seg << 4, precomputed              */
+static uint32_t g_memWatchLinLo   = 0;   /* base + lo                          */
+static uint32_t g_memWatchLinHi   = 0;   /* base + hi                          */
+static int      g_memWatchSize    = 0;   /* 0 = any; else exact 1 / 2 / 4      */
+static int      g_memWatchPred    = MW_PRED_NONE;
+static uint32_t g_memWatchPredVal = 0;
+static uint32_t g_memWatchPredMask= 0;
+static uint64_t g_memWatchHits    = 0;
+
 /* Longest legal x86 instruction; clamp DasmI386's reported size so a bad
  * decode can't make us read/echo a huge byte run. */
 const int MAX_INSN_LEN = 15;
@@ -126,6 +150,97 @@ bool parseU16Any(const JsonValue &v, uint16_t &out) {
         return true;
     }
     return false;
+}
+
+bool parseU32Any(const JsonValue &v, uint32_t &out) {
+    if (v.isNumber()) {
+        if (v.n < 0 || v.n > 4294967295.0) return false;
+        out = uint32_t(v.n);
+        return true;
+    }
+    if (v.isString())
+        return parseHexU32(v.s, out);
+    return false;
+}
+
+/* ---- mem.watch helpers (4.9.4) --------------------------------------- */
+
+void memWatchClear() {
+    AGENT_memWatchArmed = false;
+    g_memWatchSeg = g_memWatchLo = g_memWatchHi = 0;
+    g_memWatchBase = g_memWatchLinLo = g_memWatchLinHi = 0;
+    g_memWatchSize = 0;
+    g_memWatchPred = MW_PRED_NONE;
+    g_memWatchPredVal = g_memWatchPredMask = 0;
+    g_memWatchHits = 0;
+}
+
+/* The cheap range+size pre-filter (no memory read). Shared by the hot-path
+ * hook (which calls it before reading the old value) and AGENT_MemWatchMatch
+ * (which adds the value predicate). Matches on the write's *starting* address
+ * lying in [linLo, linHi]. */
+bool memWatchInScope(uint32_t lin_addr, int size) {
+    if (g_memWatchSize != 0 && size != g_memWatchSize) return false;
+    if (lin_addr < g_memWatchLinLo) return false;
+    if (lin_addr > g_memWatchLinHi) return false;
+    return true;
+}
+
+/* Mask covering `size` low bytes (1->0xFF, 2->0xFFFF, 4->0xFFFFFFFF). */
+uint32_t sizeMask(int size) {
+    return (size >= 4) ? 0xFFFFFFFFu : ((1u << (unsigned(size) * 8u)) - 1u);
+}
+
+std::string memWatchPredDesc() {
+    char buf[80];
+    switch (g_memWatchPred) {
+        case MW_PRED_NEW_EQ:
+            snprintf(buf, sizeof(buf), "new_eq=0x%X", unsigned(g_memWatchPredVal));
+            return buf;
+        case MW_PRED_NEW_NE_OLD:
+            return "new_ne_old";
+        case MW_PRED_NEW_AND_MASK_EQ:
+            snprintf(buf, sizeof(buf), "new_and_mask_eq mask=0x%X value=0x%X",
+                     unsigned(g_memWatchPredMask), unsigned(g_memWatchPredVal));
+            return buf;
+        default:
+            return "none";
+    }
+}
+
+/* Build and broadcast the mem.write event. from_cs/from_ip come from the
+ * heavy-debug previous-instruction tracker — i.e. the instruction that is
+ * *currently executing the store* (DEBUG_HeavyIsBreakpoint saves the start of
+ * each instruction before it runs). Built through jsonEncode so from_text
+ * (disassembly of the storing instruction) is escaped safely. */
+void emitMemWrite(uint32_t lin_addr, uint32_t oldval, uint32_t newval, int size) {
+    uint16_t seg = g_memWatchSeg;
+    uint16_t off = uint16_t((lin_addr - g_memWatchBase) & 0xFFFFu);
+    uint16_t from_cs = DEBUG_GetPrevCS();
+    uint16_t from_ip = DEBUG_GetPrevIP();
+    uint32_t mask = sizeMask(size);
+
+    JsonObject o;
+    o.emplace("event", JsonValue::makeString("mem.write"));
+    o.emplace("seg",   JsonValue::makeNumber(double(seg)));
+    o.emplace("off",   JsonValue::makeNumber(double(off)));
+    char addr[24];
+    snprintf(addr, sizeof(addr), "%04X:%04X", unsigned(seg), unsigned(off));
+    o.emplace("addr",  JsonValue::makeString(addr));
+    o.emplace("size",  JsonValue::makeNumber(double(size)));
+    o.emplace("old",   JsonValue::makeNumber(double(oldval & mask)));
+    o.emplace("new",   JsonValue::makeNumber(double(newval & mask)));
+    o.emplace("from_cs", JsonValue::makeNumber(double(from_cs)));
+    o.emplace("from_ip", JsonValue::makeNumber(double(from_ip)));
+    char from[24];
+    snprintf(from, sizeof(from), "%04X:%04X", unsigned(from_cs), unsigned(from_ip));
+    o.emplace("from",  JsonValue::makeString(from));
+    char text[200];
+    int len = DEBUG_AgentDisasmOne(from_cs, from_ip, text, sizeof(text));
+    if (len >= 1)
+        o.emplace("from_text", JsonValue::makeString(text));
+
+    serverBroadcastLine(jsonEncode(JsonValue::makeObject(std::move(o))));
 }
 
 /* Read `len` real-mode bytes at seg:off and render them space-separated
@@ -238,6 +353,21 @@ JsonValue handleDebugStatus(double id, const JsonValue & /*args*/) {
             rg.emplace("hi",  JsonValue::makeNumber(double(g_rangeWatchHi)));
         }
         w.emplace("range", JsonValue::makeObject(std::move(rg)));
+    }
+    {
+        /* mem.watch (4.9.4): the write-intercept watch. size=0 means "any
+         * access width"; predicate is a short human-readable description. */
+        JsonObject m;
+        m.emplace("armed", JsonValue::makeBool(AGENT_memWatchArmed));
+        m.emplace("hits",  JsonValue::makeNumber(double(g_memWatchHits)));
+        if (AGENT_memWatchArmed) {
+            m.emplace("seg",  JsonValue::makeNumber(double(g_memWatchSeg)));
+            m.emplace("lo",   JsonValue::makeNumber(double(g_memWatchLo)));
+            m.emplace("hi",   JsonValue::makeNumber(double(g_memWatchHi)));
+            m.emplace("size", JsonValue::makeNumber(double(g_memWatchSize)));
+            m.emplace("predicate", JsonValue::makeString(memWatchPredDesc()));
+        }
+        w.emplace("mem", JsonValue::makeObject(std::move(m)));
     }
     r.emplace("watches", JsonValue::makeObject(std::move(w)));
 
@@ -444,6 +574,127 @@ JsonValue handleCpuDisasm(double id, const JsonValue &args) {
     return makeReplyOk(id, std::move(r));
 }
 
+/* ---- mem.watch (4.9.4) ----------------------------------------------- */
+
+JsonValue handleMemWatch(double id, const JsonValue &args) {
+    const JsonValue *seg = args.get("seg");
+    if (!seg) {
+        return makeReplyError(id, "bad_args",
+            "expected {\"seg\":<u16 or hex>, \"lo\":<u16>, \"hi\":<u16>"
+            "[, \"size\":1|2|4, \"when\":{...}]} (seg=null to clear)");
+    }
+    if (seg->isNull()) {
+        memWatchClear();
+        JsonObject r;
+        r.emplace("armed", JsonValue::makeBool(false));
+        return makeReplyOk(id, std::move(r));
+    }
+
+    uint16_t segV = 0, loV = 0, hiV = 0;
+    if (!parseU16Any(*seg, segV))
+        return makeReplyError(id, "bad_args", "seg must be u16 number or hex string");
+    const JsonValue *lo = args.get("lo");
+    const JsonValue *hi = args.get("hi");
+    if (!lo || !hi)
+        return makeReplyError(id, "bad_args", "lo and hi required when seg is set");
+    if (!parseU16Any(*lo, loV))
+        return makeReplyError(id, "bad_args", "lo must be u16 number or hex string");
+    if (!parseU16Any(*hi, hiV))
+        return makeReplyError(id, "bad_args", "hi must be u16 number or hex string");
+    if (loV > hiV)
+        return makeReplyError(id, "bad_args", "lo must be <= hi");
+
+    /* Optional access-size filter. */
+    int sizeV = 0;
+    if (const JsonValue *sz = args.get("size")) {
+        if (!sz->isNull()) {
+            if (!sz->isNumber())
+                return makeReplyError(id, "bad_args", "size must be 1, 2, or 4");
+            int s = int(sz->n);
+            if (s != 1 && s != 2 && s != 4)
+                return makeReplyError(id, "bad_args", "size must be 1, 2, or 4");
+            sizeV = s;
+        }
+    }
+
+    /* Optional value predicate — exactly one of the three forms. */
+    int      predV     = MW_PRED_NONE;
+    uint32_t predValV  = 0;
+    uint32_t predMaskV = 0;
+    if (const JsonValue *when = args.get("when")) {
+        if (!when->isNull()) {
+            if (!when->isObject())
+                return makeReplyError(id, "bad_args", "'when' must be an object");
+            const JsonValue *neq   = when->get("new_eq");
+            const JsonValue *nne   = when->get("new_ne_old");
+            const JsonValue *nmask = when->get("new_and_mask_eq");
+            int count = (neq ? 1 : 0) + (nne ? 1 : 0) + (nmask ? 1 : 0);
+            if (count == 0)
+                return makeReplyError(id, "bad_args",
+                    "'when' needs one of new_eq / new_ne_old / new_and_mask_eq");
+            if (count > 1)
+                return makeReplyError(id, "bad_args",
+                    "'when' accepts only one predicate at a time");
+            if (neq) {
+                if (!parseU32Any(*neq, predValV))
+                    return makeReplyError(id, "bad_args",
+                        "new_eq must be a u32 number or hex string");
+                predV = MW_PRED_NEW_EQ;
+            } else if (nne) {
+                if (!nne->isBool() || !nne->b)
+                    return makeReplyError(id, "bad_args", "new_ne_old must be true");
+                predV = MW_PRED_NEW_NE_OLD;
+            } else {
+                if (!nmask->isObject())
+                    return makeReplyError(id, "bad_args",
+                        "new_and_mask_eq must be {\"mask\":<u32>, \"value\":<u32>}");
+                const JsonValue *m   = nmask->get("mask");
+                const JsonValue *val = nmask->get("value");
+                if (!m || !val)
+                    return makeReplyError(id, "bad_args",
+                        "new_and_mask_eq needs both mask and value");
+                if (!parseU32Any(*m, predMaskV))
+                    return makeReplyError(id, "bad_args",
+                        "mask must be a u32 number or hex string");
+                if (!parseU32Any(*val, predValV))
+                    return makeReplyError(id, "bad_args",
+                        "value must be a u32 number or hex string");
+                predV = MW_PRED_NEW_AND_MASK_EQ;
+            }
+        }
+    }
+
+    /* Commit. */
+    g_memWatchSeg      = segV;
+    g_memWatchLo       = loV;
+    g_memWatchHi       = hiV;
+    g_memWatchBase     = uint32_t(segV) << 4;
+    g_memWatchLinLo    = g_memWatchBase + loV;
+    g_memWatchLinHi    = g_memWatchBase + hiV;
+    g_memWatchSize     = sizeV;
+    g_memWatchPred     = predV;
+    g_memWatchPredVal  = predValV;
+    g_memWatchPredMask = predMaskV;
+    g_memWatchHits     = 0;
+    AGENT_memWatchArmed = true;
+
+    JsonObject r;
+    r.emplace("armed",     JsonValue::makeBool(true));
+    r.emplace("seg",       JsonValue::makeNumber(double(segV)));
+    r.emplace("lo",        JsonValue::makeNumber(double(loV)));
+    r.emplace("hi",        JsonValue::makeNumber(double(hiV)));
+    r.emplace("size",      JsonValue::makeNumber(double(sizeV)));
+    r.emplace("predicate", JsonValue::makeString(memWatchPredDesc()));
+    return makeReplyOk(id, std::move(r));
+}
+
+JsonValue handleMemUnwatch(double id, const JsonValue & /*args*/) {
+    memWatchClear();
+    JsonObject r;
+    r.emplace("armed", JsonValue::makeBool(false));
+    return makeReplyOk(id, std::move(r));
+}
+
 }  /* namespace agent */
 
 /* ---- Public hot-path hooks (called from DEBUG_HeavyIsBreakpoint) ------ */
@@ -479,6 +730,61 @@ void AGENT_TraceRecord(uint16_t seg, uint16_t off) {
     agent::g_traceRing[agent::g_traceHead] = agent::TraceEntry{seg, off};
     agent::g_traceHead = (agent::g_traceHead + 1) % agent::g_traceRing.size();
     if (agent::g_traceCount < agent::g_traceRing.size()) agent::g_traceCount++;
+}
+
+/* ---- mem.watch hot-path hook (4.9.4) --------------------------------- */
+
+/* The fast gate read by mem_write{b,w,d}_inline (paging.h). Global scope so
+ * that very hot path needn't reach into the agent namespace. */
+bool AGENT_memWatchArmed = false;
+
+/* Pure predicate: does this write match the armed watch? No memory read, no
+ * event, no counter bump — so the unit tests can drive it directly with a
+ * synthesised old/new pair and no MemBase. */
+bool AGENT_MemWatchMatch(uint32_t lin_addr, uint32_t newval, uint32_t oldval, int size) {
+    if (!AGENT_memWatchArmed) return false;
+    if (!agent::memWatchInScope(lin_addr, size)) return false;
+
+    const uint32_t mask = agent::sizeMask(size);
+    const uint32_t nv = newval & mask;   /* the new value, at the access width */
+    const uint32_t ov = oldval & mask;
+    switch (agent::g_memWatchPred) {
+        case agent::MW_PRED_NEW_EQ:
+            /* Compare against the full predicate value: a new_eq wider than the
+             * access size (e.g. new_eq=0x0853 against a 1-byte write) can never
+             * match, rather than matching on a coincidental low byte. */
+            return nv == agent::g_memWatchPredVal;
+        case agent::MW_PRED_NEW_NE_OLD:
+            return nv != ov;
+        case agent::MW_PRED_NEW_AND_MASK_EQ:
+            return (nv & agent::g_memWatchPredMask)
+                 == (agent::g_memWatchPredVal & agent::g_memWatchPredMask);
+        case agent::MW_PRED_NONE:
+        default:
+            return true;
+    }
+}
+
+/* Called from the guest memory-write path for every write while armed (the
+ * armed flag is checked at the call site so the disarmed cost is one bool
+ * load). Runs BEFORE the store, so a plain read returns the old value. On a
+ * match, bumps the hit counter and emits the mem.write event. */
+void AGENT_MemWatchNote(uint32_t lin_addr, uint32_t newval, int size) {
+    /* Cheap range/size pre-filter before touching memory. */
+    if (!agent::memWatchInScope(lin_addr, size)) return;
+
+    uint32_t oldval = 0;
+    switch (size) {
+        case 1: oldval = mem_readb(lin_addr); break;
+        case 2: oldval = mem_readw(lin_addr); break;
+        case 4: oldval = mem_readd(lin_addr); break;
+        default: return;
+    }
+
+    if (!AGENT_MemWatchMatch(lin_addr, newval, oldval, size)) return;
+
+    agent::g_memWatchHits++;
+    agent::emitMemWrite(lin_addr, oldval, newval, size);
 }
 
 #endif /* C_DEBUG */

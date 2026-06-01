@@ -438,6 +438,17 @@ static INLINE PhysPt64 PAGING_GetPhysicalAddress64(const LinearPt linAddr) {
 
 /* Special inlined memory reading/writing */
 
+#if C_DEBUG
+/* Agent mem.watch write-intercept hook (proposal 4.9.4) — definition in
+ * src/agent/agent_observe.cpp. Declared locally so paging.h, which is
+ * included almost everywhere, needn't pull in the whole agent header.
+ * AGENT_memWatchArmed is the fast gate: a disarmed watch costs one bool
+ * load per guest write, and the whole hook compiles out in release builds
+ * (C_DEBUG off). See include/agent.h for the contract. */
+extern bool AGENT_memWatchArmed;
+void AGENT_MemWatchNote(uint32_t lin_addr, uint32_t newval, int size);
+#endif
+
 static INLINE uint8_t mem_readb_inline(const LinearPt address) {
 	const HostPt tlb_addr=get_tlb_read(address);
 	if (tlb_addr) return host_readb(tlb_addr+address);
@@ -461,12 +472,18 @@ static INLINE uint32_t mem_readd_inline(const LinearPt address) {
 }
 
 static INLINE void mem_writeb_inline(const LinearPt address,const uint8_t val) {
+#if C_DEBUG
+	if (AGENT_memWatchArmed) AGENT_MemWatchNote(address,val,1);
+#endif
 	const HostPt tlb_addr=get_tlb_write(address);
 	if (tlb_addr) host_writeb(tlb_addr+address,val);
 	else (get_tlb_writehandler(address))->writeb(address,val);
 }
 
 static INLINE void mem_writew_inline(const LinearPt address,const uint16_t val) {
+#if C_DEBUG
+	if (AGENT_memWatchArmed) AGENT_MemWatchNote(address,val,2);
+#endif
 	if ((address & 0xfffu)<0xfffu) {
 		const HostPt tlb_addr=get_tlb_write(address);
 		if (tlb_addr) host_writew(tlb_addr+address,val);
@@ -475,6 +492,9 @@ static INLINE void mem_writew_inline(const LinearPt address,const uint16_t val) 
 }
 
 static INLINE void mem_writed_inline(const LinearPt address,const uint32_t val) {
+#if C_DEBUG
+	if (AGENT_memWatchArmed) AGENT_MemWatchNote(address,val,4);
+#endif
 	if ((address & 0xfffu)<0xffdu) {
 		const HostPt tlb_addr=get_tlb_write(address);
 		if (tlb_addr) host_writed(tlb_addr+address,val);

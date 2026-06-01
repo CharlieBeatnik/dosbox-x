@@ -69,6 +69,7 @@ public:
          * relied upon to be empty). */
         dispatchLine("{\"id\":99,\"cmd\":\"cpu.trace_ring\",\"args\":{\"depth\":256}}");
         dispatchLine("{\"id\":99,\"cmd\":\"cpu.trace_ring\",\"args\":{\"enabled\":false}}");
+        dispatchLine("{\"id\":99,\"cmd\":\"mem.unwatch\"}");
         /* Clear the BP list so debug.status never reads bytes_now (no MemBase). */
         dispatchLine("{\"id\":99,\"cmd\":\"debugger.command\",\"args\":{\"text\":\"BPDEL 0 *\"}}");
     }
@@ -78,6 +79,7 @@ public:
         AGENT_RangeWatchClear();
         dispatchLine("{\"id\":99,\"cmd\":\"cpu.probe\",\"args\":{\"points\":[]}}");
         dispatchLine("{\"id\":99,\"cmd\":\"cpu.trace_ring\",\"args\":{\"enabled\":false}}");
+        dispatchLine("{\"id\":99,\"cmd\":\"mem.unwatch\"}");
     }
 
     static JsonValue parse(const std::string &reply) {
@@ -111,6 +113,7 @@ TEST_F(AgentObservabilityTest, StatusHasAllTopLevelFields)
     EXPECT_TRUE(w->get("far") && w->get("far")->isObject());
     EXPECT_TRUE(w->get("target") && w->get("target")->isObject());
     EXPECT_TRUE(w->get("range") && w->get("range")->isObject());
+    EXPECT_TRUE(w->get("mem") && w->get("mem")->isObject());
 }
 
 TEST_F(AgentObservabilityTest, StatusReportsCsIpFromRegisters)
@@ -364,6 +367,168 @@ TEST_F(AgentObservabilityTest, DisasmRejectsBadCount)
 {
     JsonValue v = parse(dispatchLine(
         "{\"id\":1,\"cmd\":\"cpu.disasm\",\"args\":{\"addr\":\"0824:0100\",\"count\":0}}"));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+}
+
+/* ---- mem.watch (4.9.4) ----------------------------------------------- */
+/* The hot-path hook AGENT_MemWatchNote reads guest memory (old value) and
+ * emits an event, so the end-to-end path (counter bump, mem.write event,
+ * from_cs/ip attribution) is covered by the live test. Here we drive the
+ * pure predicate AGENT_MemWatchMatch directly — it touches no memory — plus
+ * argument validation and debug.status reflection. The armed watch's linear
+ * range is (seg<<4)+lo .. (seg<<4)+hi; the tests below use seg=0x1000 so the
+ * base is a round 0x10000. */
+
+/* Helper: arm a mem.watch via dispatch and assert it succeeded. */
+static void armMemWatch(const char *json) {
+    JsonValue v;
+    ASSERT_TRUE(jsonParse(dispatchLine(json), v)) << json;
+    ASSERT_TRUE(v.get("ok") && v.get("ok")->b) << json;
+}
+
+TEST_F(AgentObservabilityTest, MemWatchArmsAndSurfacesInStatus)
+{
+    JsonValue v = parse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"mem.watch\",\"args\":{\"seg\":\"1000\",\"lo\":\"0000\",\"hi\":\"00FF\"}}"));
+    ASSERT_TRUE(v.get("ok")->b);
+    const JsonValue *res = v.get("result");
+    EXPECT_TRUE(res->get("armed")->b);
+    EXPECT_EQ(uint16_t(res->get("seg")->n), 0x1000u);
+    EXPECT_EQ(uint16_t(res->get("lo")->n), 0x0000u);
+    EXPECT_EQ(uint16_t(res->get("hi")->n), 0x00FFu);
+    EXPECT_EQ(int(res->get("size")->n), 0);                 /* any width */
+    EXPECT_EQ(res->get("predicate")->s, "none");
+    EXPECT_TRUE(AGENT_memWatchArmed);
+
+    JsonValue s = status();
+    const JsonValue *m = s.get("result")->get("watches")->get("mem");
+    EXPECT_TRUE(m->get("armed")->b);
+    EXPECT_EQ(uint64_t(m->get("hits")->n), 0u);
+    EXPECT_EQ(uint16_t(m->get("seg")->n), 0x1000u);
+    EXPECT_EQ(uint16_t(m->get("lo")->n), 0x0000u);
+    EXPECT_EQ(uint16_t(m->get("hi")->n), 0x00FFu);
+}
+
+TEST_F(AgentObservabilityTest, MemUnwatchDisarms)
+{
+    armMemWatch("{\"id\":1,\"cmd\":\"mem.watch\",\"args\":{\"seg\":\"1000\",\"lo\":0,\"hi\":255}}");
+    EXPECT_TRUE(AGENT_memWatchArmed);
+
+    JsonValue v = parse(dispatchLine("{\"id\":2,\"cmd\":\"mem.unwatch\"}"));
+    ASSERT_TRUE(v.get("ok")->b);
+    EXPECT_FALSE(v.get("result")->get("armed")->b);
+    EXPECT_FALSE(AGENT_memWatchArmed);
+
+    /* seg=null is the other way to disarm. */
+    armMemWatch("{\"id\":3,\"cmd\":\"mem.watch\",\"args\":{\"seg\":\"1000\",\"lo\":0,\"hi\":255}}");
+    EXPECT_TRUE(AGENT_memWatchArmed);
+    v = parse(dispatchLine("{\"id\":4,\"cmd\":\"mem.watch\",\"args\":{\"seg\":null}}"));
+    ASSERT_TRUE(v.get("ok")->b);
+    EXPECT_FALSE(AGENT_memWatchArmed);
+}
+
+TEST_F(AgentObservabilityTest, MemWatchMatchRespectsRangeEdges)
+{
+    armMemWatch("{\"id\":1,\"cmd\":\"mem.watch\",\"args\":{\"seg\":\"1000\",\"lo\":0,\"hi\":255}}");
+    /* base 0x10000, range [0x10000, 0x100FF]. */
+    EXPECT_FALSE(AGENT_MemWatchMatch(0x0FFFF, 0x12, 0x00, 1));  /* just below */
+    EXPECT_TRUE (AGENT_MemWatchMatch(0x10000, 0x12, 0x00, 1));  /* at lo      */
+    EXPECT_TRUE (AGENT_MemWatchMatch(0x10080, 0x12, 0x00, 1));  /* inside     */
+    EXPECT_TRUE (AGENT_MemWatchMatch(0x100FF, 0x12, 0x00, 1));  /* at hi      */
+    EXPECT_FALSE(AGENT_MemWatchMatch(0x10100, 0x12, 0x00, 1));  /* just above */
+}
+
+TEST_F(AgentObservabilityTest, MemWatchMatchSizeFilter)
+{
+    /* size=2 means only 2-byte writes match. */
+    armMemWatch("{\"id\":1,\"cmd\":\"mem.watch\","
+                "\"args\":{\"seg\":\"1000\",\"lo\":0,\"hi\":255,\"size\":2}}");
+    EXPECT_FALSE(AGENT_MemWatchMatch(0x10010, 0x1234, 0, 1));   /* byte write  */
+    EXPECT_TRUE (AGENT_MemWatchMatch(0x10010, 0x1234, 0, 2));   /* word write  */
+    EXPECT_FALSE(AGENT_MemWatchMatch(0x10010, 0x1234, 0, 4));   /* dword write */
+}
+
+TEST_F(AgentObservabilityTest, MemWatchMatchNewEqPredicate)
+{
+    armMemWatch("{\"id\":1,\"cmd\":\"mem.watch\","
+                "\"args\":{\"seg\":\"1000\",\"lo\":0,\"hi\":255,\"when\":{\"new_eq\":\"0853\"}}}");
+    {
+        JsonValue s = status();
+        EXPECT_EQ(s.get("result")->get("watches")->get("mem")->get("predicate")->s,
+                  "new_eq=0x853");
+    }
+    EXPECT_TRUE (AGENT_MemWatchMatch(0x10010, 0x0853, 0x0761, 2));  /* matches  */
+    EXPECT_FALSE(AGENT_MemWatchMatch(0x10010, 0x0761, 0x0853, 2));  /* wrong new */
+    /* new_eq=0x0853 is wider than a byte, so a 1-byte write can never match,
+     * even when its value equals the predicate's low byte (0x53). */
+    EXPECT_FALSE(AGENT_MemWatchMatch(0x10010, 0x53, 0, 1));
+}
+
+TEST_F(AgentObservabilityTest, MemWatchMatchNewNeOldPredicate)
+{
+    armMemWatch("{\"id\":1,\"cmd\":\"mem.watch\","
+                "\"args\":{\"seg\":\"1000\",\"lo\":0,\"hi\":255,\"when\":{\"new_ne_old\":true}}}");
+    EXPECT_TRUE (AGENT_MemWatchMatch(0x10010, 0x0853, 0x0761, 2));  /* changed     */
+    EXPECT_FALSE(AGENT_MemWatchMatch(0x10010, 0x0853, 0x0853, 2));  /* idempotent  */
+    /* Only the low `size` bytes are compared: same low byte, differing high. */
+    EXPECT_FALSE(AGENT_MemWatchMatch(0x10010, 0xFF53, 0x0053, 1));
+}
+
+TEST_F(AgentObservabilityTest, MemWatchMatchAndMaskEqPredicate)
+{
+    armMemWatch("{\"id\":1,\"cmd\":\"mem.watch\","
+                "\"args\":{\"seg\":\"1000\",\"lo\":0,\"hi\":255,"
+                "\"when\":{\"new_and_mask_eq\":{\"mask\":\"FF00\",\"value\":\"0800\"}}}}");
+    EXPECT_TRUE (AGENT_MemWatchMatch(0x10010, 0x0853, 0, 2));  /* (0853 & FF00)=0800 */
+    EXPECT_TRUE (AGENT_MemWatchMatch(0x10010, 0x08FF, 0, 2));  /* high byte 08       */
+    EXPECT_FALSE(AGENT_MemWatchMatch(0x10010, 0x0953, 0, 2));  /* high byte 09       */
+}
+
+TEST_F(AgentObservabilityTest, MemWatchMatchFalseWhenDisarmed)
+{
+    EXPECT_FALSE(AGENT_memWatchArmed);
+    EXPECT_FALSE(AGENT_MemWatchMatch(0x10010, 0x12, 0, 1));
+}
+
+TEST_F(AgentObservabilityTest, MemWatchRejectsMissingRange)
+{
+    JsonValue v = parse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"mem.watch\",\"args\":{\"seg\":\"1000\"}}"));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+    EXPECT_FALSE(AGENT_memWatchArmed);
+}
+
+TEST_F(AgentObservabilityTest, MemWatchRejectsInvertedRange)
+{
+    JsonValue v = parse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"mem.watch\",\"args\":{\"seg\":\"1000\",\"lo\":255,\"hi\":0}}"));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+}
+
+TEST_F(AgentObservabilityTest, MemWatchRejectsBadSize)
+{
+    JsonValue v = parse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"mem.watch\",\"args\":{\"seg\":\"1000\",\"lo\":0,\"hi\":255,\"size\":3}}"));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+}
+
+TEST_F(AgentObservabilityTest, MemWatchRejectsTwoPredicates)
+{
+    JsonValue v = parse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"mem.watch\",\"args\":{\"seg\":\"1000\",\"lo\":0,\"hi\":255,"
+        "\"when\":{\"new_eq\":1,\"new_ne_old\":true}}}"));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+}
+
+TEST_F(AgentObservabilityTest, MemWatchRejectsEmptyPredicate)
+{
+    JsonValue v = parse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"mem.watch\",\"args\":{\"seg\":\"1000\",\"lo\":0,\"hi\":255,\"when\":{}}}"));
     EXPECT_FALSE(v.get("ok")->b);
     EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
 }

@@ -39,12 +39,24 @@
 ;        landmark_trace_end, and asserts cpu.traceback shows the chain in
 ;        order, most-recent-last.
 ;
+;   '4'  Phase 4 (mem.watch): a single, known store —
+;        `mov word ptr [watch_target], WATCH_VALUE` — at landmark_store. The
+;        field starts at WATCH_INITIAL, so the write transitions
+;        WATCH_INITIAL -> WATCH_VALUE in one instruction. The driver arms
+;        mem.watch on the field (with when new_eq=WATCH_VALUE) before tapping
+;        '4', then asserts the mem.write event names the storing instruction's
+;        CS:IP (== landmark_store) and reports old==WATCH_INITIAL,
+;        new==WATCH_VALUE. This is the proposal-4.9.4 "name the stamp site"
+;        test made concrete. Run once (the field stays WATCH_VALUE after).
+;
 ;   'q'  Exit cleanly via INT 21h AH=4Ch.
 ;
 ; All phases return to main_loop so the driver can run them in any order and
 ; repeat them.
 
 LOOP_ITERS      equ     300
+WATCH_INITIAL   equ     0761h           ; watch_target value at load
+WATCH_VALUE     equ     0853h           ; value phase 4 stamps into watch_target
 
 code    segment
         assume  cs:code, ds:code, es:code, ss:code
@@ -61,11 +73,12 @@ landmarks_table:
         dw      landmark_trace_end      ; +6  trace chain end (BP target)
         dw      LOOP_ITERS              ; +8  iteration count the driver checks
         dw      landmark_disasm_end     ; +10 one-past the disasm bytes
-        dw      0                       ; +12 reserved
-        dw      0                       ; +14 reserved
+        dw      watch_target            ; +12 mem.watch write-target field
+        dw      landmark_store          ; +14 the storing instruction (phase 4)
 
 ; ---- Variables -----------------------------------------------------------
 loopcount       dw      0
+watch_target    dw      WATCH_INITIAL   ; phase 4 stamps WATCH_VALUE here
 
 ; ---- Setup ---------------------------------------------------------------
 setup:
@@ -94,6 +107,10 @@ main_loop:
         je      phase2
         cmp     al, '3'
         je      phase3
+        cmp     al, '4'
+        jne     chk_q
+        jmp     phase4                  ; near jmp: phase4 is out of je's rel8 range
+chk_q:
         cmp     al, 'q'
         je      do_exit
         jmp     main_loop
@@ -139,6 +156,15 @@ landmark_trace_a:
         dec     bx
 landmark_trace_end:
         nop                             ; <- BP target; trace stops here
+        jmp     main_loop
+
+; ---- Phase 4: single known store (mem.watch write-intercept) -------------
+; One word write transitioning watch_target from WATCH_INITIAL to WATCH_VALUE.
+; landmark_store is the address of the storing instruction itself, which the
+; driver compares against the mem.write event's from_cs:from_ip.
+phase4:
+landmark_store:
+        mov     word ptr [watch_target], WATCH_VALUE
         jmp     main_loop
 
 ; ---- Clean exit ----------------------------------------------------------

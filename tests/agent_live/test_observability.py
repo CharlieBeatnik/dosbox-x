@@ -113,6 +113,8 @@ def _reset(agent: DbxAgent) -> None:
     agent.call("cpu.probe", points=[])
     with contextlib.suppress(Exception):
         agent.call("cpu.trace_ring", enabled=False)
+    with contextlib.suppress(Exception):
+        agent.call("mem.unwatch")
     _drain_events(agent)
 
 
@@ -352,6 +354,71 @@ def phase3_traceback(agent, cs, trace_a, trace_end, rep) -> None:
             agent.cpu_run(); _drain_events(agent)
 
 
+# Must match obstest.asm's WATCH_INITIAL / WATCH_VALUE.
+WATCH_INITIAL = 0x0761
+WATCH_VALUE = 0x0853
+
+
+def phase4_memwatch(agent, cs, watch_target, store, rep) -> None:
+    # 4.9.4: arm a write-intercept on the 2-byte field with a value predicate,
+    # tap '4' to run the single known store, and assert the mem.write event
+    # names the storing instruction (from_cs:from_ip == landmark_store) and
+    # reports the exact old->new transition. The watch does NOT halt the CPU,
+    # so the event arrives asynchronously on the stream.
+    name = "phase4: mem.watch names the stamp site + old/new value"
+    try:
+        _reset(agent)
+        r = agent.call("mem.watch", seg=f"{cs:04X}",
+                       lo=f"{watch_target:04X}", hi=f"{watch_target:04X}",
+                       size=2, when={"new_eq": WATCH_VALUE})
+        if not r.get("armed"):
+            rep.record(name, False, f"mem.watch arm reply: {r}")
+            return
+        agent.cpu_run(); _drain_events(agent)
+        agent.keyboard_tap("4")
+        ev = _wait_for_event(agent, "mem.write", timeout=8.0)
+
+        problems = []
+        if ev.get("seg") != cs or ev.get("off") != watch_target:
+            problems.append(
+                f"addr {ev.get('seg'):04X}:{ev.get('off'):04X} != "
+                f"{cs:04X}:{watch_target:04X}")
+        if ev.get("from_cs") != cs or ev.get("from_ip") != store:
+            problems.append(
+                f"from {ev.get('from_cs'):04X}:{ev.get('from_ip'):04X} != "
+                f"store {cs:04X}:{store:04X}")
+        if ev.get("old") != WATCH_INITIAL:
+            problems.append(f"old={ev.get('old'):#06x} expected {WATCH_INITIAL:#06x}")
+        if ev.get("new") != WATCH_VALUE:
+            problems.append(f"new={ev.get('new'):#06x} expected {WATCH_VALUE:#06x}")
+        if ev.get("size") != 2:
+            problems.append(f"size={ev.get('size')} expected 2")
+        ftext = (ev.get("from_text") or "").lower()
+        if "mov" not in ftext:
+            problems.append(f"from_text={ev.get('from_text')!r} (expected a mov)")
+
+        # The hit counter must also surface in debug.status (non-event proof).
+        st = agent.call("debug.status")
+        memw = st.get("watches", {}).get("mem", {})
+        if memw.get("hits", 0) < 1:
+            problems.append(f"debug.status mem hits={memw.get('hits')}")
+
+        if problems:
+            rep.record(name, False, "; ".join(problems[:4]))
+        else:
+            rep.record(name, True,
+                       f"stamp at {cs:04X}:{store:04X} "
+                       f"old={ev['old']:#06x}->new={ev['new']:#06x} "
+                       f"'{ev.get('from_text')}'")
+    except Exception as exc:
+        rep.record(name, False, repr(exc))
+    finally:
+        with contextlib.suppress(Exception):
+            agent.cpu_pause(); _drain_events(agent)
+            agent.call("mem.unwatch")
+            agent.cpu_run(); _drain_events(agent)
+
+
 def run(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dosbox", default=str(DEFAULT_DOSBOX))
@@ -385,15 +452,18 @@ def run(argv=None) -> int:
 
             cs = _read_signature(agent)
             print(f"OBSTEST.COM CS=0x{cs:04X}", flush=True)
-            tbl = agent.mem_read("seg:off", f"{cs:04X}:0103", 12)
-            loopbody, disasm, trace_a, trace_end, iters, disasm_end = struct.unpack("<6H", tbl)
+            tbl = agent.mem_read("seg:off", f"{cs:04X}:0103", 16)
+            (loopbody, disasm, trace_a, trace_end, iters, disasm_end,
+             watch_target, store) = struct.unpack("<8H", tbl)
             print(f"landmarks: loopbody={loopbody:04X} disasm={disasm:04X} "
                   f"trace_a={trace_a:04X} trace_end={trace_end:04X} iters={iters} "
-                  f"disasm_end={disasm_end:04X}", flush=True)
+                  f"disasm_end={disasm_end:04X} watch_target={watch_target:04X} "
+                  f"store={store:04X}", flush=True)
 
             phase1_probe_and_counters(agent, cs, loopbody, iters, rep)
             phase2_disasm(agent, cs, disasm, disasm_end, rep)
             phase3_traceback(agent, cs, trace_a, trace_end, rep)
+            phase4_memwatch(agent, cs, watch_target, store, rep)
 
             with contextlib.suppress(Exception):
                 _reset(agent)

@@ -125,6 +125,20 @@ void AGENT_ProbeCheck(uint16_t seg, uint16_t off);
 bool AGENT_TraceActive(void);
 void AGENT_TraceRecord(uint16_t seg, uint16_t off);
 
+/* Memory write-intercept watch (proposal 4.9.4). The guest memory-write path
+ * (mem_write{b,w,d}_inline in paging.h) calls AGENT_MemWatchNote on every
+ * write *while armed*. AGENT_memWatchArmed is the fast gate so a disarmed
+ * watch costs only a single bool load on that very hot path. On a match
+ * (linear address in the armed [seg:lo..hi] range, the right access size, and
+ * the optional value predicate) AGENT_MemWatchNote reads the old value, bumps
+ * the hit counter, and emits a `mem.write` event naming the storing
+ * instruction's CS:IP (via DEBUG_GetPrevCS/IP — meaningful only in a
+ * heavy-debug build). AGENT_MemWatchMatch is the pure predicate — no memory
+ * read, no event, no counter bump — shared by the hook and the unit tests. */
+extern bool AGENT_memWatchArmed;
+bool AGENT_MemWatchMatch(uint32_t lin_addr, uint32_t newval, uint32_t oldval, int size);
+void AGENT_MemWatchNote(uint32_t lin_addr, uint32_t newval, int size);
+
 /* Notified when DOSBOX_SetNormalLoop / DOSBOX_SetLoop changes the main
  * loop. Used so we know when to flip state.paused <-> state.running. */
 void AGENT_OnLoopChange(void);
@@ -176,6 +190,11 @@ static inline bool AGENT_ProbeActive(void) { return false; }
 static inline void AGENT_ProbeCheck(uint16_t /*seg*/, uint16_t /*off*/) {}
 static inline bool AGENT_TraceActive(void) { return false; }
 static inline void AGENT_TraceRecord(uint16_t /*seg*/, uint16_t /*off*/) {}
+/* AGENT_memWatchArmed has no !C_DEBUG counterpart: the only reader is the
+ * paging.h write hook, which is itself #if C_DEBUG, so the symbol is never
+ * referenced when C_DEBUG is off. */
+static inline bool AGENT_MemWatchMatch(uint32_t, uint32_t, uint32_t, int) { return false; }
+static inline void AGENT_MemWatchNote(uint32_t, uint32_t, int) {}
 static inline void AGENT_OnLoopChange(void) {}
 static inline void AGENT_OnScreenCaptured(const char * /*path*/, bool /*raw*/) {}
 static inline bool AGENT_IsHeadless(void) { return false; }

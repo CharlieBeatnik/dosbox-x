@@ -133,6 +133,8 @@ events don't. The reference client does this in a single reader thread.
 | `cpu.trace_ring`    | `{depth?, enabled?, seg?}`    | `{enabled, depth, seg?}`            |
 | `cpu.traceback`     | `{count?}`                    | `{entries: [{cs_ip, bytes, text}]}` |
 | `cpu.disasm`        | `{addr, count?}`              | `{insns: [{cs_ip, bytes, text}]}`   |
+| `mem.watch`         | `{seg, lo, hi, size?, when?}` | `{armed, seg, lo, hi, size, predicate}` (`seg=null` to clear) |
+| `mem.unwatch`       | none                          | `{armed: false}`                    |
 
 ### `vm.version`
 
@@ -574,6 +576,7 @@ COMMAND.COM stop callbacks. None of these touch a hooked opcode.
 | `farcall.transfer` | `{target_seg, target_off, from_cs, from_ip, kind}` | A `CALL FAR` / `JMP FAR` / `RETF` / `IRET` / interrupt dispatch whose target CS matched the active `farcall.watch` sentinel |
 | `cpu.transfer`     | `{target_seg, target_off, from_cs, from_ip, kind}` | A NEAR `CALL`/`JMP`/taken `Jcc`/`RETN` / same-CS `RETF` / `IRET` / interrupt dispatch whose `(CS, IP)` matched the active `cpu.watch_target` sentinel |
 | `cpu.range_enter`  | `{seg, target_off, from_cs, from_ip, kind}` | A control transfer crossed the boundary into the active `cpu.watch_range` window from outside. Suppressed for intra-range transfers (the slide / loops inside the window). |
+| `mem.write`        | `{seg, off, addr, size, old, new, from_cs, from_ip, from[, from_text]}` | A guest memory write matched the active `mem.watch` (range + size + value predicate). `from_cs:from_ip` is the storing instruction; `from_text` (heavy-debug only) is its disassembly. |
 | `screen.captured`  | `{path, raw}`                   | A `screen.capture` PNG was fully written. Same payload as the command's deferred reply. Fires even for screenshots triggered by keyboard mapper (`Host+P` etc.), so subscribe-and-filter on `path` if you only care about your own requests. |
 | `agent.error`      | `{code, message}`               | Malformed input from your side (no `id` available to reply on)  |
 | `agent.overflow`   | none                            | Outbox hit its 1 MB cap; lines were dropped                     |
@@ -636,7 +639,9 @@ consuming the event stream:
   "watches": {
     "far":    {"armed":false,"hits":0},
     "target": {"armed":true,"hits":0,"seg":2084,"off":49182},
-    "range":  {"armed":true,"hits":7,"seg":2084,"lo":38400,"hi":39423}
+    "range":  {"armed":true,"hits":7,"seg":2084,"lo":38400,"hi":39423},
+    "mem":    {"armed":true,"hits":3,"seg":2084,"lo":24576,"hi":28671,
+               "size":2,"predicate":"new_eq=0x853"}
   },
   "probe": [ {"addr":"0824:6F10","seg":2084,"off":28432,"hits":0} ],
   "trace": {"enabled":true,"depth":256,"count":256,"seg":2084}
@@ -708,6 +713,55 @@ the same `DasmI386` the curses debugger uses. `bytes` is the exact raw encoding
 mnemonic — removing the unsafe hand-decode the X2RE TOOL MANDATE warns against.
 Operand size follows the current code segment (`cpu.code.big`).
 
+### `mem.watch` — write-intercept that names the storing instruction
+
+```json
+{"id":1,"cmd":"mem.watch","args":{"seg":"0824","lo":"6000","hi":"6FFF",
+   "size":2,"when":{"new_eq":"0853"}}}
+   → {"armed":true,"seg":2084,"lo":24576,"hi":28671,"size":2,
+      "predicate":"new_eq=0x853"}
+{"id":2,"cmd":"mem.watch","args":{"seg":null}}   → {"armed":false}   // or mem.unwatch
+```
+
+Unlike `BPM` (a per-instruction value-change *poll*), this hooks the actual
+guest memory-write path, so it fires **at the instant of the store** and
+reports the storing instruction's own `CS:IP`. Each matching write emits a
+`mem.write` event:
+
+```json
+{"event":"mem.write","seg":2084,"off":27164,"addr":"0824:6A1C","size":2,
+ "old":1889,"new":2131,
+ "from_cs":2084,"from_ip":4718,"from":"0824:126E",
+ "from_text":"mov word [6a1c],0853"}
+```
+
+- **`from_cs:from_ip` (and `from`)** is the instruction that performed the
+  store — the answer to "*which* instruction stamps this value?". This is the
+  decisive measurement for the iter-6 stale-handler class: `mem.watch` the
+  entity-struct region `when new_eq=<a known stale value>` names the stamp site
+  in one run, replacing a 273-site / 106-value static audit.
+- **`old` / `new`** are the pre- and post-write values at the access width
+  (`size` bytes). `from_text` is the storing instruction, disassembled.
+- **`size`** filters to 1-, 2-, or 4-byte writes; omit it (or pass `null`) to
+  match any access width. The range `[lo, hi]` is matched against the write's
+  **starting** offset, computed as the real-mode linear address
+  `(seg<<4)+off`.
+- **`when`** (optional) is a value predicate so the one write you care about
+  isn't buried under thousands you don't — exactly one of:
+  - `{"new_eq": <u32>}` — the new value equals this (a predicate wider than
+    `size` simply never matches, so it won't fire on a coincidental low byte);
+  - `{"new_ne_old": true}` — the write actually changes the value (skips
+    idempotent stores);
+  - `{"new_and_mask_eq": {"mask": <u32>, "value": <u32>}}` — `(new & mask) ==
+    value`.
+- The hit counter surfaces in `debug.status` under `watches.mem` so a watch
+  that fired (or never did) is provable without consuming the event stream.
+- **`from_cs:from_ip` and `from_text` need a heavy-debug build** (they come
+  from the per-instruction tracker); the event itself, `old`/`new`, and the
+  hit counter work in any `C_DEBUG` build. Like the other watches this is a
+  single sentinel — calling again replaces it. It targets normal RAM; the VGA
+  framebuffer is still a gap (see below).
+
 ## What is *not* capturable
 
 The Phase-1 surface deliberately covers what `ParseCommand` can route
@@ -750,6 +804,13 @@ an issue.
 
 ### BPM on VGA memory (A0000–BFFFF) — partial coverage
 
+> For **normal RAM**, prefer `mem.watch` (above): it is a true write
+> intercept that reports the storing instruction's `CS:IP`, the old/new
+> value, and supports a value predicate — none of the caveats below apply.
+> The VGA framebuffer is the one region `mem.watch` does **not** yet cover
+> (it hooks the generic `mem_write*` path, not the VGA page handlers), so
+> the `BPM` notes here still stand for A0000–BFFFF.
+
 `BPM A000:xxxx` (or any `BPM` in the VGA memory window) is a
 **single-byte value-change watch**, not a write intercept. It works
 fine for normal RAM, but for VGA memory it carries two caveats that
@@ -775,8 +836,9 @@ robust workaround is to grep the disassembly for `mov ax, 0A000h` /
 `mov ax, 0xa0` literals (or whatever segment constant the game's
 source uses), set a regular `BP` on each candidate site, and run.
 `cpu.watch_target` works too if you only care about one specific
-landing IP. A proper write-intercept BPM that hooks the VGA page
-handlers' `writeb` would be a Phase-3 addition.
+landing IP. Extending `mem.watch` to hook the VGA page handlers'
+`writeb`/`writew` (so a planar write reports its real writer `CS:IP`)
+is the remaining follow-up.
 
 ## Recipes
 

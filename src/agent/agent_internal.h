@@ -177,6 +177,8 @@ JsonValue handleCpuProbe(double id, const JsonValue &args);       /* 4.9.2 */
 JsonValue handleCpuTraceRing(double id, const JsonValue &args);   /* 4.9.3 */
 JsonValue handleCpuTraceback(double id, const JsonValue &args);   /* 4.9.3 */
 JsonValue handleCpuDisasm(double id, const JsonValue &args);      /* 4.9.6 */
+JsonValue handleMemWatch(double id, const JsonValue &args);       /* 4.9.4 */
+JsonValue handleMemUnwatch(double id, const JsonValue &args);     /* 4.9.4 */
 
 /* Reply helpers shared between agent.cpp and agent_keyboard.cpp. */
 JsonValue makeReplyOk(double id, JsonObject result);

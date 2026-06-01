@@ -529,6 +529,8 @@ std::string dispatchLine(const std::string &line) {
     if (cmd->s == "cpu.unwatch_target")return jsonEncode(handleCpuUnwatchTarget(id, a));
     if (cmd->s == "cpu.watch_range")   return jsonEncode(handleCpuWatchRange(id, a));
     if (cmd->s == "cpu.unwatch_range") return jsonEncode(handleCpuUnwatchRange(id, a));
+    if (cmd->s == "mem.watch")         return jsonEncode(handleMemWatch(id, a));
+    if (cmd->s == "mem.unwatch")       return jsonEncode(handleMemUnwatch(id, a));
     /* Observability & trust (proposal 4.9) — handlers in agent_observe.cpp. */
     if (cmd->s == "debug.status")      return jsonEncode(handleDebugStatus(id, a));
     if (cmd->s == "cpu.probe")         return jsonEncode(handleCpuProbe(id, a));

@@ -6,7 +6,90 @@ Leave-behind for the next agent continuing the **proposal-4.9** work on the
 Source proposal:
 `X2RE/.claude/notes/dosbox-x-fixes/PROPOSAL_4.9_observability_and_trust.md`.
 
-## What shipped this iteration (Tier 1 + disasm)
+## What shipped this iteration (4.9.4 — `mem.watch` write-intercept)
+
+The Tier-2 headline item: a real write-intercept (not a value-change poll)
+that reports **the instruction that did the store**, the old/new value, with
+an address range + access-size + value predicate. Built, unit-tested, and
+verified end-to-end against a booted guest.
+
+| # | Command | Proves | Status |
+|---|---------|--------|--------|
+| 4.9.4 | `mem.watch` / `mem.unwatch` + `mem.write` event | "*which* instruction stamps this value?" in one run | ✅ |
+
+### How it works / code map
+
+- **`include/paging.h`** — the hook lives at the top of `mem_writeb_inline` /
+  `mem_writew_inline` / `mem_writed_inline` (the path the CPU cores reach via
+  `SaveMb/Mw/Md`, and the path `mem_writeb` and friends funnel into). Guarded
+  by `#if C_DEBUG` so it compiles out entirely in release. The fast gate is a
+  global `extern bool AGENT_memWatchArmed` — a disarmed watch costs one bool
+  load per guest write. On armed, it calls `AGENT_MemWatchNote(addr,val,size)`.
+  Forward-declared locally in paging.h (not via an `agent.h` include) to keep
+  that very wide header lean.
+- **`src/agent/agent_observe.cpp`** — all the mem.watch logic is self-contained
+  here:
+  - file-scope state (range precomputed to a linear `[linLo,linHi]`, size
+    filter, predicate enum/val/mask, hit counter);
+  - `AGENT_MemWatchMatch(lin,new,old,size)` — the **pure** predicate (no memory
+    read, no event, no counter bump), so the unit tests drive it directly with
+    a synthesised old/new pair and no `MemBase`;
+  - `AGENT_MemWatchNote` — the hook: cheap range/size pre-filter → read old
+    value (`mem_readb/w/d`, a plain read, no recursion) → `AGENT_MemWatchMatch`
+    → bump counter + `emitMemWrite`;
+  - `handleMemWatch` / `handleMemUnwatch` dispatch handlers;
+  - the `watches.mem` block added to `debug.status`.
+- **`include/agent.h`** — public decls for `AGENT_memWatchArmed`,
+  `AGENT_MemWatchMatch`, `AGENT_MemWatchNote` (+ the `#else` no-op pair; the
+  armed bool has no no-op counterpart since its only reader is the C_DEBUG
+  paging hook).
+- **`src/agent/agent.cpp`** / **`agent_internal.h`** — two dispatch cases +
+  two `handle*` prototypes. Old value is read *before* the store, so the event
+  carries the true pre-write value; `from_cs:from_ip` comes from
+  `DEBUG_GetPrevCS/IP` (the storing instruction's start — heavy-debug only).
+
+### `mem.write` event shape
+
+```json
+{"event":"mem.write","seg":2084,"off":27164,"addr":"0824:6A1C","size":2,
+ "old":1889,"new":2131,"from_cs":2084,"from_ip":4718,"from":"0824:126E",
+ "from_text":"mov word [6a1c],0853"}
+```
+
+Predicate forms (`when`, optional, pick one): `{"new_eq":<u32>}` (a value
+wider than `size` never matches, so no coincidental-low-byte false positives),
+`{"new_ne_old":true}`, `{"new_and_mask_eq":{"mask":<u32>,"value":<u32>}}`.
+Range `[lo,hi]` is matched against the write's **starting** real-mode linear
+address `(seg<<4)+off`.
+
+### Tests
+
+- **`tests/agent_observability_tests.cpp`** — 13 new gTests (now 33 in the
+  suite, **92 Agent gTests total, all pass**). The pure predicate
+  `AGENT_MemWatchMatch` is exercised exhaustively (range edges, size filter,
+  all three predicate forms, disarmed→false); plus dispatch arg-validation and
+  `debug.status` reflection. The hook's memory-read + event emission is
+  MemBase-dependent, so that path is covered live (same split as disasm).
+- **`tests/agent_live/obstest.asm` + `OBSTEST.COM` (rebuilt)** — added Phase 4:
+  a single `mov word ptr [watch_target], 0853h` at `landmark_store`, with the
+  field starting at `0761h`. Repurposed the two reserved landmark-table slots
+  (`+12` = watch_target offset, `+14` = store offset). Rebuilt via
+  `build_masm.py` (toolchain present on this host: `MASM`/`TASM` env vars set).
+- **`tests/agent_live/test_observability.py`** — Phase 4 arms
+  `mem.watch ... when new_eq=0853`, taps '4', and asserts the `mem.write`
+  event's `from_cs:from_ip == landmark_store`, `old==0761`, `new==0853`,
+  `size==2`, `from_text` contains `mov`, and `debug.status` `watches.mem.hits`
+  ≥ 1. **All 5 phases pass** (`stamp at 0814:016E old=0x0761->new=0x0853
+  'mov  word [0115],0853'`).
+
+### Known gap carried forward
+
+`mem.watch` hooks the generic `mem_write*` path, which covers normal RAM but
+**not the VGA framebuffer** (planar writes go through the VGA page handlers'
+`writeb`/`writew`). Hooking those is the remaining piece of the proposal's
+4.9.4 (the "VGA blind spot"); see USAGE.md §"BPM on VGA memory".
+
+## Previously shipped (Tier 1 + disasm)
 
 Four commands, each built, unit-tested **and** verified end-to-end against a
 booted DOS guest with a purpose-built MASM program:
@@ -108,12 +191,12 @@ python tests/agent_live/test_observability.py
 
 ## Not done / deferred (pick up here, in proposal priority order)
 
-- **4.9.4 `mem.watch`** (highest value) — real write-intercept reporting the
-  storing instruction's CS:IP + old/new value, with range + value predicate,
-  plus a VGA-page-handler hook for the planar-write blind spot. Wants the
-  `mem_writeb/w/d` checked path (where `BPM` taps) but capturing the *current*
-  instruction's CS:IP rather than firing on the next boundary. Most
-  substantial item.
+- **4.9.4 VGA sub-item** — `mem.watch` (RAM) shipped this iteration; the one
+  remaining piece is hooking the VGA page handlers' `writeb`/`writew` so a
+  planar framebuffer write reports its real writer CS:IP (the "VGA blind
+  spot"). The RAM hook and event shape are done; this adds the same
+  range/predicate check inside the VGA write callbacks and routes through the
+  existing `emitMemWrite`.
 - **4.9.5 multi-sentinel watches** — let `cpu.watch_target` / `farcall.watch`
   hold a *set* (and `cpu.watch_range` several ranges) with a `which` field on
   events. NOTES flags this ~20 lines (generalize `g_*WatchSeg` to a container).
@@ -150,7 +233,9 @@ python tests/agent_live/test_observability.py
 - 4.9.1/4.9.2 "C01E retrial" → `test_observability.py` phase1a+1b.
 - 4.9.3 "traceback at the ARPL" → phase3.
 - 4.9.6 hand-decode removal → phase2 (disasm bytes == `mem.read`).
-- 4.9.4 / 4.9.5 / 4.9.8 acceptance tests deferred with those items.
+- 4.9.4 "name the stamp site" → phase4 (`mem.write` `from_cs:from_ip` ==
+  `landmark_store`, old/new == the known transition).
+- 4.9.5 / 4.9.8 acceptance tests deferred with those items.
 
 ## Environment note
 
