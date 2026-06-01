@@ -153,6 +153,22 @@ JsonValue handleKeyboardTap(double id, const JsonValue &args);
 JsonValue handleRegsGet(double id, const JsonValue &args);
 JsonValue handleMemRead(double id, const JsonValue &args);
 
+/* Structured single-step (proposal 4.9.7), implemented in agent_cpu.cpp.
+ * cpu.step always replies synchronously. cpu.step_over returns the empty
+ * string (like screen.capture) when it stepped over a CALL/INT/LOOP/REP and
+ * must defer its reply until the temp-BP pause; AGENT_OnDebuggerPaused sends
+ * that deferred reply. buildStepResult reads the *current* CPU state and is
+ * shared by the synchronous replies and the deferred one. */
+JsonValue   handleCpuStep(double id, const JsonValue &args);
+std::string handleCpuStepOver(double id, const JsonValue &args);
+JsonObject  buildStepResult(void);
+
+/* Pending cpu.step_over reply slot (defined in agent.cpp). Single-slot because
+ * Phase 1 is single-client and a step-over can't be issued while one is in
+ * flight (the CPU is running until the temp BP fires). */
+extern bool   g_stepOverPending;
+extern double g_stepOverId;
+
 /* ---- Observability (proposal 4.9) --------------------------------------
  * Watch state + hit counters live in agent.cpp (read on the CPU hot path,
  * written from the main thread). debug.status in agent_observe.cpp reads

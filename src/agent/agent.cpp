@@ -90,6 +90,12 @@ bool                                            g_screenCaptureRaw = false;
 bool                                            g_screenCapturePending = false;
 std::chrono::steady_clock::time_point           g_screenCaptureDeadline;
 
+/* Pending cpu.step_over reply (proposal 4.9.7). When a step-over steps a
+ * CALL/INT/LOOP/REP the CPU resumes until a temporary breakpoint fires; the
+ * reply is sent from AGENT_OnDebuggerPaused once that pause settles. */
+bool                                            g_stepOverPending = false;
+double                                          g_stepOverId = 0.0;
+
 namespace {
 
 bool g_started        = false;     /* did we register the tick handler / start the server? */
@@ -621,6 +627,10 @@ std::string dispatchLine(const std::string &line) {
     if (cmd->s == "cpu.run")           return jsonEncode(handleCpuRun(id, a));
     if (cmd->s == "regs.get")          return jsonEncode(handleRegsGet(id, a));
     if (cmd->s == "mem.read")          return jsonEncode(handleMemRead(id, a));
+    if (cmd->s == "cpu.step")          return jsonEncode(handleCpuStep(id, a));
+    /* cpu.step_over may return "" (deferred) when it steps over a CALL/INT/
+     * LOOP/REP — its reply is sent from AGENT_OnDebuggerPaused. */
+    if (cmd->s == "cpu.step_over")     return handleCpuStepOver(id, a);
     if (cmd->s == "farcall.watch")     return jsonEncode(handleFarcallWatch(id, a));
     if (cmd->s == "farcall.unwatch")   return jsonEncode(handleFarcallUnwatch(id, a));
     if (cmd->s == "cpu.watch_target")  return jsonEncode(handleCpuWatchTarget(id, a));
@@ -700,6 +710,22 @@ bool AGENT_IsHeadless(void) {
      * revisited later; the loss is that pressing Alt-Pause with the agent
      * active no longer pops a curses window. */
     return agent::g_started;
+}
+
+void AGENT_OnDebuggerPaused(void) {
+    /* Deferred cpu.step_over reply (proposal 4.9.7). A step-over of a
+     * CALL/INT/LOOP/REP set a temp BP and resumed the CPU; the running->paused
+     * transition that just settled is (normally) that temp BP firing. Send the
+     * post-step register snapshot now. If a *different* breakpoint fired first
+     * (one inside the called routine, or a manual cpu.pause), we still reply
+     * with the state at that stop — the same behaviour the curses step-over
+     * has — and clear the slot so it never gets stuck. */
+    if (!agent::g_started) return;
+    if (!agent::g_stepOverPending) return;
+    agent::serverBroadcastLine(
+        agent::jsonEncode(agent::makeReplyOk(agent::g_stepOverId,
+                                             agent::buildStepResult())));
+    agent::g_stepOverPending = false;
 }
 
 bool AGENT_FarWatchMatches(uint16_t seg) {

@@ -166,6 +166,13 @@ void AGENT_OnScreenCaptured(const char *path, bool raw);
  * caller should skip curses init in DEBUG_EnableDebugger. */
 bool AGENT_IsHeadless(void);
 
+/* Notified from DEBUG_EnableDebugger once a running->paused transition has
+ * settled (after debugger.entered / state.paused are emitted). Used to send
+ * the deferred reply for a cpu.step_over (proposal 4.9.7) that stepped over a
+ * CALL/INT/LOOP/REP and resumed the CPU until a temporary breakpoint fired.
+ * No-op when no step-over is pending. */
+void AGENT_OnDebuggerPaused(void);
+
 #else /* !C_DEBUG */
 
 static inline void AGENT_StartIfRequested(void) {}
@@ -209,6 +216,7 @@ static inline void AGENT_MemWatchNote(uint32_t, uint32_t, int) {}
 static inline void AGENT_OnLoopChange(void) {}
 static inline void AGENT_OnScreenCaptured(const char * /*path*/, bool /*raw*/) {}
 static inline bool AGENT_IsHeadless(void) { return false; }
+static inline void AGENT_OnDebuggerPaused(void) {}
 
 #endif /* C_DEBUG */
 

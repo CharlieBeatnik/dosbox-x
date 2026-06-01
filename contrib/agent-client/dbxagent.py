@@ -172,6 +172,29 @@ class DbxAgent:
     def cpu_run(self) -> dict:
         return self.call("cpu.run")
 
+    def cpu_step(self) -> dict:
+        """Single-step one instruction (trace into). The CPU must be paused.
+
+        Returns ``{regs, cs_ip, insn}``: ``regs`` is the post-step register
+        snapshot (same shape as ``regs_get``), ``cs_ip`` the new CS:EIP, and
+        ``insn`` the disassembly (``{cs_ip, bytes, text}``) of the instruction
+        now at CS:IP. Errors ``bad_state`` if the CPU is not paused.
+        """
+        return self.call("cpu.step")
+
+    def cpu_step_over(self, timeout: float = 10.0) -> dict:
+        """Step over one instruction, treating CALL/INT/LOOP/REP as one unit.
+
+        Same ``{regs, cs_ip, insn}`` result shape as ``cpu_step``. For a
+        CALL/INT/LOOP/REP the CPU resumes to a temporary breakpoint at the
+        return address (you will see bp.hit / debugger.entered / state.paused
+        events meanwhile); the reply still arrives on this request id, so the
+        call blocks transparently. A larger default timeout covers the body
+        run. Errors ``bad_state`` (not paused) or ``busy`` (one already in
+        flight — wait for it, or cpu.pause to bail out).
+        """
+        return self.call("cpu.step_over", timeout=timeout)
+
     def regs_get(self) -> dict:
         """Snapshot all CPU registers in one structured reply.
 

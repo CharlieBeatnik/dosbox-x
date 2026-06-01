@@ -564,6 +564,125 @@ def phase6_multi_sentinel(agent, cs, msa, msb, rep) -> None:
             agent.cpu_run(); _drain_events(agent)
 
 
+def _off_of(cs_ip: str) -> int:
+    """Return the offset half of a "SEG:OFF" string as an int (masked to 16 bits
+    so the step result's 32-bit EIP rendering compares against a real-mode
+    landmark offset)."""
+    _, _, off_s = (cs_ip or "").partition(":")
+    return int(off_s, 16) & 0xFFFF if off_s else -1
+
+
+def phase7_step(agent, cs, trace_a, trace_end, call_at, call_ret, sub, rep) -> None:
+    # 7a: cpu.step is single-instruction granular and returns post-step regs +
+    # the instruction now at CS:IP. Walk the phase-3 straight-line chain
+    #   mov ax,AAAA / mov bx,BBBB / mov dx,DDDD / xchg ax,bx / inc ax / dec bx
+    # one instruction at a time, asserting each register transition and that
+    # every step's `insn.bytes` equals mem.read of the reported address.
+    name = "phase7a: cpu.step single-steps with post-step regs + insn"
+    try:
+        _reset(agent)
+        agent.debugger_command(f"BP {cs:04X}:{trace_a:04X}")
+        agent.cpu_run(); _drain_events(agent)
+        agent.keyboard_tap("3")
+        _wait_for_event(agent, "bp.hit", timeout=8.0)
+
+        problems = []
+
+        def do_step():
+            r = agent.call("cpu.step")
+            for k in ("regs", "cs_ip", "insn"):
+                if k not in r:
+                    problems.append(f"step result missing {k!r}: {r}")
+            insn = r.get("insn", {})
+            gotbytes = (insn.get("bytes") or "").upper().split()
+            csip = insn.get("cs_ip", "")
+            if gotbytes and csip:
+                seg_s, _, off_s = csip.partition(":")
+                mem = agent.mem_read("seg:off", f"{seg_s}:{off_s}", len(gotbytes))
+                if [f"{x:02X}" for x in mem] != gotbytes:
+                    problems.append(f"@{csip} insn.bytes {gotbytes} != mem")
+            return r["regs"], _off_of(r.get("cs_ip", ""))
+
+        regs, off = do_step()                      # after mov ax,AAAA
+        if regs["eax"] & 0xFFFF != 0xAAAA:
+            problems.append(f"after step1 eax={regs['eax']:#x} (want low AAAA)")
+        regs, off = do_step()                      # after mov bx,BBBB
+        if regs["ebx"] & 0xFFFF != 0xBBBB:
+            problems.append(f"after step2 ebx={regs['ebx']:#x} (want low BBBB)")
+        regs, off = do_step()                      # after mov dx,DDDD
+        if regs["edx"] & 0xFFFF != 0xDDDD:
+            problems.append(f"after step3 edx={regs['edx']:#x} (want low DDDD)")
+        regs, off = do_step()                      # after xchg ax,bx
+        if regs["eax"] & 0xFFFF != 0xBBBB or regs["ebx"] & 0xFFFF != 0xAAAA:
+            problems.append(f"after xchg eax={regs['eax']:#x} ebx={regs['ebx']:#x}")
+        regs, off = do_step()                      # after inc ax
+        if regs["eax"] & 0xFFFF != 0xBBBC:
+            problems.append(f"after inc ax eax={regs['eax']:#x} (want low BBBC)")
+        regs, off = do_step()                      # after dec bx -> now at trace_end
+        if regs["ebx"] & 0xFFFF != 0xAAA9:
+            problems.append(f"after dec bx ebx={regs['ebx']:#x} (want low AAA9)")
+        if off != trace_end:
+            problems.append(f"landed at {off:04X}, expected trace_end {trace_end:04X}")
+
+        if problems:
+            rep.record(name, False, "; ".join(problems[:4]))
+        else:
+            rep.record(name, True, "6 steps; reg transitions + insn.bytes verified")
+    except Exception as exc:
+        rep.record(name, False, repr(exc))
+    finally:
+        with contextlib.suppress(Exception):
+            agent.cpu_pause(); _drain_events(agent)
+            agent.debugger_command("BPDEL 0 *")
+            agent.cpu_run(); _drain_events(agent)
+
+    # 7b: at the SAME known CALL, cpu.step descends into the subroutine
+    # (lands at landmark_sub) while cpu.step_over treats the call as one unit
+    # (lands at landmark_call_ret). step_over of a CALL is the asynchronous,
+    # deferred-reply path: agent.call() still returns the post-step {regs}.
+    name = "phase7b: cpu.step into vs cpu.step_over over a CALL"
+    try:
+        problems = []
+
+        # step into the call
+        _reset(agent)
+        agent.debugger_command(f"BP {cs:04X}:{call_at:04X}")
+        agent.cpu_run(); _drain_events(agent)
+        agent.keyboard_tap("7")
+        _wait_for_event(agent, "bp.hit", timeout=8.0)
+        r = agent.call("cpu.step")
+        into = _off_of(r.get("cs_ip", ""))
+        if into != sub:
+            problems.append(f"cpu.step landed at {into:04X}, expected sub {sub:04X}")
+
+        # step over the call (fresh hit at the same CALL)
+        _reset(agent)
+        agent.debugger_command(f"BP {cs:04X}:{call_at:04X}")
+        agent.cpu_run(); _drain_events(agent)
+        agent.keyboard_tap("7")
+        _wait_for_event(agent, "bp.hit", timeout=8.0)
+        r = agent.call("cpu.step_over")
+        over = _off_of(r.get("cs_ip", ""))
+        if over != call_ret:
+            problems.append(
+                f"cpu.step_over landed at {over:04X}, expected call_ret {call_ret:04X}")
+        if "regs" not in r:
+            problems.append(f"step_over result missing regs: {r}")
+
+        if problems:
+            rep.record(name, False, "; ".join(problems[:4]))
+        else:
+            rep.record(name, True,
+                       f"step->sub {sub:04X}, step_over->call_ret {call_ret:04X}")
+    except Exception as exc:
+        rep.record(name, False, repr(exc))
+    finally:
+        with contextlib.suppress(Exception):
+            agent.cpu_pause(); _drain_events(agent)
+            agent.debugger_command("BPDEL 0 *")
+            agent.cpu_run(); _drain_events(agent)
+
+
 def run(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dosbox", default=str(DEFAULT_DOSBOX))
@@ -597,14 +716,16 @@ def run(argv=None) -> int:
 
             cs = _read_signature(agent)
             print(f"OBSTEST.COM CS=0x{cs:04X}", flush=True)
-            tbl = agent.mem_read("seg:off", f"{cs:04X}:0103", 22)
+            tbl = agent.mem_read("seg:off", f"{cs:04X}:0103", 28)
             (loopbody, disasm, trace_a, trace_end, iters, disasm_end,
-             watch_target, store, vga_store, msa, msb) = struct.unpack("<11H", tbl)
+             watch_target, store, vga_store, msa, msb,
+             call_at, call_ret, sub) = struct.unpack("<14H", tbl)
             print(f"landmarks: loopbody={loopbody:04X} disasm={disasm:04X} "
                   f"trace_a={trace_a:04X} trace_end={trace_end:04X} iters={iters} "
                   f"disasm_end={disasm_end:04X} watch_target={watch_target:04X} "
                   f"store={store:04X} vga_store={vga_store:04X} "
-                  f"msa={msa:04X} msb={msb:04X}", flush=True)
+                  f"msa={msa:04X} msb={msb:04X} "
+                  f"call={call_at:04X} call_ret={call_ret:04X} sub={sub:04X}", flush=True)
 
             phase1_probe_and_counters(agent, cs, loopbody, iters, rep)
             phase2_disasm(agent, cs, disasm, disasm_end, rep)
@@ -612,6 +733,7 @@ def run(argv=None) -> int:
             phase4_memwatch(agent, cs, watch_target, store, rep)
             phase5_vga_memwatch(agent, cs, vga_store, rep)
             phase6_multi_sentinel(agent, cs, msa, msb, rep)
+            phase7_step(agent, cs, trace_a, trace_end, call_at, call_ret, sub, rep)
 
             with contextlib.suppress(Exception):
                 _reset(agent)

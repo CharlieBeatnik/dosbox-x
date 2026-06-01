@@ -77,6 +77,13 @@ void DEBUG_AgentForEachBreakpoint(
  * textsz==0). Honours the current code-segment operand size. */
 int DEBUG_AgentDisasmOne(uint16_t seg, uint32_t off, char *text, size_t textsz);
 
+/* Single-step the guest from the agent dispatch (proposal 4.9.7). `over`
+ * false = trace into (one instruction); true = step over CALL/INT/LOOP/REP.
+ * Returns 0 if the CPU is not paused, 1 if it stepped one instruction and is
+ * still paused (read regs now), 2 if it launched an asynchronous step-over of
+ * a CALL/INT/LOOP/REP (the pause arrives later, via AGENT_OnDebuggerPaused). */
+int DEBUG_AgentStep(bool over);
+
 #ifdef C_HEAVY_DEBUG
 bool DEBUG_HeavyIsBreakpoint(void);
 void DEBUG_HeavyWriteLogInstruction(void);

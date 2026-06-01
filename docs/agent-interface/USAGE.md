@@ -29,8 +29,10 @@ Not available — see "What is **not** capturable" below for the full list,
 but the headlines are: anything the curses debugger draws into a pane
 (register pane, disassembly pane, hex/ASCII data pane) is invisible to
 the agent. `MEMDUMP` writes a file on disk rather than returning bytes
-inline. Mouse input, screenshots, and typed breakpoint/step commands are
-planned for Phase 2.
+inline. Single-stepping *is* available with structured output
+(`cpu.step` / `cpu.step_over`, below); mouse input and typed breakpoint
+commands are still planned for Phase 2. (Screenshots are available via
+`screen.capture`.)
 
 ## Requirements
 
@@ -115,6 +117,8 @@ events don't. The reference client does this in a single reader thread.
 | `debugger.command`  | `{text}`                      | `{output, recognized}`              |
 | `cpu.pause`         | none                          | `{}`                                |
 | `cpu.run`           | none                          | `{}`                                |
+| `cpu.step`          | none                          | `{regs, cs_ip, insn}` (paused only) |
+| `cpu.step_over`     | none                          | `{regs, cs_ip, insn}` (paused only) |
 | `keyboard.type`     | `{text}`                      | `{queued}` (byte count)             |
 | `keyboard.press`    | `{key}`                       | `{}`                                |
 | `keyboard.release`  | `{key}`                       | `{}`                                |
@@ -739,6 +743,60 @@ the same `DasmI386` the curses debugger uses. `bytes` is the exact raw encoding
 mnemonic — removing the unsafe hand-decode the X2RE TOOL MANDATE warns against.
 Operand size follows the current code segment (`cpu.code.big`).
 
+### `cpu.step` / `cpu.step_over` — structured single-step (4.9.7)
+
+Walk a suspect dispatch one instruction at a time and *see* where control goes
+— the precise, deterministic alternative to arming a watch and hoping it fires.
+Both **require the CPU to be paused** (`cpu.pause`, or stopped at a breakpoint);
+they reply `bad_state` otherwise. Both take no arguments.
+
+```json
+{"id":1,"cmd":"cpu.step"}
+  → {"regs":{"eax":43690,"ebx":48059, … ,"eflags":518},
+     "cs_ip":"0814:0000017D",
+     "insn":{"cs_ip":"0814:017D","bytes":"BB BB BB","text":"mov bx,0xbbbb"}}
+```
+
+- **`regs`** is the full post-step register snapshot — exactly the `regs.get`
+  shape (all GPRs + segregs + EIP + EFLAGS). This is the "where did the value
+  go?" answer after the instruction retired.
+- **`cs_ip`** is the new `CS:EIP` (`%04X:%08X`), i.e. where the CPU is *now*.
+- **`insn`** is the disassembly of the instruction now at `CS:IP` — the one
+  about to execute — as `{cs_ip, bytes, text}` (same row shape as `cpu.disasm`;
+  `bytes` always agrees with `mem.read`).
+
+`cpu.step` is **trace into**: it runs exactly one instruction. Stepping a
+`CALL`/`INT` descends into the target; the result shows you landed at the
+callee's entry point.
+
+`cpu.step_over` is **step over**: for a `CALL`/`INT`/`LOOP`/`REP` it treats the
+whole thing as one unit (it sets a temporary breakpoint at the return address,
+runs the body, and stops when control comes back), so the result is the
+instruction *after* the call rather than the callee's first instruction. For any
+other instruction `cpu.step_over` behaves identically to `cpu.step`.
+
+Stepping over a `CALL`/`INT`/`LOOP`/`REP` resumes the CPU until the temporary
+breakpoint fires, so while it runs you will also see the usual `bp.hit` →
+`debugger.entered` → `state.paused` events on the stream (the `bp.hit` is for
+the internal temporary breakpoint). The command's `{regs, …}` reply still
+arrives synchronously to your `cpu.step_over` request id — the reference client
+blocks transparently until it does.
+
+Caveats:
+- **`bad_state`** — the CPU was not paused. Call `cpu.pause` (or wait for a
+  breakpoint) first.
+- **`busy`** — a previous `cpu.step_over` is still running (the CPU is resuming
+  to its temporary breakpoint). Wait for that reply, or issue `cpu.pause` to
+  bail out (the pause delivers the pending reply with the state at that stop).
+- If a step-over's called routine never returns (infinite loop, or it exits the
+  program) the temporary breakpoint never fires; recover with `cpu.pause`, which
+  stops the CPU and delivers the deferred reply with the current state.
+- If a *different* breakpoint fires inside the stepped-over call, that stop wins
+  — the `cpu.step_over` reply reflects the state there (the same behaviour the
+  curses `P` step has).
+- `from`/disassembly text needs no special build, but like the other 4.9 tools
+  this is a debug-build-only feature.
+
 ### `mem.watch` — write-intercept that names the storing instruction
 
 ```json
@@ -812,8 +870,8 @@ through the agent:
   pane all draw directly to ncurses windows. Their contents never go
   through `DEBUG_ShowMsg` and so produce empty `output` when their
   setter command is invoked over the agent. Use `regs.get` / `mem.read`
-  instead. There is no Phase-1 disassembly command; if you need one,
-  Phase 2 adds `disasm` via `DasmI386` directly.
+  instead — and for disassembly use `cpu.disasm` (proposal 4.9.6), which
+  feeds `DasmI386` directly and returns structured rows.
 - **Pane-setter commands.** `D`, `DV`, `DP` (data overview),
   `C` (code overview), `SHOWWIN`/`HIDEWIN`, `MOVEWINDN`/`MOVEWINUP`
   only mutate which curses window shows what. They reply with a short
@@ -824,10 +882,11 @@ through the agent:
   `LOG`/`LOGS`/`LOGL`/`LOGC` write CPU trace logs to disk. The agent
   sees only a one-line "success" message. Use `mem.read` for byte
   access.
-- **Single-stepping with structured output.** `T`/`P` step commands
-  exist in `ParseCommand`, but the resulting register/code-view refresh
-  goes to the curses panes. Phase 2's `cpu.step` / `cpu.step_over`
-  will return structured state.
+- **Single-stepping with structured output.** The curses `T`/`P` keys
+  refresh the register/code-view panes, which the agent can't read — but
+  you do **not** need them: `cpu.step` / `cpu.step_over` (proposal 4.9.7,
+  documented above) return the post-step register snapshot, `CS:IP`, and
+  the disassembly of the now-current instruction directly.
 - **The `R` register-dump command.** It doesn't exist in
   `ParseCommand` at all (the curses key `R` is a UI handler). Use
   `regs.get`.

@@ -6,12 +6,102 @@ Leave-behind for the next agent continuing the **proposal-4.9** work on the
 Source proposal:
 `X2RE/.claude/notes/dosbox-x-fixes/PROPOSAL_4.9_observability_and_trust.md`.
 
-## What shipped this iteration (4.9.5 — multi-sentinel watches)
+## What shipped this iteration (4.9.7 — `cpu.step` / `cpu.step_over`)
 
-`farcall.watch`, `cpu.watch_target`, and `cpu.watch_range` now each hold a
-**set** of sentinels instead of a single one, and every emitted event carries
-a `which` index naming the sentinel that fired. Built, 104 unit tests pass,
-and verified end-to-end (a new OBSTEST phase 6). 4.9.5 complete.
+Structured single-step: `cpu.step` (trace into) and `cpu.step_over` (treat
+`CALL`/`INT`/`LOOP`/`REP` as one unit). Each returns the post-step register
+snapshot, the new `CS:IP`, and the disassembly of the now-current instruction —
+so you can walk a suspect dispatch one instruction at a time and *see* where a
+stale pointer sends control, instead of arming a watch and hoping it fires.
+Built, **107 unit tests pass**, and verified end-to-end (a new OBSTEST phase 7).
+4.9.7 complete.
+
+| # | Item | Proves | Status |
+|---|------|--------|--------|
+| 4.9.7 | `cpu.step` / `cpu.step_over` → `{regs, cs_ip, insn}` | "where does control go from here, one instruction at a time?" deterministically | ✅ |
+
+### Design / code map
+
+- **The step itself is a debug.cpp bridge** — `int DEBUG_AgentStep(bool over)`
+  (`src/debug/debug.cpp`, placed right after `DEBUG_Run`; declared in
+  `include/debug.h`). It mirrors the curses **F11** (trace into) and **F10**
+  (step over) key handlers exactly, just driven from the agent dispatch instead
+  of a keypress. The agent dispatch runs from `AGENT_Poll(true)` inside
+  `DEBUG_Loop`'s paused branch — the *same* call-stack depth `DEBUG_CheckKeys`
+  runs at — so a direct `DEBUG_Run(1,…)` here nests precisely as the key
+  handlers do. Return codes: `0` not paused, `1` stepped one instruction (still
+  paused — read regs now), `2` launched an async step-over.
+- **Why step-over is asynchronous (and why that's correct).** DOSBox's loop
+  model re-reads the global `loop` pointer every `DOSBOX_RunMachine` do-while
+  iteration, so curses step-over (and the agent's) doesn't *block*: `StepOver()`
+  sets a temporary breakpoint at the return address, `DEBUG_Run(1,false)` runs
+  the `CALL` itself and `DOSBOX_SetNormalLoop()`s, and the next loop iteration
+  runs the body at full speed until the temp BP fires and re-enters the
+  debugger. There is no clean way to make that synchronous without
+  re-implementing the machine loop, so the reply is **deferred** — the same
+  pattern `screen.capture` already uses.
+- **Deferred reply plumbing.** `handleCpuStepOver` (`agent_cpu.cpp`) returns
+  `""` (rc==2) so the protocol layer queues no immediate reply, after stashing
+  `g_stepOverPending`/`g_stepOverId` (defined in `agent.cpp`). When the temp BP
+  fires, `DEBUG_EnableDebugger` (after emitting `debugger.entered`/`state.paused`)
+  calls the new `AGENT_OnDebuggerPaused()` (`agent.cpp`), which sends the
+  deferred `{regs, cs_ip, insn}` reply on the stashed id and clears the slot.
+  If a *different* breakpoint (or a manual `cpu.pause`) settles the pause first,
+  the reply is sent there — same as the curses `P` behaviour — so the slot never
+  sticks. A second `cpu.step_over` while one is pending returns `busy`.
+- **Result builder shared with `regs.get`.** `buildRegs()` (the 16-register
+  object, refactored out of `handleRegsGet`) and `buildStepResult()` (`{regs,
+  cs_ip, insn}`) live in `agent_cpu.cpp`; the deferred path in `agent.cpp` calls
+  `buildStepResult()` too, so the synchronous and deferred replies are
+  byte-identical in shape. `insn` reuses the `cpu.disasm` row shape
+  (`DEBUG_AgentDisasmOne` + a local `phys_readb` hex dump).
+- **The trace-into callback case.** If a single step lands on a DOSBox callback
+  trampoline opcode, `DEBUG_Run` returns the callback index; `DEBUG_AgentStep`
+  dispatches `CallBack_Handlers[ret]` exactly as `DEBUG_CheckKeys` does, so the
+  BIOS/DOS service actually runs. `skipFirstInstruction` (set by `DEBUG_Run`)
+  means stepping off a breakpoint doesn't immediately re-trigger it.
+- **Dispatch.** Two cases in `agent.cpp`: `cpu.step` → `jsonEncode(handleCpuStep)`
+  (always synchronous), `cpu.step_over` → `handleCpuStepOver` directly (may
+  return `""`, like `screen.capture`). `include/agent.h` gained
+  `AGENT_OnDebuggerPaused` (+ the `#else` no-op).
+
+### Reply shape
+
+```json
+{"regs":{"eax":…, "ebx":…, …, "eflags":…},
+ "cs_ip":"0814:0000017D",
+ "insn":{"cs_ip":"0814:017D","bytes":"BB BB BB","text":"mov bx,0xbbbb"}}
+```
+
+`regs` is the exact `regs.get` shape; `cs_ip` is the post-step `%04X:%08X`;
+`insn` is the instruction *now at* `CS:IP` (about to execute). Errors:
+`bad_state` (not paused), `busy` (a step-over is already in flight).
+
+### Tests
+
+- **`tests/agent_observability_tests.cpp`** — 3 new gTests. The step itself runs
+  guest instructions through `DEBUG_Run`, which needs a paused CPU + initialised
+  core (MemBase), neither of which exist in `-tests` mode; so these exercise the
+  *gate*: `cpu.step` / `cpu.step_over` are routed and cleanly refuse with
+  `bad_state` (the CPU is never paused in test mode), and a `cpu.step_over` while
+  `g_stepOverPending` is set returns `busy` without clobbering the in-flight id.
+  **107 Agent gTests total, all pass.** The real stepping is covered live.
+- **`tests/agent_live/obstest.asm` + `OBSTEST.COM` (rebuilt)** — Phase 7: a
+  single known NEAR `call near ptr landmark_sub`. Landmark table grew to 14
+  entries (`+22` call, `+24` call_ret, `+26` sub). **`test_observability.py`**
+  Phase 7 has two checks: **7a** parks a BP at the phase-3 trace chain and
+  single-steps the six `mov`/`xchg`/`inc`/`dec` instructions, asserting each
+  register transition (eax→AAAA, ebx→BBBB, … after xchg eax↔ebx, inc, dec) and
+  that every step's `insn.bytes` equals `mem.read`; **7b** at the known `CALL`
+  asserts `cpu.step` lands at `landmark_sub` (descends) while `cpu.step_over`
+  lands at `landmark_call_ret` (steps over) — the latter exercising the deferred
+  async reply. **All 9 phases pass.**
+
+## Previously shipped (4.9.5 — multi-sentinel watches)
+
+`farcall.watch`, `cpu.watch_target`, and `cpu.watch_range` each hold a **set**
+of sentinels instead of a single one, and every emitted event carries a `which`
+index naming the sentinel that fired.
 
 | # | Item | Proves | Status |
 |---|------|--------|--------|
@@ -49,7 +139,7 @@ and verified end-to-end (a new OBSTEST phase 6). 4.9.5 complete.
   no-op stubs in `include/agent.h` are unchanged (the public signatures of the
   matchers/setters/emitters didn't change).
 
-### Build note (read this — it bit this iteration)
+### Build note (read this — it bit a prior iteration)
 
 `src/debug/debug.cpp` has grown (via the 4.9 agent hooks) past the COFF
 `/JMC` section limit and now fails `C1128: number of sections exceeded
@@ -307,23 +397,39 @@ python tests/agent_live/test_observability.py
 
 ## Not done / deferred (pick up here, in proposal priority order)
 
-- **4.9.4 and 4.9.5 are now complete.** Next items:
-- **4.9.7 `cpu.step` / `cpu.step_over`** — structured single-step returning the
-  post-step `regs.get` snapshot. (NOTES' suggested alternative if 4.9.5 had
-  ballooned — it didn't, so this is simply the next item.)
+- **4.9.4, 4.9.5 and 4.9.7 are now complete.** Next items:
 - **4.9.8 `state.save` / `state.restore`** — agent entry points into the
-  existing savestate subsystem for deterministic, instant iteration.
+  existing savestate subsystem for deterministic, instant iteration. This is the
+  recommended next item (highest remaining proposal value: kills the ~25 s
+  re-drive to the bug window and makes runs deterministic).
 - **4.9.9 conditional / Nth-hit BP + on-hit command macro** — `bp.set {if, do,
   continue}`. Pairs with the per-BP hit counter already added (`hits==N`
   conditions are now cheap).
+
+### Notes for whoever does 4.9.8 / a future step refinement
+
+- **`cpu.step_over` reason on the temp-BP `bp.hit`.** A step-over of a CALL
+  emits a `bp.hit` for its *internal* temporary breakpoint (whatever `bp_index`
+  it happens to occupy). Accurate but a touch noisy; a future iteration could
+  tag it or suppress it. Not worth it until a consumer complains.
+- **Step-over of a routine that never returns** (infinite loop / program exit)
+  leaves `g_stepOverPending` set with the CPU running; `cpu.pause` recovers it
+  (the pause delivers the deferred reply). Documented in USAGE.md. There's no
+  watchdog timeout on the step-over the way `screen.capture` has one — add one
+  only if a real consumer hits this.
+- **`cpu.step` callback dispatch** mirrors `DEBUG_CheckKeys` (dispatch
+  `CallBack_Handlers[ret]` when the stepped opcode is a callback trampoline). If
+  a future change makes single-stepping into protected-mode callbacks misbehave,
+  that's the line to look at (`DEBUG_AgentStep`, the `ret > 0` branch).
 
 ### Smaller follow-ups
 
 - **`Makefile.am`** not updated for `agent_observe.cpp` — only the VS project
   was. A Linux/macOS build needs the agent TU list updated; verify on a Unix
   host.
-- **`contrib/agent-client/dbxagent.py`** has no typed wrappers for the new
-  commands yet (clients use `call("debug.status")` etc.). Add `debug_status()`,
+- **`contrib/agent-client/dbxagent.py`** now has typed wrappers for the 4.9.7
+  commands (`cpu_step()`, `cpu_step_over()`), but still not for the earlier 4.9
+  commands — clients use `call("debug.status")` etc. Add `debug_status()`,
   `cpu_probe()`, `cpu_trace_ring()`, `cpu_traceback()`, `cpu_disasm()` when
   convenient.
 - **Heavy-debug only:** `cpu.probe` and `cpu.trace_ring` rely on
@@ -347,6 +453,10 @@ python tests/agent_live/test_observability.py
 - 4.9.5 "which of N watched targets fired" → phase6 (two-sentinel
   `cpu.watch_target`: `cpu.transfer` `which==0` for `landmark_msa`, `which==1`
   for `landmark_msb`; per-sentinel `hits` in `debug.status`).
+- 4.9.7 "walk a dispatch one instruction at a time" → phase7a (six `cpu.step`s
+  through the trace chain with verified per-instruction register transitions)
+  and phase7b (`cpu.step` descends into a `CALL` → `landmark_sub`;
+  `cpu.step_over` treats it as one unit → `landmark_call_ret`).
 - 4.9.8 acceptance test deferred with that item.
 
 ## Environment note

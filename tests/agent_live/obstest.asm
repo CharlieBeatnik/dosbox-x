@@ -64,6 +64,13 @@
 ;        events carry which==0 then which==1, with one hit per sentinel in
 ;        debug.status. Proves the proposal-4.9.5 multi-sentinel `which` field.
 ;
+;   '7'  Phase 7 (cpu.step / cpu.step_over, 4.9.7): a single known NEAR call.
+;        The driver parks a BP at landmark_call, taps '7', and then: cpu.step
+;        must land at landmark_sub (single-step descends into the call) while
+;        cpu.step_over must land at landmark_call_ret (the call is treated as
+;        one unit). Single-step register granularity is proven separately on
+;        the phase-3 trace chain. Proves the proposal-4.9.7 structured step.
+;
 ;   'q'  Exit cleanly via INT 21h AH=4Ch.
 ;
 ; All phases return to main_loop so the driver can run them in any order and
@@ -82,7 +89,7 @@ code    segment
 start:  jmp     near ptr setup          ; 3 bytes -> table at 103h
 
 ; ---- Landmarks table -- fixed offset 103h --------------------------------
-; The driver reads (9) 16-bit offsets here with one mem.read at CS:0103.
+; The driver reads (14) 16-bit offsets here with one mem.read at CS:0103.
 landmarks_table:
         dw      landmark_loopbody       ; +0  probe / BP / hit-counter target
         dw      landmark_disasm         ; +2  cpu.disasm target (never executed)
@@ -95,6 +102,9 @@ landmarks_table:
         dw      landmark_vga_store      ; +16 the VGA storing instruction (phase 5)
         dw      landmark_msa            ; +18 multi-sentinel target A (phase 6)
         dw      landmark_msb            ; +20 multi-sentinel target B (phase 6)
+        dw      landmark_call           ; +22 the NEAR call instruction (phase 7)
+        dw      landmark_call_ret       ; +24 instruction after the call (step_over)
+        dw      landmark_sub            ; +26 subroutine entry (step lands here)
 
 ; ---- Variables -----------------------------------------------------------
 loopcount       dw      0
@@ -136,8 +146,12 @@ chk_5:
         jmp     phase5                  ; near jmp: phase5 is out of je's rel8 range
 chk_6:
         cmp     al, '6'
-        jne     chk_q
+        jne     chk_7
         jmp     phase6                  ; near jmp: phase6 is out of je's rel8 range
+chk_7:
+        cmp     al, '7'
+        jne     chk_q
+        jmp     phase7                  ; near jmp: phase7 is out of je's rel8 range
 chk_q:
         cmp     al, 'q'
         je      do_exit
@@ -233,6 +247,25 @@ landmark_msa:
         retn
 landmark_msb:
         nop                             ; <- watch_target sentinel 1 (which==1)
+        retn
+
+; ---- Phase 7: known NEAR call (cpu.step / cpu.step_over, 4.9.7) -----------
+; A single NEAR call whose instruction address (landmark_call), return address
+; (landmark_call_ret) and subroutine entry (landmark_sub) are all in the
+; landmark table. With a BP parked at landmark_call: cpu.step lands at
+; landmark_sub (step descends into the call); cpu.step_over lands at
+; landmark_call_ret (the whole call is one unit). The subroutine is a couple of
+; NOPs + RETN so step-over has a real body to run through before the temp BP
+; at the return address fires.
+phase7:
+landmark_call:
+        call    near ptr landmark_sub
+landmark_call_ret:
+        mov     ax, 7777h
+        jmp     main_loop
+landmark_sub:
+        nop
+        nop
         retn
 
 ; ---- Clean exit ----------------------------------------------------------

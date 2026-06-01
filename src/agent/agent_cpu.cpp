@@ -31,10 +31,13 @@
 
 #include "agent_internal.h"
 
+#include "dosbox.h"
 #include "mem.h"
 #include "regs.h"
+#include "debug.h"          /* DEBUG_AgentStep, DEBUG_AgentDisasmOne */
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -105,11 +108,25 @@ bool parseSegOff(const std::string &s, uint32_t &seg, uint32_t &off) {
         && parseHexU32(s.substr(colon + 1), off);
 }
 
-}  /* anonymous namespace */
+/* Render `len` real-mode bytes at seg:off as space-separated uppercase hex
+ * ("B8 34 12"). phys_readb matches mem.read's "physical" semantics (no
+ * paging, OOB returns 0xFF); for real-mode code physical == linear. */
+std::string bytesHex(uint16_t seg, uint16_t off, int len) {
+    std::string out;
+    uint32_t base = uint32_t(seg) << 4;
+    for (int k = 0; k < len; ++k) {
+        if (k) out.push_back(' ');
+        uint8_t b = phys_readb(PhysPt(base + uint16_t(off + k)));
+        char hb[3];
+        snprintf(hb, sizeof(hb), "%02X", b);
+        out.append(hb);
+    }
+    return out;
+}
 
-/* ---- regs.get --------------------------------------------------------- */
-
-JsonValue handleRegsGet(double id, const JsonValue & /*args*/) {
+/* The 16 architectural registers, as one JSON object. Shared by regs.get and
+ * the cpu.step / cpu.step_over result so a client parses one register shape. */
+JsonObject buildRegs(void) {
     JsonObject r;
     r.emplace("eax", JsonValue::makeNumber(double(reg_eax)));
     r.emplace("ebx", JsonValue::makeNumber(double(reg_ebx)));
@@ -127,7 +144,84 @@ JsonValue handleRegsGet(double id, const JsonValue & /*args*/) {
     r.emplace("gs",  JsonValue::makeNumber(double(SegValue(gs))));
     r.emplace("ss",  JsonValue::makeNumber(double(SegValue(ss))));
     r.emplace("eflags", JsonValue::makeNumber(double(reg_flags)));
-    return makeReplyOk(id, std::move(r));
+    return r;
+}
+
+}  /* anonymous namespace */
+
+/* ---- regs.get --------------------------------------------------------- */
+
+JsonValue handleRegsGet(double id, const JsonValue & /*args*/) {
+    return makeReplyOk(id, buildRegs());
+}
+
+/* ---- cpu.step / cpu.step_over (4.9.7) --------------------------------- */
+
+/* {regs:{...}, cs_ip:"SEG:EIP", insn:{cs_ip,bytes,text}} for the *current*
+ * (post-step) CPU state. The insn is the instruction now at CS:IP — i.e. the
+ * one about to execute — so a client walking a dispatch sees where control
+ * landed and what runs next. Reads live state, so call it after the step. */
+JsonObject buildStepResult(void) {
+    uint16_t seg = SegValue(cs);
+    uint16_t off = uint16_t(reg_eip);
+
+    JsonObject r;
+    r.emplace("regs", JsonValue::makeObject(buildRegs()));
+
+    char csip[24];
+    snprintf(csip, sizeof(csip), "%04X:%08X", unsigned(seg), unsigned(reg_eip));
+    r.emplace("cs_ip", JsonValue::makeString(csip));
+
+    char text[200];
+    int len = DEBUG_AgentDisasmOne(seg, off, text, sizeof(text));
+    if (len < 1)  len = 1;
+    if (len > 16) len = 16;
+    JsonObject insn;
+    char icsip[24];
+    snprintf(icsip, sizeof(icsip), "%04X:%04X", unsigned(seg), unsigned(off));
+    insn.emplace("cs_ip", JsonValue::makeString(icsip));
+    insn.emplace("bytes", JsonValue::makeString(bytesHex(seg, off, len)));
+    insn.emplace("text",  JsonValue::makeString(text));
+    r.emplace("insn", JsonValue::makeObject(std::move(insn)));
+    return r;
+}
+
+JsonValue handleCpuStep(double id, const JsonValue & /*args*/) {
+    /* DEBUG_AgentStep(false) returns 0 if the CPU isn't paused, else 1 after
+     * executing exactly one instruction (still paused). */
+    if (DEBUG_AgentStep(false) == 0)
+        return makeReplyError(id, "bad_state",
+            "cpu.step requires the CPU to be paused (call cpu.pause first)");
+    return makeReplyOk(id, buildStepResult());
+}
+
+std::string handleCpuStepOver(double id, const JsonValue & /*args*/) {
+    /* Reject a second step-over while one is still running (the CPU is resuming
+     * to a temp BP and `debugging` is false, so a new one couldn't proceed
+     * anyway). A client that wants to bail out of a stuck step-over should send
+     * cpu.pause — that pause delivers the pending reply and frees the slot. */
+    if (g_stepOverPending)
+        return jsonEncode(makeReplyError(id, "busy",
+            "a cpu.step_over is already in progress (wait for its reply, or cpu.pause)"));
+
+    /* Mark a step-over pending before launching: for a CALL/INT/LOOP/REP the
+     * step is asynchronous (temp BP + resume) and the reply is deferred to
+     * AGENT_OnDebuggerPaused. Setting the slot first is safe because the CPU
+     * cannot reach that pause until this handler returns (single-threaded;
+     * the normal loop only runs on the next DEBUG_Loop iteration). */
+    g_stepOverPending = true;
+    g_stepOverId = id;
+
+    int rc = DEBUG_AgentStep(true);
+    if (rc == 2)
+        return std::string();          /* deferred — reply on the temp-BP pause */
+
+    /* Synchronous outcome — clear the slot and reply now. */
+    g_stepOverPending = false;
+    if (rc == 0)
+        return jsonEncode(makeReplyError(id, "bad_state",
+            "cpu.step_over requires the CPU to be paused (call cpu.pause first)"));
+    return jsonEncode(makeReplyOk(id, buildStepResult()));
 }
 
 /* ---- mem.read --------------------------------------------------------- */

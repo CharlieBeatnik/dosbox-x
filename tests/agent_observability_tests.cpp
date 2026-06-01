@@ -70,6 +70,7 @@ public:
         dispatchLine("{\"id\":99,\"cmd\":\"cpu.trace_ring\",\"args\":{\"depth\":256}}");
         dispatchLine("{\"id\":99,\"cmd\":\"cpu.trace_ring\",\"args\":{\"enabled\":false}}");
         dispatchLine("{\"id\":99,\"cmd\":\"mem.unwatch\"}");
+        g_stepOverPending = false;   /* no cpu.step_over (4.9.7) in flight */
         /* Clear the BP list so debug.status never reads bytes_now (no MemBase). */
         dispatchLine("{\"id\":99,\"cmd\":\"debugger.command\",\"args\":{\"text\":\"BPDEL 0 *\"}}");
     }
@@ -722,6 +723,50 @@ TEST_F(AgentObservabilityTest, MemWatchMatchNoOldFalseWhenDisarmed)
 {
     EXPECT_FALSE(AGENT_memWatchArmed);
     EXPECT_FALSE(AGENT_MemWatchMatchNoOld(0xA0010, 0x5A, 1));
+}
+
+/* ---- cpu.step / cpu.step_over (4.9.7) -------------------------------- */
+/* The step itself runs guest instructions through DEBUG_Run, which needs a
+ * paused CPU and an initialised memory/core (MemBase). In -tests mode the
+ * debugger is never entered, so the gate (DEBUG_AgentStep returning 0 because
+ * `debugging` is false) is what we exercise here: both commands are routed and
+ * cleanly refuse with bad_state instead of touching the uninitialised core.
+ * The actual single-step / step-over behaviour is covered live by
+ * tests/agent_live/test_observability.py phase 7. */
+
+TEST_F(AgentObservabilityTest, CpuStepRequiresPause)
+{
+    JsonValue v = parse(dispatchLine("{\"id\":7,\"cmd\":\"cpu.step\"}"));
+    ASSERT_TRUE(v.get("ok"));
+    EXPECT_FALSE(v.get("ok")->b);
+    ASSERT_TRUE(v.get("error") && v.get("error")->get("code"));
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_state");
+}
+
+TEST_F(AgentObservabilityTest, CpuStepOverRequiresPause)
+{
+    JsonValue v = parse(dispatchLine("{\"id\":7,\"cmd\":\"cpu.step_over\"}"));
+    ASSERT_TRUE(v.get("ok"));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_state");
+    /* A refused step-over must not leave the deferred-reply slot armed. */
+    EXPECT_FALSE(g_stepOverPending);
+}
+
+TEST_F(AgentObservabilityTest, CpuStepOverBusyWhilePending)
+{
+    /* Simulate a step-over already in flight (the CPU resuming to a temp BP).
+     * A second cpu.step_over must be rejected with `busy`, not clobber the
+     * pending id. */
+    g_stepOverPending = true;
+    g_stepOverId = 11;
+    JsonValue v = parse(dispatchLine("{\"id\":12,\"cmd\":\"cpu.step_over\"}"));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "busy");
+    /* The in-flight slot is untouched (still id 11, still pending). */
+    EXPECT_TRUE(g_stepOverPending);
+    EXPECT_EQ(g_stepOverId, 11.0);
+    g_stepOverPending = false;   /* don't leak into the next test */
 }
 
 }  /* anonymous namespace */

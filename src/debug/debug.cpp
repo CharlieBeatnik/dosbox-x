@@ -4406,6 +4406,54 @@ int32_t DEBUG_Run(int32_t amount,bool quickexit) {
 	return ret;
 }
 
+/* ---- Agent single-step bridge (proposal 4.9.7) --------------------------
+ * Drives the same machinery the curses F11 (trace into) and F10 (step over)
+ * keys use, but from the agent dispatch instead of a keypress. Called while
+ * the CPU is paused in DEBUG_Loop (the agent dispatch runs from AGENT_Poll,
+ * at the same call-stack depth DEBUG_CheckKeys runs at), so a direct
+ * DEBUG_Run here nests exactly as the keypress handlers do.
+ *
+ * Returns:
+ *   0  the CPU is not paused in the debugger — caller reports bad_state.
+ *   1  executed exactly one instruction and is still paused; caller reads the
+ *      post-step register snapshot immediately.
+ *   2  a CALL/INT/LOOP/REP was stepped over: a temporary breakpoint was set
+ *      past it and the CPU is resuming (normal loop). The post-step pause
+ *      arrives asynchronously (bp.hit / debugger.entered / state.paused); the
+ *      caller defers its reply until AGENT_OnDebuggerPaused fires. */
+int DEBUG_AgentStep(bool over) {
+	if (!debugging) return 0;
+
+	if (over && StepOver()) {
+		/* StepOver() set a temp BP at the return address and cleared
+		 * `debugging`. Execute the CALL/INT/LOOP/REP itself, then let the
+		 * normal loop run the body until that temp BP fires — identical to
+		 * the F10 path. mustCompleteInstruction / inhibit_int_breakpoint are
+		 * set only across this one instruction, exactly as F10 does. */
+		mustCompleteInstruction = true;
+		inhibit_int_breakpoint = true;
+		DEBUG_Run(1,false);            /* runs the insn + DOSBOX_SetNormalLoop */
+		inhibit_int_breakpoint = false;
+		mustCompleteInstruction = false;
+		return 2;
+	}
+
+	/* Trace into: run exactly one instruction and stay paused (quickexit keeps
+	 * the debug loop — no DOSBOX_SetNormalLoop). Identical to the F11 path. */
+	exitLoop = false;
+	mustCompleteInstruction = true;
+	Bits ret = DEBUG_Run(1,true);
+	mustCompleteInstruction = false;
+
+	/* If the stepped instruction was a DOSBox callback trampoline the core
+	 * returns its callback index; dispatch it exactly as DEBUG_CheckKeys does
+	 * so the BIOS/DOS service actually runs. */
+	if (ret > 0 && ret < (Bits)CB_MAX)
+		(void)(*CallBack_Handlers[ret])();
+
+	return 1;
+}
+
 uint32_t DEBUG_CheckKeys(void) {
 	/* When the curses debugger has not been initialised (e.g. headless
 	 * agent-driven debugging), there is no stdscr for `getch` to read
@@ -5757,6 +5805,9 @@ Bitu DEBUG_EnableDebugger(void)
 	if (wasRunning && debugging && !debug_running) {
 		AGENT_EmitDebuggerEntered("breakpoint");
 		AGENT_EmitStatePaused();
+		/* If a cpu.step_over (proposal 4.9.7) is awaiting the temp-BP pause,
+		 * send its deferred reply now that the post-step state is settled. */
+		AGENT_OnDebuggerPaused();
 	}
 	return 0;
 }
