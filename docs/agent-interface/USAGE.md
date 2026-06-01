@@ -121,11 +121,11 @@ events don't. The reference client does this in a single reader thread.
 | `keyboard.tap`      | `{key}`                       | `{}`                                |
 | `log.subscribe`     | none                          | `{subscribed: true}`                |
 | `log.unsubscribe`   | none                          | `{subscribed: false}`               |
-| `farcall.watch`     | `{target_seg}`                | `{watching, target_seg}`            |
+| `farcall.watch`     | `{target_seg}` or `{target_segs:[…]}`        | `{watching, target_seg}` / `{watching, target_segs}` |
 | `farcall.unwatch`   | none                          | `{watching: false}`                 |
-| `cpu.watch_target`  | `{target_seg, target_off}`    | `{watching, target_seg, target_off}`|
+| `cpu.watch_target`  | `{target_seg, target_off}` or `{targets:["SEG:OFF",…]}` | `{watching, target_seg, target_off}` / `{watching, targets}` |
 | `cpu.unwatch_target`| none                          | `{watching: false}`                 |
-| `cpu.watch_range`   | `{seg, lo, hi}`               | `{watching, seg, lo, hi}`           |
+| `cpu.watch_range`   | `{seg, lo, hi}` or `{ranges:[{seg,lo,hi},…]}` | `{watching, seg, lo, hi}` / `{watching, ranges}` |
 | `cpu.unwatch_range` | none                          | `{watching: false}`                 |
 | `screen.capture`    | `{raw?: bool}`                | `{path, raw}` (deferred — see below) |
 | `debug.status`      | none                          | full snapshot — see below           |
@@ -309,16 +309,19 @@ sentinel, run, wait for the first `farcall.transfer` event, and the
 event tells you which instruction in which source location did the
 transfer.
 
-- `target_seg` (required) — `u16` decimal number, or hex string with or
-  without `0x` prefix (`"483C"`, `"0x483C"`, `18492` all mean the same
-  segment).
+- `target_seg` (required for the single-sentinel form) — `u16` decimal
+  number, or hex string with or without `0x` prefix (`"483C"`, `"0x483C"`,
+  `18492` all mean the same segment).
 - Pass `target_seg: null` to clear the watch (equivalent to
   `farcall.unwatch`).
-- Single-sentinel for now; calling `farcall.watch` again replaces the
-  previous sentinel.
+- **Multiple sentinels (4.9.5):** pass `target_segs: [<seg>, …]` (each a
+  number or hex string) to watch a *set* of destination segments at once.
+  The array form **replaces** the whole set; `target_segs: []` clears it.
+  Each emitted event carries a `which` index into this set (see below).
 
-Reply: `{watching: true|false, target_seg: <u16>}`. Idempotent — calling
-again with the same segment is a no-op.
+Reply: `{watching: true|false, target_seg: <u16>}` for the single form, or
+`{watching, target_segs: [<u16>, …]}` for the array form. Idempotent —
+re-arming with the same set is a no-op.
 
 Emits a `farcall.transfer` event per matching transfer:
 
@@ -326,8 +329,11 @@ Emits a `farcall.transfer` event per matching transfer:
 {"event": "farcall.transfer",
  "target_seg": 18492, "target_off": 4068,
  "from_cs": 2084, "from_ip": 24576,
- "kind": "call_far_direct"}
+ "kind": "call_far_direct", "which": 0}
 ```
+
+`which` is the 0-based index of the sentinel that fired, into the set as
+last armed (always `0` for the single-sentinel form).
 
 `kind` is one of: `"call_far_direct"` (opcode `0x9A`),
 `"call_far_indirect"` (`0xFF /3`), `"jmp_far_direct"` (`0xEA`),
@@ -416,12 +422,17 @@ NEAR transfers are much more common than FAR, so the sentinel is a
 `(seg, off)` pair (not just a segment) — only the exact destination
 fires an event.
 
-- `target_seg`, `target_off` (both required when setting) — `u16`
-  decimal numbers or hex strings, same convention as `farcall.watch`.
+- `target_seg`, `target_off` (both required for the single-sentinel form) —
+  `u16` decimal numbers or hex strings, same convention as `farcall.watch`.
 - Pass `target_seg: null` to clear (same as `cpu.unwatch_target`).
-- Single sentinel — calling again replaces the previous one.
+- **Multiple sentinels (4.9.5):** pass `targets: ["SEG:OFF", …]` (each a
+  `"SEG:OFF"` hex string, the same form `cpu.probe` uses, e.g.
+  `"0824:C01E"`) to watch a *set* of `(seg, off)` landing points at once.
+  The array form **replaces** the whole set; `targets: []` clears it. Each
+  emitted event carries a `which` index into this set.
 
-Reply: `{watching: true|false, target_seg, target_off}`.
+Reply: `{watching: true|false, target_seg, target_off}` for the single
+form, or `{watching, targets: [...]}` for the array form.
 
 Emits a `cpu.transfer` event per matching transfer:
 
@@ -429,8 +440,11 @@ Emits a `cpu.transfer` event per matching transfer:
 {"event": "cpu.transfer",
  "target_seg": 2084, "target_off": 59598,
  "from_cs": 2084, "from_ip": 8512,
- "kind": "jmp_near_indirect"}
+ "kind": "jmp_near_indirect", "which": 0}
 ```
+
+`which` is the 0-based index of the sentinel that fired (always `0` for
+the single-sentinel form).
 
 `kind` is one of:
 
@@ -489,13 +503,17 @@ say, or a sub-procedure body you want to identify the entry point
 of), the watch reports just the entry, not the long slide that
 follows.
 
-- `seg`, `lo`, `hi` (all required when setting) — `u16` decimal numbers
-  or hex strings, same convention as `cpu.watch_target`. `lo` must be
-  `<= hi`.
+- `seg`, `lo`, `hi` (all required for the single-range form) — `u16`
+  decimal numbers or hex strings, same convention as `cpu.watch_target`.
+  `lo` must be `<= hi`.
 - Pass `seg: null` to clear (same as `cpu.unwatch_range`).
-- Single sentinel — calling again replaces the previous one.
+- **Multiple ranges (4.9.5):** pass `ranges: [{seg, lo, hi}, …]` to watch a
+  *set* of windows at once. The array form **replaces** the whole set;
+  `ranges: []` clears it. Each window keeps its own "from-outside" gate and
+  hit counter, and each emitted event carries a `which` index into the set.
 
-Reply: `{watching: true|false, seg, lo, hi}`.
+Reply: `{watching: true|false, seg, lo, hi}` for the single form, or
+`{watching, ranges: [{seg, lo, hi}, …]}` for the array form.
 
 Emits a `cpu.range_enter` event per matching boundary crossing:
 
@@ -503,7 +521,7 @@ Emits a `cpu.range_enter` event per matching boundary crossing:
 {"event": "cpu.range_enter",
  "seg": 2084, "target_off": 39274,
  "from_cs": 2084, "from_ip": 50071,
- "kind": "jmp_near_indirect"}
+ "kind": "jmp_near_indirect", "which": 0}
 ```
 
 `kind` reuses the existing transfer-source classification: any of the
@@ -573,9 +591,9 @@ COMMAND.COM stop callbacks. None of these touch a hooked opcode.
 | `bp.hit`           | `{seg, off, bp_index[, from_cs, from_ip]}` | Just before the debugger entry that a breakpoint triggered. In heavy-debug builds `from_cs`/`from_ip` carry the previous instruction's CS:IP (the source of the transfer to `seg:off`). |
 | `debugger.entered` | `{reason}`                      | After `bp.hit`, or any other debugger entry                     |
 | `log.line`         | `{text}`                        | While subscribed                                                |
-| `farcall.transfer` | `{target_seg, target_off, from_cs, from_ip, kind}` | A `CALL FAR` / `JMP FAR` / `RETF` / `IRET` / interrupt dispatch whose target CS matched the active `farcall.watch` sentinel |
-| `cpu.transfer`     | `{target_seg, target_off, from_cs, from_ip, kind}` | A NEAR `CALL`/`JMP`/taken `Jcc`/`RETN` / same-CS `RETF` / `IRET` / interrupt dispatch whose `(CS, IP)` matched the active `cpu.watch_target` sentinel |
-| `cpu.range_enter`  | `{seg, target_off, from_cs, from_ip, kind}` | A control transfer crossed the boundary into the active `cpu.watch_range` window from outside. Suppressed for intra-range transfers (the slide / loops inside the window). |
+| `farcall.transfer` | `{target_seg, target_off, from_cs, from_ip, kind, which}` | A `CALL FAR` / `JMP FAR` / `RETF` / `IRET` / interrupt dispatch whose target CS matched one of the active `farcall.watch` sentinels. `which` is the 0-based index of the matched sentinel. |
+| `cpu.transfer`     | `{target_seg, target_off, from_cs, from_ip, kind, which}` | A NEAR `CALL`/`JMP`/taken `Jcc`/`RETN` / same-CS `RETF` / `IRET` / interrupt dispatch whose `(CS, IP)` matched one of the active `cpu.watch_target` sentinels. `which` is the 0-based index of the matched sentinel. |
+| `cpu.range_enter`  | `{seg, target_off, from_cs, from_ip, kind, which}` | A control transfer crossed the boundary into one of the active `cpu.watch_range` windows from outside. Suppressed for intra-range transfers (the slide / loops inside the window). `which` is the 0-based index of the matched range. |
 | `mem.write`        | `{seg, off, addr, size, old, new, from_cs, from_ip, from[, from_text]}` | A guest memory write matched the active `mem.watch` (range + size + value predicate). `from_cs:from_ip` is the storing instruction; `from_text` (heavy-debug only) is its disassembly. `old` is `null` for VGA-framebuffer/MMIO writes (reading them back has side effects). |
 | `screen.captured`  | `{path, raw}`                   | A `screen.capture` PNG was fully written. Same payload as the command's deferred reply. Fires even for screenshots triggered by keyboard mapper (`Host+P` etc.), so subscribe-and-filter on `path` if you only care about your own requests. |
 | `agent.error`      | `{code, message}`               | Malformed input from your side (no `id` available to reply on)  |
@@ -637,9 +655,12 @@ consuming the event stream:
     {"index":1,"kind":"int","int":8,"enabled":true,"hits":1573}
   ],
   "watches": {
-    "far":    {"armed":false,"hits":0},
-    "target": {"armed":true,"hits":0,"seg":2084,"off":49182},
-    "range":  {"armed":true,"hits":7,"seg":2084,"lo":38400,"hi":39423},
+    "far":    {"armed":false,"hits":0,"sentinels":[]},
+    "target": {"armed":true,"hits":5,"seg":2084,"off":49182,
+               "sentinels":[{"seg":2084,"off":49182,"hits":3},
+                            {"seg":4096,"off":64,"hits":2}]},
+    "range":  {"armed":true,"hits":7,"seg":2084,"lo":38400,"hi":39423,
+               "sentinels":[{"seg":2084,"lo":38400,"hi":39423,"hits":7}]},
     "mem":    {"armed":true,"hits":3,"seg":2084,"lo":24576,"hi":28671,
                "size":2,"predicate":"new_eq=0x853"}
   },
@@ -654,6 +675,11 @@ consuming the event stream:
   `cpu.watch_target`, and a `cpu.probe` on one address, drive the repro, read
   `debug.status`. If the BP and probe `hits` agree but the watch `hits` is 0,
   the watch path is provably the bug — settled in one run.
+- **`sentinels`** (4.9.5) on `far` / `target` / `range` lists every armed
+  sentinel with its own `hits`; the array index matches the `which` field of
+  the emitted event. The watch-level `hits` is the total across the set, and
+  for back-compat the first sentinel's `seg`/`off`/`lo`/`hi` are also mirrored
+  at the top level. An empty `sentinels` array means the watch is disarmed.
 - **`bytes_now`** is the live four bytes at each exec breakpoint, read via
   `phys_readb`; it catches "armed on a wrong/relocated address" for free.
 - `kind` is `exec` / `int` / `mem` / `other`. INT breakpoints carry `int`

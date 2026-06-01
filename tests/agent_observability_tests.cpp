@@ -190,6 +190,135 @@ TEST_F(AgentObservabilityTest, ClearResetsHitCounter)
     EXPECT_EQ(uint64_t(t->get("hits")->n), 0u);
 }
 
+/* ---- multi-sentinel watches (4.9.5) ---------------------------------- */
+
+/* Arming a set of NEAR targets; the matcher reports *which* sentinel fired
+ * (g_targetWatchWhich — the value the cpu.transfer emitter stamps) and bumps
+ * only that sentinel's counter. debug.status surfaces per-sentinel hits and
+ * a total. */
+TEST_F(AgentObservabilityTest, MultiTargetWatchWhichAndPerSentinelHits)
+{
+    JsonValue v = parse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"cpu.watch_target\",\"args\":{\"targets\":"
+        "[\"0824:C01E\",\"0824:C020\",\"1000:0040\"]}}"));
+    ASSERT_TRUE(v.get("ok")->b) << jsonEncode(v);
+    EXPECT_TRUE(v.get("result")->get("watching")->b);
+    ASSERT_EQ(v.get("result")->get("targets")->a->size(), 3u);
+    ASSERT_EQ(g_targetWatch.size(), 3u);
+
+    /* Drive the matcher at sentinels 1, 2, 1, 0 (and a non-match). Each call
+     * is what the CPU core makes; check the recorded `which` each time. */
+    EXPECT_TRUE (AGENT_TargetWatchMatches(0x0824, 0xC020));  EXPECT_EQ(g_targetWatchWhich, 1);
+    EXPECT_TRUE (AGENT_TargetWatchMatches(0x1000, 0x0040));  EXPECT_EQ(g_targetWatchWhich, 2);
+    EXPECT_TRUE (AGENT_TargetWatchMatches(0x0824, 0xC020));  EXPECT_EQ(g_targetWatchWhich, 1);
+    EXPECT_TRUE (AGENT_TargetWatchMatches(0x0824, 0xC01E));  EXPECT_EQ(g_targetWatchWhich, 0);
+    EXPECT_FALSE(AGENT_TargetWatchMatches(0x0824, 0xFFFF));
+
+    JsonValue sv = status();
+    const JsonValue *t = sv.get("result")->get("watches")->get("target");
+    EXPECT_TRUE(t->get("armed")->b);
+    EXPECT_EQ(uint64_t(t->get("hits")->n), 4u);                 /* total */
+    /* Back-compat: top-level seg/off mirror sentinel[0]. */
+    EXPECT_EQ(uint16_t(t->get("seg")->n), 0x0824u);
+    EXPECT_EQ(uint16_t(t->get("off")->n), 0xC01Eu);
+    const JsonArray &s = *t->get("sentinels")->a;
+    ASSERT_EQ(s.size(), 3u);
+    EXPECT_EQ(uint64_t(s[0].get("hits")->n), 1u);
+    EXPECT_EQ(uint64_t(s[1].get("hits")->n), 2u);
+    EXPECT_EQ(uint64_t(s[2].get("hits")->n), 1u);
+    EXPECT_EQ(uint16_t(s[2].get("seg")->n), 0x1000u);
+    EXPECT_EQ(uint16_t(s[2].get("off")->n), 0x0040u);
+}
+
+/* An empty targets array disarms the whole set. */
+TEST_F(AgentObservabilityTest, MultiTargetWatchEmptyArrayClears)
+{
+    dispatchLine("{\"id\":1,\"cmd\":\"cpu.watch_target\",\"args\":{\"targets\":[\"0824:C01E\"]}}");
+    ASSERT_EQ(g_targetWatch.size(), 1u);
+    JsonValue v = parse(dispatchLine(
+        "{\"id\":2,\"cmd\":\"cpu.watch_target\",\"args\":{\"targets\":[]}}"));
+    ASSERT_TRUE(v.get("ok")->b);
+    EXPECT_FALSE(v.get("result")->get("watching")->b);
+    EXPECT_TRUE(g_targetWatch.empty());
+    JsonValue sv = status();
+    EXPECT_FALSE(sv.get("result")->get("watches")->get("target")->get("armed")->b);
+}
+
+/* A malformed targets entry is rejected and leaves the set untouched. */
+TEST_F(AgentObservabilityTest, MultiTargetWatchRejectsBadEntry)
+{
+    JsonValue v = parse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"cpu.watch_target\",\"args\":{\"targets\":[\"nocolon\"]}}"));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+    EXPECT_TRUE(g_targetWatch.empty());
+}
+
+/* The same for a set of FAR-destination segments. */
+TEST_F(AgentObservabilityTest, MultiFarWatchWhichAndPerSentinelHits)
+{
+    JsonValue v = parse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"farcall.watch\",\"args\":{\"target_segs\":[\"483C\",4096,\"0x9000\"]}}"));
+    ASSERT_TRUE(v.get("ok")->b) << jsonEncode(v);
+    ASSERT_EQ(g_farWatch.size(), 3u);
+
+    EXPECT_TRUE (AGENT_FarWatchMatches(0x9000)); EXPECT_EQ(g_farWatchWhich, 2);
+    EXPECT_TRUE (AGENT_FarWatchMatches(0x483C)); EXPECT_EQ(g_farWatchWhich, 0);
+    EXPECT_TRUE (AGENT_FarWatchMatches(0x9000)); EXPECT_EQ(g_farWatchWhich, 2);
+    EXPECT_FALSE(AGENT_FarWatchMatches(0x0001));
+
+    JsonValue sv = status();
+    const JsonValue *f = sv.get("result")->get("watches")->get("far");
+    EXPECT_EQ(uint64_t(f->get("hits")->n), 3u);
+    const JsonArray &s = *f->get("sentinels")->a;
+    ASSERT_EQ(s.size(), 3u);
+    EXPECT_EQ(uint16_t(s[0].get("seg")->n), 0x483Cu);
+    EXPECT_EQ(uint64_t(s[0].get("hits")->n), 1u);
+    EXPECT_EQ(uint64_t(s[2].get("hits")->n), 2u);
+}
+
+/* A set of ranges, each with its own from-outside gate and counter. */
+TEST_F(AgentObservabilityTest, MultiRangeWatchWhichAndPerSentinelHits)
+{
+    JsonValue v = parse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"cpu.watch_range\",\"args\":{\"ranges\":["
+        "{\"seg\":\"0824\",\"lo\":\"9600\",\"hi\":\"99FF\"},"
+        "{\"seg\":\"1000\",\"lo\":\"0000\",\"hi\":\"00FF\"}]}}"));
+    ASSERT_TRUE(v.get("ok")->b) << jsonEncode(v);
+    ASSERT_EQ(g_rangeWatch.size(), 2u);
+
+    /* Range 0 entry from outside: which==0. */
+    EXPECT_TRUE (AGENT_RangeWatchEntry(0x0824, 0x9700, 0x0824, 0x6000)); EXPECT_EQ(g_rangeWatchWhich, 0);
+    /* Intra-range step in range 0: no match. */
+    EXPECT_FALSE(AGENT_RangeWatchEntry(0x0824, 0x9701, 0x0824, 0x9700));
+    /* Range 1 entry (different seg): which==1. */
+    EXPECT_TRUE (AGENT_RangeWatchEntry(0x1000, 0x0010, 0x0824, 0x9700)); EXPECT_EQ(g_rangeWatchWhich, 1);
+
+    JsonValue sv = status();
+    const JsonValue *rg = sv.get("result")->get("watches")->get("range");
+    EXPECT_EQ(uint64_t(rg->get("hits")->n), 2u);
+    const JsonArray &s = *rg->get("sentinels")->a;
+    ASSERT_EQ(s.size(), 2u);
+    EXPECT_EQ(uint64_t(s[0].get("hits")->n), 1u);
+    EXPECT_EQ(uint64_t(s[1].get("hits")->n), 1u);
+    EXPECT_EQ(uint16_t(s[1].get("seg")->n), 0x1000u);
+    EXPECT_EQ(uint16_t(s[1].get("hi")->n), 0x00FFu);
+}
+
+/* The single-sentinel scalar form still works and is reported as a
+ * one-element set (back-compat with pre-4.9.5 callers). */
+TEST_F(AgentObservabilityTest, ScalarFormIsAOneElementSet)
+{
+    dispatchLine("{\"id\":1,\"cmd\":\"farcall.watch\",\"args\":{\"target_seg\":\"483C\"}}");
+    ASSERT_EQ(g_farWatch.size(), 1u);
+    EXPECT_TRUE(AGENT_FarWatchMatches(0x483C));
+    EXPECT_EQ(g_farWatchWhich, 0);
+    JsonValue sv = status();
+    const JsonValue *f = sv.get("result")->get("watches")->get("far");
+    EXPECT_EQ(uint16_t(f->get("seg")->n), 0x483Cu);
+    EXPECT_EQ(f->get("sentinels")->a->size(), 1u);
+}
+
 /* ---- cpu.probe (4.9.2) ----------------------------------------------- */
 
 TEST_F(AgentObservabilityTest, ProbeArmsAndDisarms)

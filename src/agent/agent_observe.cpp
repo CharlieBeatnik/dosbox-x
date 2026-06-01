@@ -341,35 +341,72 @@ JsonValue handleDebugStatus(double id, const JsonValue & /*args*/) {
     DEBUG_AgentForEachBreakpoint(&bpCollector, &bps);
     r.emplace("breakpoints", JsonValue::makeArray(std::move(bps)));
 
-    /* Watches. */
+    /* Watches. Each watch is a *set* of sentinels (proposal 4.9.5). `hits` is
+     * the total across the set; `sentinels[]` carries the per-sentinel count
+     * (the `which` index in emitted events is the position in this array). For
+     * back-compat the single-sentinel case also exposes the first sentinel's
+     * seg/off/lo/hi at the top level. */
     JsonObject w;
     {
         JsonObject f;
-        f.emplace("armed", JsonValue::makeBool(g_farWatchEnabled));
-        f.emplace("hits",  JsonValue::makeNumber(double(g_farWatchHits)));
-        if (g_farWatchEnabled)
-            f.emplace("seg", JsonValue::makeNumber(double(g_farWatchSeg)));
+        uint64_t total = 0;
+        JsonArray sent;
+        for (const AgentFarSentinel &s : g_farWatch) {
+            total += s.hits;
+            JsonObject so;
+            so.emplace("seg",  JsonValue::makeNumber(double(s.seg)));
+            so.emplace("hits", JsonValue::makeNumber(double(s.hits)));
+            sent.push_back(JsonValue::makeObject(std::move(so)));
+        }
+        f.emplace("armed", JsonValue::makeBool(!g_farWatch.empty()));
+        f.emplace("hits",  JsonValue::makeNumber(double(total)));
+        if (!g_farWatch.empty())
+            f.emplace("seg", JsonValue::makeNumber(double(g_farWatch[0].seg)));
+        f.emplace("sentinels", JsonValue::makeArray(std::move(sent)));
         w.emplace("far", JsonValue::makeObject(std::move(f)));
     }
     {
         JsonObject t;
-        t.emplace("armed", JsonValue::makeBool(g_targetWatchEnabled));
-        t.emplace("hits",  JsonValue::makeNumber(double(g_targetWatchHits)));
-        if (g_targetWatchEnabled) {
-            t.emplace("seg", JsonValue::makeNumber(double(g_targetWatchSeg)));
-            t.emplace("off", JsonValue::makeNumber(double(g_targetWatchOff)));
+        uint64_t total = 0;
+        JsonArray sent;
+        for (const AgentTargetSentinel &s : g_targetWatch) {
+            total += s.hits;
+            JsonObject so;
+            so.emplace("seg",  JsonValue::makeNumber(double(s.seg)));
+            so.emplace("off",  JsonValue::makeNumber(double(s.off)));
+            so.emplace("hits", JsonValue::makeNumber(double(s.hits)));
+            sent.push_back(JsonValue::makeObject(std::move(so)));
         }
+        t.emplace("armed", JsonValue::makeBool(!g_targetWatch.empty()));
+        t.emplace("hits",  JsonValue::makeNumber(double(total)));
+        if (!g_targetWatch.empty()) {
+            t.emplace("seg", JsonValue::makeNumber(double(g_targetWatch[0].seg)));
+            t.emplace("off", JsonValue::makeNumber(double(g_targetWatch[0].off)));
+        }
+        t.emplace("sentinels", JsonValue::makeArray(std::move(sent)));
         w.emplace("target", JsonValue::makeObject(std::move(t)));
     }
     {
         JsonObject rg;
-        rg.emplace("armed", JsonValue::makeBool(g_rangeWatchEnabled));
-        rg.emplace("hits",  JsonValue::makeNumber(double(g_rangeWatchHits)));
-        if (g_rangeWatchEnabled) {
-            rg.emplace("seg", JsonValue::makeNumber(double(g_rangeWatchSeg)));
-            rg.emplace("lo",  JsonValue::makeNumber(double(g_rangeWatchLo)));
-            rg.emplace("hi",  JsonValue::makeNumber(double(g_rangeWatchHi)));
+        uint64_t total = 0;
+        JsonArray sent;
+        for (const AgentRangeSentinel &s : g_rangeWatch) {
+            total += s.hits;
+            JsonObject so;
+            so.emplace("seg",  JsonValue::makeNumber(double(s.seg)));
+            so.emplace("lo",   JsonValue::makeNumber(double(s.lo)));
+            so.emplace("hi",   JsonValue::makeNumber(double(s.hi)));
+            so.emplace("hits", JsonValue::makeNumber(double(s.hits)));
+            sent.push_back(JsonValue::makeObject(std::move(so)));
         }
+        rg.emplace("armed", JsonValue::makeBool(!g_rangeWatch.empty()));
+        rg.emplace("hits",  JsonValue::makeNumber(double(total)));
+        if (!g_rangeWatch.empty()) {
+            rg.emplace("seg", JsonValue::makeNumber(double(g_rangeWatch[0].seg)));
+            rg.emplace("lo",  JsonValue::makeNumber(double(g_rangeWatch[0].lo)));
+            rg.emplace("hi",  JsonValue::makeNumber(double(g_rangeWatch[0].hi)));
+        }
+        rg.emplace("sentinels", JsonValue::makeArray(std::move(sent)));
         w.emplace("range", JsonValue::makeObject(std::move(rg)));
     }
     {

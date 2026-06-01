@@ -484,6 +484,86 @@ def phase5_vga_memwatch(agent, cs, vga_store, rep) -> None:
             agent.cpu_run(); _drain_events(agent)
 
 
+def phase6_multi_sentinel(agent, cs, msa, msb, rep) -> None:
+    # 4.9.5: arm cpu.watch_target with a TWO-sentinel set (msa first, msb
+    # second). The guest makes two NEAR calls, msa then msb. Assert each
+    # cpu.transfer event carries the right `which` (0 for msa, 1 for msb),
+    # names the calling segment, and that debug.status shows one hit per
+    # sentinel (and 2 total). The watch does not halt the CPU, so the two
+    # events arrive asynchronously on the stream.
+    name = "phase6: multi-sentinel cpu.watch_target reports which + per-sentinel hits"
+    try:
+        _reset(agent)
+        r = agent.call("cpu.watch_target",
+                       targets=[f"{cs:04X}:{msa:04X}", f"{cs:04X}:{msb:04X}"])
+        if not r.get("watching") or len(r.get("targets", [])) != 2:
+            rep.record(name, False, f"watch_target arm reply: {r}")
+            return
+        agent.cpu_run(); _drain_events(agent)
+        agent.keyboard_tap("6")
+
+        # Collect the two cpu.transfer events keyed by target_off.
+        events: dict[int, dict] = {}
+        deadline = time.monotonic() + 8.0
+        while len(events) < 2 and time.monotonic() < deadline:
+            ev = agent.next_event(timeout=max(0.05, deadline - time.monotonic()))
+            if ev is None:
+                continue
+            if ev.get("event") == "cpu.transfer":
+                events[ev.get("target_off")] = ev
+
+        problems = []
+        for idx, off in ((0, msa), (1, msb)):
+            ev = events.get(off)
+            if ev is None:
+                problems.append(f"no cpu.transfer for sentinel {idx} ({cs:04X}:{off:04X})")
+                continue
+            if ev.get("which") != idx:
+                problems.append(f"which={ev.get('which')} expected {idx} @ {cs:04X}:{off:04X}")
+            if ev.get("target_seg") != cs:
+                problems.append(f"target_seg={ev.get('target_seg'):04X} expected {cs:04X}")
+            if ev.get("from_cs") != cs:
+                problems.append(f"from_cs={ev.get('from_cs'):04X} expected {cs:04X}")
+
+        # Per-sentinel hit counters in debug.status (non-event proof). The
+        # guest may run phase 6 more than once if the '6' key auto-repeats
+        # before the slow paste-pump releases it — a known harness timing
+        # quirk that phases 4/5 also tolerate (they use >=1 thresholds). What
+        # MUST hold regardless of pass count: each sentinel is counted
+        # independently and *equally* (one call apiece per pass), and the
+        # total is their sum.
+        agent.cpu_pause(); _drain_events(agent)
+        st = agent.call("debug.status")
+        tgt = st.get("watches", {}).get("target", {})
+        sentinels = tgt.get("sentinels", [])
+        h0 = h1 = 0
+        if len(sentinels) != 2:
+            problems.append(f"sentinels={sentinels}")
+        else:
+            h0 = sentinels[0].get("hits", 0)
+            h1 = sentinels[1].get("hits", 0)
+            if h0 < 1 or h1 < 1:
+                problems.append(f"per-sentinel hits [{h0},{h1}] (expected >=1 each)")
+            if h0 != h1:
+                problems.append(f"per-sentinel hits unequal [{h0},{h1}]")
+            if tgt.get("hits") != h0 + h1:
+                problems.append(f"total hits={tgt.get('hits')} != {h0}+{h1}")
+
+        if problems:
+            rep.record(name, False, "; ".join(problems[:4]))
+        else:
+            rep.record(name, True,
+                       f"which 0->{cs:04X}:{msa:04X}, 1->{cs:04X}:{msb:04X}; "
+                       f"per-sentinel hits [{h0},{h1}]")
+    except Exception as exc:
+        rep.record(name, False, repr(exc))
+    finally:
+        with contextlib.suppress(Exception):
+            agent.cpu_pause(); _drain_events(agent)
+            agent.call("cpu.unwatch_target")
+            agent.cpu_run(); _drain_events(agent)
+
+
 def run(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dosbox", default=str(DEFAULT_DOSBOX))
@@ -517,19 +597,21 @@ def run(argv=None) -> int:
 
             cs = _read_signature(agent)
             print(f"OBSTEST.COM CS=0x{cs:04X}", flush=True)
-            tbl = agent.mem_read("seg:off", f"{cs:04X}:0103", 18)
+            tbl = agent.mem_read("seg:off", f"{cs:04X}:0103", 22)
             (loopbody, disasm, trace_a, trace_end, iters, disasm_end,
-             watch_target, store, vga_store) = struct.unpack("<9H", tbl)
+             watch_target, store, vga_store, msa, msb) = struct.unpack("<11H", tbl)
             print(f"landmarks: loopbody={loopbody:04X} disasm={disasm:04X} "
                   f"trace_a={trace_a:04X} trace_end={trace_end:04X} iters={iters} "
                   f"disasm_end={disasm_end:04X} watch_target={watch_target:04X} "
-                  f"store={store:04X} vga_store={vga_store:04X}", flush=True)
+                  f"store={store:04X} vga_store={vga_store:04X} "
+                  f"msa={msa:04X} msb={msb:04X}", flush=True)
 
             phase1_probe_and_counters(agent, cs, loopbody, iters, rep)
             phase2_disasm(agent, cs, disasm, disasm_end, rep)
             phase3_traceback(agent, cs, trace_a, trace_end, rep)
             phase4_memwatch(agent, cs, watch_target, store, rep)
             phase5_vga_memwatch(agent, cs, vga_store, rep)
+            phase6_multi_sentinel(agent, cs, msa, msb, rep)
 
             with contextlib.suppress(Exception):
                 _reset(agent)

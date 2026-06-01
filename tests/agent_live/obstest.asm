@@ -58,6 +58,12 @@
 ;        old==null (a VGA read loads the plane latches, so old is not sampled).
 ;        This is the proposal-4.9.4 "VGA blind spot" closure made concrete.
 ;
+;   '6'  Phase 6 (multi-sentinel cpu.watch_target, 4.9.5): two NEAR calls to
+;        distinct targets landmark_msa / landmark_msb. The driver arms
+;        cpu.watch_target with both as a set and asserts the two cpu.transfer
+;        events carry which==0 then which==1, with one hit per sentinel in
+;        debug.status. Proves the proposal-4.9.5 multi-sentinel `which` field.
+;
 ;   'q'  Exit cleanly via INT 21h AH=4Ch.
 ;
 ; All phases return to main_loop so the driver can run them in any order and
@@ -87,6 +93,8 @@ landmarks_table:
         dw      watch_target            ; +12 mem.watch write-target field
         dw      landmark_store          ; +14 the storing instruction (phase 4)
         dw      landmark_vga_store      ; +16 the VGA storing instruction (phase 5)
+        dw      landmark_msa            ; +18 multi-sentinel target A (phase 6)
+        dw      landmark_msb            ; +20 multi-sentinel target B (phase 6)
 
 ; ---- Variables -----------------------------------------------------------
 loopcount       dw      0
@@ -124,8 +132,12 @@ main_loop:
         jmp     phase4                  ; near jmp: phase4 is out of je's rel8 range
 chk_5:
         cmp     al, '5'
-        jne     chk_q
+        jne     chk_6
         jmp     phase5                  ; near jmp: phase5 is out of je's rel8 range
+chk_6:
+        cmp     al, '6'
+        jne     chk_q
+        jmp     phase6                  ; near jmp: phase6 is out of je's rel8 range
 chk_q:
         cmp     al, 'q'
         je      do_exit
@@ -205,6 +217,23 @@ landmark_vga_store:
         push    cs
         pop     es                      ; restore ES for the rest of the program
         jmp     main_loop
+
+; ---- Phase 6: multi-sentinel cpu.watch_target (4.9.5) --------------------
+; Two NEAR calls to distinct targets. The driver arms cpu.watch_target with
+; BOTH entry points as a 2-sentinel set (msa first, msb second) and asserts
+; the two cpu.transfer events carry which==0 (msa) then which==1 (msb), and
+; that debug.status shows one hit per sentinel. The RETN landings fall on the
+; instruction after each call (not watched), so only the two calls fire.
+phase6:
+        call    near ptr landmark_msa
+        call    near ptr landmark_msb
+        jmp     main_loop
+landmark_msa:
+        nop                             ; <- watch_target sentinel 0 (which==0)
+        retn
+landmark_msb:
+        nop                             ; <- watch_target sentinel 1 (which==1)
+        retn
 
 ; ---- Clean exit ----------------------------------------------------------
 do_exit:

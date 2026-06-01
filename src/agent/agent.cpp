@@ -53,34 +53,27 @@ extern std::string pathscr;
 
 namespace agent {
 
-/* Far-transfer watch state — file-scope so the public AGENT_FarWatch*
- * helpers below can mutate it without going through dispatch. Read on the
- * CPU dispatch hot path; written only from the main thread.
+/* Watch state — file-scope so the public AGENT_*Watch* helpers below can
+ * mutate it without going through dispatch. Read on the CPU dispatch hot
+ * path; written only from the main thread.
  *
- * Each watch carries a monotonic hit counter (proposal 4.9.1) incremented
- * by its matcher when it returns true — i.e. once per emitted event. It is
- * read by debug.status (agent_observe.cpp) so an agent can prove a watch was
- * (or was not) exercised without consuming the event stream. */
-bool     g_farWatchEnabled = false;
-uint16_t g_farWatchSeg     = 0;
-uint64_t g_farWatchHits    = 0;
-
-/* Near-transfer watch state (proposal 4.4). Same single-thread invariants
- * as the FAR watch above; the (seg, off) pair filters the much higher
- * NEAR-transfer rate down to one event per matching arrival. */
-bool     g_targetWatchEnabled = false;
-uint16_t g_targetWatchSeg     = 0;
-uint16_t g_targetWatchOff     = 0;
-uint64_t g_targetWatchHits    = 0;
-
-/* Range-entry watch state (proposal 4.8). Fires only on a transfer that
- * lands at [seg, lo..hi] *from outside* that window. Same single-thread
- * invariants as the other watch globals. */
-bool     g_rangeWatchEnabled = false;
-uint16_t g_rangeWatchSeg     = 0;
-uint16_t g_rangeWatchLo      = 0;
-uint16_t g_rangeWatchHi      = 0;
-uint64_t g_rangeWatchHits     = 0;
+ * Multi-sentinel (proposal 4.9.5): each watch is a *set* of sentinels. Each
+ * sentinel carries its own monotonic hit counter (proposal 4.9.1) bumped by
+ * its matcher when that sentinel fires — i.e. once per emitted event. The
+ * counts are read by debug.status (agent_observe.cpp) so an agent can prove
+ * which sentinel was (or was not) exercised without consuming the event
+ * stream. `armed` is just a non-empty set.
+ *
+ * On a match the matcher records the matched index in g_*WatchWhich; the
+ * emitter that runs immediately afterwards (same CPU thread, no intervening
+ * code) reads it to stamp the event's `which` field. -1 means "no current
+ * match" (the value seen by a direct emitter call with no preceding match). */
+std::vector<AgentFarSentinel>    g_farWatch;        /* proposal 4.4 / 4.9.5 */
+std::vector<AgentTargetSentinel> g_targetWatch;     /* proposal 4.4 / 4.9.5 */
+std::vector<AgentRangeSentinel>  g_rangeWatch;      /* proposal 4.8 / 4.9.5 */
+int g_farWatchWhich    = -1;
+int g_targetWatchWhich = -1;
+int g_rangeWatchWhich  = -1;
 
 /* screen.capture pending-request state (proposal 4.7). The handler returns
  * an empty string so the protocol layer queues no immediate reply, then
@@ -288,11 +281,54 @@ bool parseSegArg(const JsonValue &v, uint32_t &out)
     return false;
 }
 
+/* Parse a "SEG:OFF" target string (each half a bare hex number, the form
+ * cpu.probe already uses) into a (seg, off) pair. */
+bool parseSegOffArg(const JsonValue &v, uint16_t &seg, uint16_t &off) {
+    if (!v.isString()) return false;
+    const std::string &s = v.s;
+    size_t colon = s.find(':');
+    if (colon == std::string::npos) return false;
+    uint32_t sg = 0, of = 0;
+    if (!parseSegArg(JsonValue::makeString(s.substr(0, colon)), sg)) return false;
+    if (!parseSegArg(JsonValue::makeString(s.substr(colon + 1)), of)) return false;
+    seg = (uint16_t)sg;
+    off = (uint16_t)of;
+    return true;
+}
+
+/* farcall.watch — arm a *set* of FAR-transfer destination segments
+ * (proposal 4.9.5). Two request shapes:
+ *   {"target_seg": <u16|hex>}     — single sentinel (back-compat; null clears)
+ *   {"target_segs": [<u16|hex>,…]}— sentinel set ([] clears)
+ * Each emitted farcall.transfer carries a `which` index into this set. */
 JsonValue handleFarcallWatch(double id, const JsonValue &args) {
+    const JsonValue *segs = args.get("target_segs");
+    if (segs) {
+        if (!segs->isArray())
+            return makeReplyError(id, "bad_args", "target_segs must be an array");
+        std::vector<AgentFarSentinel> set;
+        JsonArray echo;
+        for (const JsonValue &e : *segs->a) {
+            uint32_t sv = 0;
+            if (!parseSegArg(e, sv))
+                return makeReplyError(id, "bad_args",
+                    "each target_segs entry must be a u16 number or hex string");
+            set.push_back(AgentFarSentinel{(uint16_t)sv, 0});
+            echo.push_back(JsonValue::makeNumber(sv));
+        }
+        g_farWatch = std::move(set);
+        g_farWatchWhich = -1;
+        JsonObject r;
+        r.emplace("watching",    JsonValue::makeBool(!g_farWatch.empty()));
+        r.emplace("target_segs", JsonValue::makeArray(std::move(echo)));
+        return makeReplyOk(id, std::move(r));
+    }
+
     const JsonValue *seg = args.get("target_seg");
     if (!seg) {
         return makeReplyError(id, "bad_args",
-            "expected {\"target_seg\":<u16 or hex string>} (null to clear)");
+            "expected {\"target_seg\":<u16 or hex string>} or "
+            "{\"target_segs\":[…]} (null / [] to clear)");
     }
     if (seg->isNull()) {
         AGENT_FarWatchClear();
@@ -319,15 +355,40 @@ JsonValue handleFarcallUnwatch(double id, const JsonValue & /*args*/) {
     return makeReplyOk(id, std::move(r));
 }
 
-/* cpu.watch_target — set (or clear, via target_seg=null) the NEAR-transfer
- * sentinel. Mirrors farcall.watch's accept-either-number-or-hex-string
- * convention; target_off is required only when target_seg is non-null. */
+/* cpu.watch_target — arm a *set* of NEAR-transfer (seg, off) sentinels
+ * (proposal 4.9.5). Two request shapes:
+ *   {"target_seg":…,"target_off":…}  — single sentinel (back-compat; null clears)
+ *   {"targets":["SEG:OFF", …]}        — sentinel set ([] clears), the same
+ *                                       "SEG:OFF" string form cpu.probe uses.
+ * Each emitted cpu.transfer carries a `which` index into this set. */
 JsonValue handleCpuWatchTarget(double id, const JsonValue &args) {
+    const JsonValue *targets = args.get("targets");
+    if (targets) {
+        if (!targets->isArray())
+            return makeReplyError(id, "bad_args", "targets must be an array");
+        std::vector<AgentTargetSentinel> set;
+        JsonArray echo;
+        for (const JsonValue &e : *targets->a) {
+            uint16_t sv = 0, ov = 0;
+            if (!parseSegOffArg(e, sv, ov))
+                return makeReplyError(id, "bad_args",
+                    "each targets entry must be a \"SEG:OFF\" hex string");
+            set.push_back(AgentTargetSentinel{sv, ov, 0});
+            echo.push_back(e);   /* echo the request's "SEG:OFF" string back */
+        }
+        g_targetWatch = std::move(set);
+        g_targetWatchWhich = -1;
+        JsonObject r;
+        r.emplace("watching", JsonValue::makeBool(!g_targetWatch.empty()));
+        r.emplace("targets",  JsonValue::makeArray(std::move(echo)));
+        return makeReplyOk(id, std::move(r));
+    }
+
     const JsonValue *seg = args.get("target_seg");
     if (!seg) {
         return makeReplyError(id, "bad_args",
             "expected {\"target_seg\":<u16 or hex string>, \"target_off\":<u16 or hex string>}"
-            " (target_seg=null to clear)");
+            " or {\"targets\":[\"SEG:OFF\", …]} (target_seg=null / targets=[] to clear)");
     }
     if (seg->isNull()) {
         AGENT_TargetWatchClear();
@@ -365,13 +426,50 @@ JsonValue handleCpuUnwatchTarget(double id, const JsonValue & /*args*/) {
 /* cpu.watch_range — fires on the *boundary crossing* into [seg, lo..hi].
  * Use this when you want to know "what code first enters this region" and
  * the region itself has a lot of intra-range traffic (a slide / loop /
- * data-as-code execution) that would otherwise flood cpu.watch_target. */
+ * data-as-code execution) that would otherwise flood cpu.watch_target.
+ *
+ * Multi-range (proposal 4.9.5). Two request shapes:
+ *   {"seg":…,"lo":…,"hi":…}                       — single range (null clears)
+ *   {"ranges":[{"seg":…,"lo":…,"hi":…}, …]}        — range set ([] clears)
+ * Each emitted cpu.range_enter carries a `which` index into this set. */
 JsonValue handleCpuWatchRange(double id, const JsonValue &args) {
+    const JsonValue *ranges = args.get("ranges");
+    if (ranges) {
+        if (!ranges->isArray())
+            return makeReplyError(id, "bad_args", "ranges must be an array");
+        std::vector<AgentRangeSentinel> set;
+        JsonArray echo;
+        for (const JsonValue &e : *ranges->a) {
+            const JsonValue *es = e.get("seg");
+            const JsonValue *el = e.get("lo");
+            const JsonValue *eh = e.get("hi");
+            uint32_t sv = 0, lv = 0, hv = 0;
+            if (!es || !el || !eh ||
+                !parseSegArg(*es, sv) || !parseSegArg(*el, lv) || !parseSegArg(*eh, hv))
+                return makeReplyError(id, "bad_args",
+                    "each ranges entry must be {\"seg\":…,\"lo\":…,\"hi\":…} (u16/hex)");
+            if (lv > hv)
+                return makeReplyError(id, "bad_args", "lo must be <= hi");
+            set.push_back(AgentRangeSentinel{(uint16_t)sv, (uint16_t)lv, (uint16_t)hv, 0});
+            JsonObject re;
+            re.emplace("seg", JsonValue::makeNumber(sv));
+            re.emplace("lo",  JsonValue::makeNumber(lv));
+            re.emplace("hi",  JsonValue::makeNumber(hv));
+            echo.push_back(JsonValue::makeObject(std::move(re)));
+        }
+        g_rangeWatch = std::move(set);
+        g_rangeWatchWhich = -1;
+        JsonObject r;
+        r.emplace("watching", JsonValue::makeBool(!g_rangeWatch.empty()));
+        r.emplace("ranges",   JsonValue::makeArray(std::move(echo)));
+        return makeReplyOk(id, std::move(r));
+    }
+
     const JsonValue *seg = args.get("seg");
     if (!seg) {
         return makeReplyError(id, "bad_args",
             "expected {\"seg\":<u16 or hex string>, \"lo\":<u16>, \"hi\":<u16>}"
-            " (seg=null to clear)");
+            " or {\"ranges\":[{…}, …]} (seg=null / ranges=[] to clear)");
     }
     if (seg->isNull()) {
         AGENT_RangeWatchClear();
@@ -605,83 +703,75 @@ bool AGENT_IsHeadless(void) {
 }
 
 bool AGENT_FarWatchMatches(uint16_t seg) {
-    if (agent::g_farWatchEnabled && seg == agent::g_farWatchSeg) {
-        agent::g_farWatchHits++;
-        return true;
+    for (size_t i = 0; i < agent::g_farWatch.size(); ++i) {
+        if (agent::g_farWatch[i].seg == seg) {
+            agent::g_farWatch[i].hits++;
+            agent::g_farWatchWhich = (int)i;
+            return true;
+        }
     }
     return false;
 }
 
 void AGENT_FarWatchSet(uint16_t seg) {
-    agent::g_farWatchSeg     = seg;
-    agent::g_farWatchEnabled = true;
-    agent::g_farWatchHits    = 0;
+    agent::g_farWatch.assign(1, agent::AgentFarSentinel{seg, 0});
+    agent::g_farWatchWhich = -1;
 }
 
 void AGENT_FarWatchClear(void) {
-    agent::g_farWatchEnabled = false;
-    agent::g_farWatchSeg     = 0;
-    agent::g_farWatchHits    = 0;
+    agent::g_farWatch.clear();
+    agent::g_farWatchWhich = -1;
 }
 
 bool AGENT_TargetWatchMatches(uint16_t seg, uint16_t off) {
-    if (agent::g_targetWatchEnabled
-        && seg == agent::g_targetWatchSeg
-        && off == agent::g_targetWatchOff) {
-        agent::g_targetWatchHits++;
-        return true;
+    for (size_t i = 0; i < agent::g_targetWatch.size(); ++i) {
+        if (agent::g_targetWatch[i].seg == seg && agent::g_targetWatch[i].off == off) {
+            agent::g_targetWatch[i].hits++;
+            agent::g_targetWatchWhich = (int)i;
+            return true;
+        }
     }
     return false;
 }
 
 void AGENT_TargetWatchSet(uint16_t seg, uint16_t off) {
-    agent::g_targetWatchSeg     = seg;
-    agent::g_targetWatchOff     = off;
-    agent::g_targetWatchEnabled = true;
-    agent::g_targetWatchHits    = 0;
+    agent::g_targetWatch.assign(1, agent::AgentTargetSentinel{seg, off, 0});
+    agent::g_targetWatchWhich = -1;
 }
 
 void AGENT_TargetWatchClear(void) {
-    agent::g_targetWatchEnabled = false;
-    agent::g_targetWatchSeg     = 0;
-    agent::g_targetWatchOff     = 0;
-    agent::g_targetWatchHits    = 0;
+    agent::g_targetWatch.clear();
+    agent::g_targetWatchWhich = -1;
 }
 
 bool AGENT_RangeWatchEntry(uint16_t target_seg, uint16_t target_off,
                            uint16_t from_seg,   uint16_t from_ip) {
-    if (!agent::g_rangeWatchEnabled)                   return false;
-    if (target_seg != agent::g_rangeWatchSeg)          return false;
-    if (target_off < agent::g_rangeWatchLo)            return false;
-    if (target_off > agent::g_rangeWatchHi)            return false;
-    /* "From outside the range" gate. A FAR landing whose source seg is
-     * different from the watched seg is trivially outside. Within the
-     * same seg, the previous instruction's IP must fall outside [lo, hi]. */
-    if (from_seg != agent::g_rangeWatchSeg) {
-        agent::g_rangeWatchHits++;
-        return true;
-    }
-    if ((from_ip < agent::g_rangeWatchLo) || (from_ip > agent::g_rangeWatchHi)) {
-        agent::g_rangeWatchHits++;
-        return true;
+    for (size_t i = 0; i < agent::g_rangeWatch.size(); ++i) {
+        const agent::AgentRangeSentinel &rw = agent::g_rangeWatch[i];
+        if (target_seg != rw.seg)        continue;
+        if (target_off < rw.lo)          continue;
+        if (target_off > rw.hi)          continue;
+        /* "From outside the range" gate. A FAR landing whose source seg is
+         * different from the watched seg is trivially outside. Within the
+         * same seg, the previous instruction's IP must fall outside [lo, hi]. */
+        if (from_seg != rw.seg ||
+            from_ip  < rw.lo  || from_ip > rw.hi) {
+            agent::g_rangeWatch[i].hits++;
+            agent::g_rangeWatchWhich = (int)i;
+            return true;
+        }
     }
     return false;
 }
 
 void AGENT_RangeWatchSet(uint16_t seg, uint16_t lo, uint16_t hi) {
-    agent::g_rangeWatchSeg     = seg;
-    agent::g_rangeWatchLo      = lo;
-    agent::g_rangeWatchHi      = hi;
-    agent::g_rangeWatchEnabled = true;
-    agent::g_rangeWatchHits    = 0;
+    agent::g_rangeWatch.assign(1, agent::AgentRangeSentinel{seg, lo, hi, 0});
+    agent::g_rangeWatchWhich = -1;
 }
 
 void AGENT_RangeWatchClear(void) {
-    agent::g_rangeWatchEnabled = false;
-    agent::g_rangeWatchSeg     = 0;
-    agent::g_rangeWatchLo      = 0;
-    agent::g_rangeWatchHi      = 0;
-    agent::g_rangeWatchHits    = 0;
+    agent::g_rangeWatch.clear();
+    agent::g_rangeWatchWhich = -1;
 }
 
 #endif /* C_DEBUG */

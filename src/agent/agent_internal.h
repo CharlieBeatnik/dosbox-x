@@ -156,20 +156,24 @@ JsonValue handleMemRead(double id, const JsonValue &args);
 /* ---- Observability (proposal 4.9) --------------------------------------
  * Watch state + hit counters live in agent.cpp (read on the CPU hot path,
  * written from the main thread). debug.status in agent_observe.cpp reads
- * them via these externs to report each watch's armed/sentinel/hit-count
- * without halting the CPU or consuming the event stream. */
-extern bool     g_farWatchEnabled;
-extern uint16_t g_farWatchSeg;
-extern uint64_t g_farWatchHits;
-extern bool     g_targetWatchEnabled;
-extern uint16_t g_targetWatchSeg;
-extern uint16_t g_targetWatchOff;
-extern uint64_t g_targetWatchHits;
-extern bool     g_rangeWatchEnabled;
-extern uint16_t g_rangeWatchSeg;
-extern uint16_t g_rangeWatchLo;
-extern uint16_t g_rangeWatchHi;
-extern uint64_t g_rangeWatchHits;
+ * them via these externs to report each watch's armed/sentinels/hit-count
+ * without halting the CPU or consuming the event stream.
+ *
+ * Multi-sentinel (proposal 4.9.5): each watch is a *set* of sentinels, each
+ * carrying its own hit counter. `armed` is just `!empty()`. The matcher that
+ * fires records the matched index in the paired g_*WatchWhich so the emitter
+ * that runs immediately after (single-threaded, on the same CPU thread) can
+ * stamp a `which` field on the event without re-deriving the index. */
+struct AgentFarSentinel    { uint16_t seg;                          uint64_t hits; };
+struct AgentTargetSentinel { uint16_t seg; uint16_t off;           uint64_t hits; };
+struct AgentRangeSentinel  { uint16_t seg; uint16_t lo; uint16_t hi; uint64_t hits; };
+
+extern std::vector<AgentFarSentinel>    g_farWatch;
+extern std::vector<AgentTargetSentinel> g_targetWatch;
+extern std::vector<AgentRangeSentinel>  g_rangeWatch;
+extern int g_farWatchWhich;
+extern int g_targetWatchWhich;
+extern int g_rangeWatchWhich;
 
 /* Dispatch entry points implemented in agent_observe.cpp. */
 JsonValue handleDebugStatus(double id, const JsonValue &args);    /* 4.9.1 */

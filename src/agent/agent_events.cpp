@@ -114,15 +114,18 @@ void AGENT_EmitFarTransfer(uint16_t target_seg, uint16_t target_ip,
      * ("call_far_direct", "call_far_indirect", "jmp_far_direct",
      * "jmp_far_indirect", "retf"). No escaping needed; buffer sized for
      * the longest. */
-    char buf[192];
+    /* `which` (proposal 4.9.5) is the index into the armed sentinel set that
+     * fired, stashed by AGENT_FarWatchMatches just before this call (same
+     * thread, no intervening code). -1 if emitted without a preceding match. */
+    char buf[224];
     snprintf(buf, sizeof(buf),
         "{\"event\":\"farcall.transfer\","
         "\"target_seg\":%u,\"target_off\":%u,"
         "\"from_cs\":%u,\"from_ip\":%u,"
-        "\"kind\":\"%s\"}",
+        "\"kind\":\"%s\",\"which\":%d}",
         static_cast<unsigned>(target_seg), static_cast<unsigned>(target_ip),
         static_cast<unsigned>(from_cs),    static_cast<unsigned>(from_ip),
-        kind ? kind : "unknown");
+        kind ? kind : "unknown", agent::g_farWatchWhich);
     agent::serverBroadcastLine(buf);
 }
 
@@ -165,15 +168,17 @@ void AGENT_EmitTransfer(const char *kind,
      * ("jmp_near_indirect", "call_near_indirect", "retn", "retn_imm",
      * "call_near_direct", "jmp_near_direct", "jmp_short", "jcc_short",
      * "jcc_near"). No escaping needed. */
-    char buf[192];
+    /* `which` (proposal 4.9.5): index into the cpu.watch_target sentinel set,
+     * stashed by AGENT_TargetWatchMatches just before this call. */
+    char buf[224];
     snprintf(buf, sizeof(buf),
         "{\"event\":\"cpu.transfer\","
         "\"target_seg\":%u,\"target_off\":%u,"
         "\"from_cs\":%u,\"from_ip\":%u,"
-        "\"kind\":\"%s\"}",
+        "\"kind\":\"%s\",\"which\":%d}",
         static_cast<unsigned>(target_seg), static_cast<unsigned>(target_off),
         static_cast<unsigned>(from_cs),    static_cast<unsigned>(from_ip),
-        kind ? kind : "unknown");
+        kind ? kind : "unknown", agent::g_targetWatchWhich);
     agent::serverBroadcastLine(buf);
 }
 
@@ -185,15 +190,17 @@ void AGENT_EmitRangeEnter(const char *kind,
      * is the landing offset inside [lo, hi]. `from_cs`/`from_ip` point
      * at the source instruction that performed the boundary-crossing
      * transfer — the one to disassemble to find the divert. */
-    char buf[192];
+    /* `which` (proposal 4.9.5): index into the cpu.watch_range range set,
+     * stashed by AGENT_RangeWatchEntry just before this call. */
+    char buf[224];
     snprintf(buf, sizeof(buf),
         "{\"event\":\"cpu.range_enter\","
         "\"seg\":%u,\"target_off\":%u,"
         "\"from_cs\":%u,\"from_ip\":%u,"
-        "\"kind\":\"%s\"}",
+        "\"kind\":\"%s\",\"which\":%d}",
         static_cast<unsigned>(target_seg), static_cast<unsigned>(target_off),
         static_cast<unsigned>(from_cs),    static_cast<unsigned>(from_ip),
-        kind ? kind : "unknown");
+        kind ? kind : "unknown", agent::g_rangeWatchWhich);
     agent::serverBroadcastLine(buf);
 }
 

@@ -6,7 +6,80 @@ Leave-behind for the next agent continuing the **proposal-4.9** work on the
 Source proposal:
 `X2RE/.claude/notes/dosbox-x-fixes/PROPOSAL_4.9_observability_and_trust.md`.
 
-## What shipped this iteration (4.9.4-VGA — framebuffer write coverage)
+## What shipped this iteration (4.9.5 — multi-sentinel watches)
+
+`farcall.watch`, `cpu.watch_target`, and `cpu.watch_range` now each hold a
+**set** of sentinels instead of a single one, and every emitted event carries
+a `which` index naming the sentinel that fired. Built, 104 unit tests pass,
+and verified end-to-end (a new OBSTEST phase 6). 4.9.5 complete.
+
+| # | Item | Proves | Status |
+|---|------|--------|--------|
+| 4.9.5 | multi-sentinel `farcall.watch` / `cpu.watch_target` / `cpu.watch_range` + `which` on events + per-sentinel `hits` | "*which* of N watched targets fired, and how often each?" in one run | ✅ |
+
+### Design / code map
+
+- **State → containers.** The scalar `g_{far,target,range}WatchSeg/Off/Hits/
+  Enabled` globals are gone. Each watch is now a `std::vector` of a small
+  sentinel struct (`AgentFarSentinel{seg,hits}`,
+  `AgentTargetSentinel{seg,off,hits}`, `AgentRangeSentinel{seg,lo,hi,hits}`,
+  defined in `src/agent/agent_internal.h`). `armed` == `!empty()`; the
+  per-watch total `hits` is the sum across the set.
+- **`which` plumbing without touching the ~12 hot-path call sites.** The
+  matchers (`AGENT_FarWatchMatches` / `AGENT_TargetWatchMatches` /
+  `AGENT_RangeWatchEntry` in `agent.cpp`) now loop over their vector, bump the
+  matched sentinel's own counter, and stash the matched index in a file-scope
+  `g_{far,target,range}WatchWhich`. The emitter that runs *immediately after*
+  (same CPU thread, no intervening code) reads that stash to append
+  `"which":<n>`. So the CPU-core hooks in `cpu.cpp`, `callback.cpp`,
+  `core_normal/support.h`, and `core_normal/prefix_none.h` are **unchanged**
+  (the matcher/emitter signatures didn't change).
+- **Handlers (`agent.cpp`).** `handleFarcallWatch` accepts `target_segs:[…]`,
+  `handleCpuWatchTarget` accepts `targets:["SEG:OFF",…]` (the cpu.probe string
+  form — new `parseSegOffArg` helper), `handleCpuWatchRange` accepts
+  `ranges:[{seg,lo,hi},…]`. Each array form **replaces** the whole set; `[]`
+  clears. The pre-4.9.5 scalar forms still work and are stored as a
+  one-element set, so all existing callers/tests are byte-for-byte compatible.
+- **`debug.status` (`agent_observe.cpp`).** Each watch now reports a
+  `sentinels` array (`[{seg[,off|lo,hi],hits}, …]`); the array index == the
+  event `which`. Top-level `hits` is the total, and the first sentinel's
+  scalar fields are still mirrored at top level for back-compat.
+- **Events.** `farcall.transfer` / `cpu.transfer` / `cpu.range_enter` gained a
+  trailing `"which":<n>` (buffers bumped 192→224). The `#else` (release-build)
+  no-op stubs in `include/agent.h` are unchanged (the public signatures of the
+  matchers/setters/emitters didn't change).
+
+### Build note (read this — it bit this iteration)
+
+`src/debug/debug.cpp` has grown (via the 4.9 agent hooks) past the COFF
+`/JMC` section limit and now fails `C1128: number of sections exceeded
+object file format limit` on a **fresh** compile. Prior iterations only ever
+relinked a stale `debug.obj` built before it crossed the limit; a
+partial-failure build this session invalidated that obj and exposed it. Fixed
+by adding `/bigobj` to `debug.cpp`'s `ClCompile` entry in
+`vs/dosbox-x.vcxproj` — the compiler-recommended, codegen-neutral fix. (If a
+Unix build hits the same wall, `debug.cpp` may need a per-file flag in
+`Makefile.am` too — untested here.)
+
+### Tests
+
+- **`tests/agent_observability_tests.cpp`** — 6 new gTests: per-sentinel
+  `which` + counts for target / far / range, empty-array-clears, bad-entry
+  rejection, and "scalar form is a one-element set". **104 Agent gTests total,
+  all pass.** (Gotcha re-learned: bind `status()` to a local `JsonValue`
+  before chaining `.get()` — `status().get(...)` dangles the temporary and
+  faults.)
+- **`tests/agent_live/obstest.asm` + `OBSTEST.COM` (rebuilt)** — Phase 6: two
+  NEAR calls to `landmark_msa` / `landmark_msb`; landmark table grew to 11
+  entries (`+18`/`+20`). **`tests/agent_live/test_observability.py`** Phase 6
+  arms `cpu.watch_target targets=[msa,msb]`, taps '6', and asserts the two
+  `cpu.transfer` events carry `which==0` then `which==1`, plus equal nonzero
+  per-sentinel `hits` summing to the total. **All 7 phases pass.** (The phase
+  may run >once via the '6' key auto-repeating before the slow paste-pump
+  releases it — same harness quirk phases 4/5 tolerate — so the assertion
+  checks per-sentinel *equality* + `which`, not an exact count.)
+
+## Previously shipped (4.9.4-VGA — framebuffer write coverage)
 
 Closed the last 4.9.4 gap: `mem.watch` now covers the **VGA framebuffer**
 (A0000–BFFFF), not just normal RAM, while fixing a latent emulation-corruption
@@ -234,14 +307,10 @@ python tests/agent_live/test_observability.py
 
 ## Not done / deferred (pick up here, in proposal priority order)
 
-- **4.9.4 is now complete** (RAM + VGA framebuffer both covered). Next items:
-- **4.9.5 multi-sentinel watches** — let `cpu.watch_target` / `farcall.watch`
-  hold a *set* (and `cpu.watch_range` several ranges) with a `which` field on
-  events. NOTES flags this ~20 lines (generalize `g_*WatchSeg` to a container).
-  The per-watch hit-counter plumbing added here should extend to per-sentinel
-  counts.
+- **4.9.4 and 4.9.5 are now complete.** Next items:
 - **4.9.7 `cpu.step` / `cpu.step_over`** — structured single-step returning the
-  post-step `regs.get` snapshot.
+  post-step `regs.get` snapshot. (NOTES' suggested alternative if 4.9.5 had
+  ballooned — it didn't, so this is simply the next item.)
 - **4.9.8 `state.save` / `state.restore`** — agent entry points into the
   existing savestate subsystem for deterministic, instant iteration.
 - **4.9.9 conditional / Nth-hit BP + on-hit command macro** — `bp.set {if, do,
@@ -275,7 +344,10 @@ python tests/agent_live/test_observability.py
   `landmark_store`, old/new == the known transition).
 - 4.9.4-VGA "name the framebuffer writer" → phase5 (`mem.write`
   `from_cs:from_ip` == `landmark_vga_store`, `new==0x5A`, `old==null`).
-- 4.9.5 / 4.9.8 acceptance tests deferred with those items.
+- 4.9.5 "which of N watched targets fired" → phase6 (two-sentinel
+  `cpu.watch_target`: `cpu.transfer` `which==0` for `landmark_msa`, `which==1`
+  for `landmark_msb`; per-sentinel `hits` in `debug.status`).
+- 4.9.8 acceptance test deferred with that item.
 
 ## Environment note
 
