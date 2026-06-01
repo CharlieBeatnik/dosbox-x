@@ -55,9 +55,15 @@ namespace agent {
 
 /* Far-transfer watch state — file-scope so the public AGENT_FarWatch*
  * helpers below can mutate it without going through dispatch. Read on the
- * CPU dispatch hot path; written only from the main thread. */
+ * CPU dispatch hot path; written only from the main thread.
+ *
+ * Each watch carries a monotonic hit counter (proposal 4.9.1) incremented
+ * by its matcher when it returns true — i.e. once per emitted event. It is
+ * read by debug.status (agent_observe.cpp) so an agent can prove a watch was
+ * (or was not) exercised without consuming the event stream. */
 bool     g_farWatchEnabled = false;
 uint16_t g_farWatchSeg     = 0;
+uint64_t g_farWatchHits    = 0;
 
 /* Near-transfer watch state (proposal 4.4). Same single-thread invariants
  * as the FAR watch above; the (seg, off) pair filters the much higher
@@ -65,6 +71,7 @@ uint16_t g_farWatchSeg     = 0;
 bool     g_targetWatchEnabled = false;
 uint16_t g_targetWatchSeg     = 0;
 uint16_t g_targetWatchOff     = 0;
+uint64_t g_targetWatchHits    = 0;
 
 /* Range-entry watch state (proposal 4.8). Fires only on a transfer that
  * lands at [seg, lo..hi] *from outside* that window. Same single-thread
@@ -73,6 +80,7 @@ bool     g_rangeWatchEnabled = false;
 uint16_t g_rangeWatchSeg     = 0;
 uint16_t g_rangeWatchLo      = 0;
 uint16_t g_rangeWatchHi      = 0;
+uint64_t g_rangeWatchHits     = 0;
 
 /* screen.capture pending-request state (proposal 4.7). The handler returns
  * an empty string so the protocol layer queues no immediate reply, then
@@ -521,6 +529,12 @@ std::string dispatchLine(const std::string &line) {
     if (cmd->s == "cpu.unwatch_target")return jsonEncode(handleCpuUnwatchTarget(id, a));
     if (cmd->s == "cpu.watch_range")   return jsonEncode(handleCpuWatchRange(id, a));
     if (cmd->s == "cpu.unwatch_range") return jsonEncode(handleCpuUnwatchRange(id, a));
+    /* Observability & trust (proposal 4.9) — handlers in agent_observe.cpp. */
+    if (cmd->s == "debug.status")      return jsonEncode(handleDebugStatus(id, a));
+    if (cmd->s == "cpu.probe")         return jsonEncode(handleCpuProbe(id, a));
+    if (cmd->s == "cpu.trace_ring")    return jsonEncode(handleCpuTraceRing(id, a));
+    if (cmd->s == "cpu.traceback")     return jsonEncode(handleCpuTraceback(id, a));
+    if (cmd->s == "cpu.disasm")        return jsonEncode(handleCpuDisasm(id, a));
     /* screen.capture returns "" so the protocol layer queues no immediate
      * reply; the deferred reply is sent from AGENT_OnScreenCaptured. */
     if (cmd->s == "screen.capture")    return handleScreenCapture(id, a);
@@ -589,35 +603,47 @@ bool AGENT_IsHeadless(void) {
 }
 
 bool AGENT_FarWatchMatches(uint16_t seg) {
-    return agent::g_farWatchEnabled && seg == agent::g_farWatchSeg;
+    if (agent::g_farWatchEnabled && seg == agent::g_farWatchSeg) {
+        agent::g_farWatchHits++;
+        return true;
+    }
+    return false;
 }
 
 void AGENT_FarWatchSet(uint16_t seg) {
     agent::g_farWatchSeg     = seg;
     agent::g_farWatchEnabled = true;
+    agent::g_farWatchHits    = 0;
 }
 
 void AGENT_FarWatchClear(void) {
     agent::g_farWatchEnabled = false;
     agent::g_farWatchSeg     = 0;
+    agent::g_farWatchHits    = 0;
 }
 
 bool AGENT_TargetWatchMatches(uint16_t seg, uint16_t off) {
-    return agent::g_targetWatchEnabled
+    if (agent::g_targetWatchEnabled
         && seg == agent::g_targetWatchSeg
-        && off == agent::g_targetWatchOff;
+        && off == agent::g_targetWatchOff) {
+        agent::g_targetWatchHits++;
+        return true;
+    }
+    return false;
 }
 
 void AGENT_TargetWatchSet(uint16_t seg, uint16_t off) {
     agent::g_targetWatchSeg     = seg;
     agent::g_targetWatchOff     = off;
     agent::g_targetWatchEnabled = true;
+    agent::g_targetWatchHits    = 0;
 }
 
 void AGENT_TargetWatchClear(void) {
     agent::g_targetWatchEnabled = false;
     agent::g_targetWatchSeg     = 0;
     agent::g_targetWatchOff     = 0;
+    agent::g_targetWatchHits    = 0;
 }
 
 bool AGENT_RangeWatchEntry(uint16_t target_seg, uint16_t target_off,
@@ -629,9 +655,15 @@ bool AGENT_RangeWatchEntry(uint16_t target_seg, uint16_t target_off,
     /* "From outside the range" gate. A FAR landing whose source seg is
      * different from the watched seg is trivially outside. Within the
      * same seg, the previous instruction's IP must fall outside [lo, hi]. */
-    if (from_seg != agent::g_rangeWatchSeg)            return true;
-    return (from_ip < agent::g_rangeWatchLo) ||
-           (from_ip > agent::g_rangeWatchHi);
+    if (from_seg != agent::g_rangeWatchSeg) {
+        agent::g_rangeWatchHits++;
+        return true;
+    }
+    if ((from_ip < agent::g_rangeWatchLo) || (from_ip > agent::g_rangeWatchHi)) {
+        agent::g_rangeWatchHits++;
+        return true;
+    }
+    return false;
 }
 
 void AGENT_RangeWatchSet(uint16_t seg, uint16_t lo, uint16_t hi) {
@@ -639,6 +671,7 @@ void AGENT_RangeWatchSet(uint16_t seg, uint16_t lo, uint16_t hi) {
     agent::g_rangeWatchLo      = lo;
     agent::g_rangeWatchHi      = hi;
     agent::g_rangeWatchEnabled = true;
+    agent::g_rangeWatchHits    = 0;
 }
 
 void AGENT_RangeWatchClear(void) {
@@ -646,6 +679,7 @@ void AGENT_RangeWatchClear(void) {
     agent::g_rangeWatchSeg     = 0;
     agent::g_rangeWatchLo      = 0;
     agent::g_rangeWatchHi      = 0;
+    agent::g_rangeWatchHits    = 0;
 }
 
 #endif /* C_DEBUG */

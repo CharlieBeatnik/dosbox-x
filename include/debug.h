@@ -29,6 +29,54 @@ Bitu DEBUG_EnableDebugger(void);
 extern Bitu cycle_count;
 extern Bitu debugCallback;
 
+uint16_t DEBUG_GetPrevCS(void);
+uint16_t DEBUG_GetPrevIP(void);
+
+/* ---- Agent observability bridge (proposal 4.9) --------------------------
+ * Thin C-style entry points the agent subsystem uses to read debugger
+ * internals (the CBreakpoint list is file-local to debug.cpp) without
+ * coupling the agent translation units to the debugger's STL containers.
+ * All are no-ops / empty when there is nothing to report and are only
+ * meaningful in a C_DEBUG build. */
+
+/* debug.h has no overall include guard (it is intentionally re-includable —
+ * it is only function prototypes and externs, which are idempotent). The
+ * agent-observability additions below are the first *type* definitions in
+ * this header, so they need their own guard against double inclusion. */
+#ifndef DOSBOX_DEBUG_AGENT_TYPES
+#define DOSBOX_DEBUG_AGENT_TYPES
+
+/* Kind codes reported in AgentBreakpointInfo so the agent does not have to
+ * know the internal EBreakpoint enum values. */
+enum AgentBpKind {
+    AGENT_BPKIND_EXEC   = 0,   /* BKPNT_PHYSICAL                         */
+    AGENT_BPKIND_INT    = 1,   /* BKPNT_INTERRUPT                        */
+    AGENT_BPKIND_MEM    = 2,   /* BKPNT_MEMORY*                          */
+    AGENT_BPKIND_OTHER  = 3
+};
+
+struct AgentBreakpointInfo {
+    int       index;    /* BPoints iteration order — matches bp.hit bp_index */
+    int       kind;     /* one of AgentBpKind                                */
+    uint16_t  seg;      /* segment for EXEC/MEM kinds (0 for INT)            */
+    uint32_t  off;      /* offset  for EXEC/MEM kinds (0 for INT)            */
+    uint32_t  linear;   /* GetAddress(seg,off) — for the bytes_now read      */
+    uint8_t   intnr;    /* interrupt number for INT kind                     */
+    bool      enabled;  /* IsActive()                                        */
+    uint64_t  hits;     /* monotonic hit counter (4.9.1)                     */
+};
+
+#endif /* DOSBOX_DEBUG_AGENT_TYPES */
+
+/* Invoke `cb` once per breakpoint, in BPoints iteration order. */
+void DEBUG_AgentForEachBreakpoint(
+    void (*cb)(void *ctx, const AgentBreakpointInfo *info), void *ctx);
+
+/* Disassemble one instruction at guest seg:off into `text` (NUL-terminated,
+ * truncated to textsz). Returns the instruction length in bytes (0 if
+ * textsz==0). Honours the current code-segment operand size. */
+int DEBUG_AgentDisasmOne(uint16_t seg, uint32_t off, char *text, size_t textsz);
+
 #ifdef C_HEAVY_DEBUG
 bool DEBUG_HeavyIsBreakpoint(void);
 void DEBUG_HeavyWriteLogInstruction(void);

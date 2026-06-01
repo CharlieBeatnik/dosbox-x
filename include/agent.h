@@ -107,6 +107,24 @@ void AGENT_EmitRangeEnter(const char *kind,
                           uint16_t target_seg, uint16_t target_off,
                           uint16_t from_cs,    uint16_t from_ip);
 
+/* Execution probe (proposal 4.9.2). A set of (seg, off) points each with a
+ * monotonic counter, checked once per instruction from the heavy-debug
+ * per-instruction hook. Unlike a breakpoint it never halts the CPU and never
+ * emits an event, so it runs at full speed and answers "was this address ever
+ * executed, and how many times?" without the ~20x halting-BP slowdown.
+ * AGENT_ProbeActive() is the fast gate the hot path tests first so a disarmed
+ * probe costs a single bool load. */
+bool AGENT_ProbeActive(void);
+void AGENT_ProbeCheck(uint16_t seg, uint16_t off);
+
+/* Instruction-trace ring (proposal 4.9.3). When armed, records the retired
+ * (seg, off) of each executed instruction into a fixed-size ring so a later
+ * cpu.traceback can answer "how did the CPU get here?" in one run. Optionally
+ * filtered to a single CS to skip BIOS/IRET noise. AGENT_TraceActive() gates
+ * the hot path the same way the probe does. */
+bool AGENT_TraceActive(void);
+void AGENT_TraceRecord(uint16_t seg, uint16_t off);
+
 /* Notified when DOSBOX_SetNormalLoop / DOSBOX_SetLoop changes the main
  * loop. Used so we know when to flip state.paused <-> state.running. */
 void AGENT_OnLoopChange(void);
@@ -154,6 +172,10 @@ static inline void AGENT_RangeWatchClear(void) {}
 static inline void AGENT_EmitRangeEnter(const char * /*kind*/,
                                         uint16_t /*target_seg*/, uint16_t /*target_off*/,
                                         uint16_t /*from_cs*/,    uint16_t /*from_ip*/) {}
+static inline bool AGENT_ProbeActive(void) { return false; }
+static inline void AGENT_ProbeCheck(uint16_t /*seg*/, uint16_t /*off*/) {}
+static inline bool AGENT_TraceActive(void) { return false; }
+static inline void AGENT_TraceRecord(uint16_t /*seg*/, uint16_t /*off*/) {}
 static inline void AGENT_OnLoopChange(void) {}
 static inline void AGENT_OnScreenCaptured(const char * /*path*/, bool /*raw*/) {}
 static inline bool AGENT_IsHeadless(void) { return false; }

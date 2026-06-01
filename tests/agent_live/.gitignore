@@ -1,9 +1,24 @@
-# Build artefacts from `_build.dosbox-x.conf` (TASM 1.0 + TLINK /T):
+# bptest build artefacts (the .COM is committed):
 BPTEST.OBJ
 BPTEST.LST
 BPTEST.MAP
-BUILD.LOG
 
-# DOSBox-X transient state:
+# obstest build artefacts (OBSTEST.COM is committed; built by build_masm.py):
+OBSTEST.OBJ
+OBSTEST.LST
+OBSTEST.MAP
+
+# in-DOS build log + generated build driver:
+BUILD.LOG
+_masmbuild.bat
+_masmbuild.dosbox-x.conf
+
+# DOSBox-X transient state + local scratch:
 *.dosbox-x.log
 __pycache__/
+_*.txt
+_*.py
+_*.conf
+tiny.asm
+TINY.OBJ
+DIAG.LOG

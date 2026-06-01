@@ -128,6 +128,11 @@ events don't. The reference client does this in a single reader thread.
 | `cpu.watch_range`   | `{seg, lo, hi}`               | `{watching, seg, lo, hi}`           |
 | `cpu.unwatch_range` | none                          | `{watching: false}`                 |
 | `screen.capture`    | `{raw?: bool}`                | `{path, raw}` (deferred — see below) |
+| `debug.status`      | none                          | full snapshot — see below           |
+| `cpu.probe`         | `{points: ["SEG:OFF", …]}`    | `{armed: N}` (`[]` to disarm)       |
+| `cpu.trace_ring`    | `{depth?, enabled?, seg?}`    | `{enabled, depth, seg?}`            |
+| `cpu.traceback`     | `{count?}`                    | `{entries: [{cs_ip, bytes, text}]}` |
+| `cpu.disasm`        | `{addr, count?}`              | `{insns: [{cs_ip, bytes, text}]}`   |
 
 ### `vm.version`
 
@@ -603,6 +608,105 @@ When a request fails the reply is `{"id": N, "ok": false, "error": {code, messag
 
 Malformed JSON gets an unsolicited `agent.error` event (no `id` to reply
 to). The connection stays up; just send the next request.
+
+## Observability & trust (proposal 4.9)
+
+These commands exist to answer the question that otherwise forks every
+silent watch/breakpoint result into two un-decidable hypotheses: *did the
+CPU never reach that address (real software behaviour), or did the debugger
+fail to observe it (tool deficiency)?* Every armed observer is now
+independently provable — you never take the debugger's silence on faith.
+
+### `debug.status` — non-halting typed snapshot
+
+No arguments. Readable while the CPU is **running or paused**, without
+consuming the event stream:
+
+```json
+{
+  "cpu": "running",                  // or "paused"
+  "cs_ip": "0824:000099E2",
+  "cs": 2084, "eip": 39394,
+  "instr_count": 123456789,          // emulated instructions since boot (cycle_count)
+  "breakpoints": [
+    {"index":0,"kind":"exec","addr":"0824:C01E","enabled":true,"hits":42,
+     "seg":2084,"off":49182,"bytes_now":"2E FF 65 FE"},
+    {"index":1,"kind":"int","int":8,"enabled":true,"hits":1573}
+  ],
+  "watches": {
+    "far":    {"armed":false,"hits":0},
+    "target": {"armed":true,"hits":0,"seg":2084,"off":49182},
+    "range":  {"armed":true,"hits":7,"seg":2084,"lo":38400,"hi":39423}
+  },
+  "probe": [ {"addr":"0824:6F10","seg":2084,"off":28432,"hits":0} ],
+  "trace": {"enabled":true,"depth":256,"count":256,"seg":2084}
+}
+```
+
+- **`hits`** on each breakpoint and watch is a monotonic counter incremented
+  by the matcher itself — the same code path that fires the event — so it is
+  authoritative. The canonical use (the "C01E saga"): arm `BP`, a
+  `cpu.watch_target`, and a `cpu.probe` on one address, drive the repro, read
+  `debug.status`. If the BP and probe `hits` agree but the watch `hits` is 0,
+  the watch path is provably the bug — settled in one run.
+- **`bytes_now`** is the live four bytes at each exec breakpoint, read via
+  `phys_readb`; it catches "armed on a wrong/relocated address" for free.
+- `kind` is `exec` / `int` / `mem` / `other`. INT breakpoints carry `int`
+  instead of `addr`/`seg`/`off`.
+
+### `cpu.probe` — non-halting execution counter
+
+```json
+{"id":1,"cmd":"cpu.probe","args":{"points":["0824:6F10","0824:99E2"]}}  → {"armed":2}
+{"id":2,"cmd":"cpu.probe","args":{"points":[]}}                          → {"armed":0}
+```
+
+A set of `SEG:OFF` points (hex), each with its own counter, checked once per
+instruction from the heavy-debug per-instruction hook. Unlike a breakpoint it
+**never halts** and emits **no event**, so it runs at full speed and sidesteps
+the ~20× halting-BP slowdown that often starves a repro before it reaches the
+bug window. Counts are read back via `debug.status`'s `probe` array. Up to 256
+points; calling again replaces the set. `hits == 0` after a full-speed run ⇒
+provably never executed; `hits > 0` ⇒ provably on the path. Requires a
+**heavy-debug** build.
+
+### `cpu.trace_ring` / `cpu.traceback` — "how did the CPU get here?"
+
+```json
+{"id":1,"cmd":"cpu.trace_ring","args":{"depth":256,"seg":"0824"}}
+   → {"enabled":true,"depth":256,"seg":2084}
+// ... drive to a breakpoint/pause ...
+{"id":2,"cmd":"cpu.traceback","args":{"count":64}}
+   → {"entries":[
+        {"cs_ip":"0824:9849","bytes":"00 00","text":"add [bx+si],al"},
+        {"cs_ip":"0824:99E2","bytes":"63 C0","text":"arpl ax,ax"}   // most-recent last
+     ]}
+```
+
+`cpu.trace_ring` arms a fixed-size ring recording the retired `(seg, off)` of
+every executed instruction (gated on an arm flag, so it costs nothing when
+off). Consecutive duplicates of the same CS:IP collapse to one, so a halting
+breakpoint at an address can't flood the ring. Optional `seg` filters to one
+code segment. `enabled:false` stops recording but **retains** the ring, so a
+traceback after the CPU pauses still works. `depth` defaults to 256, capped at
+4096. `cpu.traceback` dumps the last `count` retired instructions, oldest
+first (so the array reads most-recent-last), each disassembled. Requires a
+heavy-debug build. This reconstructs an entire backward slide in **one**
+capture instead of an O(N)-run byte-walk, with no data-as-code alignment
+guessing.
+
+### `cpu.disasm` — structured disassembly (no more hand-decoding)
+
+```json
+{"id":1,"cmd":"cpu.disasm","args":{"addr":"0824:99C5","count":4}}
+   → {"insns":[{"cs_ip":"0824:99C5","bytes":"E2 41","text":"loop 0x9A08"}, ...]}
+```
+
+Disassembles `count` instructions (default 1, max 64) from `SEG:OFF`, reusing
+the same `DasmI386` the curses debugger uses. `bytes` is the exact raw encoding
+(always agrees with `mem.read` of the same address) and `text` is the decoded
+mnemonic — removing the unsafe hand-decode the X2RE TOOL MANDATE warns against.
+Operand size follows the current code segment (`cpu.code.big`).
 
 ## What is *not* capturable
 

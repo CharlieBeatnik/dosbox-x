@@ -153,6 +153,31 @@ JsonValue handleKeyboardTap(double id, const JsonValue &args);
 JsonValue handleRegsGet(double id, const JsonValue &args);
 JsonValue handleMemRead(double id, const JsonValue &args);
 
+/* ---- Observability (proposal 4.9) --------------------------------------
+ * Watch state + hit counters live in agent.cpp (read on the CPU hot path,
+ * written from the main thread). debug.status in agent_observe.cpp reads
+ * them via these externs to report each watch's armed/sentinel/hit-count
+ * without halting the CPU or consuming the event stream. */
+extern bool     g_farWatchEnabled;
+extern uint16_t g_farWatchSeg;
+extern uint64_t g_farWatchHits;
+extern bool     g_targetWatchEnabled;
+extern uint16_t g_targetWatchSeg;
+extern uint16_t g_targetWatchOff;
+extern uint64_t g_targetWatchHits;
+extern bool     g_rangeWatchEnabled;
+extern uint16_t g_rangeWatchSeg;
+extern uint16_t g_rangeWatchLo;
+extern uint16_t g_rangeWatchHi;
+extern uint64_t g_rangeWatchHits;
+
+/* Dispatch entry points implemented in agent_observe.cpp. */
+JsonValue handleDebugStatus(double id, const JsonValue &args);    /* 4.9.1 */
+JsonValue handleCpuProbe(double id, const JsonValue &args);       /* 4.9.2 */
+JsonValue handleCpuTraceRing(double id, const JsonValue &args);   /* 4.9.3 */
+JsonValue handleCpuTraceback(double id, const JsonValue &args);   /* 4.9.3 */
+JsonValue handleCpuDisasm(double id, const JsonValue &args);      /* 4.9.6 */
+
 /* Reply helpers shared between agent.cpp and agent_keyboard.cpp. */
 JsonValue makeReplyOk(double id, JsonObject result);
 JsonValue makeReplyError(double id, const std::string &code, const std::string &message);

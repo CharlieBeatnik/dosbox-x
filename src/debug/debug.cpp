@@ -582,6 +582,12 @@ public:
 	uint16_t					GetValue		(void)						{ return ahValue; };
 	uint16_t					GetOther		(void)						{ return alValue; };
 
+	// Monotonic hit counter (agent proposal 4.9.1). Incremented every time
+	// this breakpoint matches in CheckBreakpoint / CheckIntBreakpoint, even
+	// when the match does not halt the CPU. Readable via debug.status.
+	uint64_t				GetHits			(void)						{ return hits; };
+	void					BumpHits		(void)						{ hits++; };
+
 	// statics
 	static CBreakpoint*		AddBreakpoint		(uint16_t seg, uint32_t off, bool once);
 	static CBreakpoint*		AddIntBreakpoint	(uint8_t intNum, uint16_t ah, uint16_t al, bool once);
@@ -616,11 +622,15 @@ private:
 	// Shared
 	bool		active;
 	bool		once;
+	uint64_t	hits = 0;	// agent proposal 4.9.1 — see GetHits/BumpHits
 
 	static std::list<CBreakpoint*>	BPoints;
 #if C_HEAVY_DEBUG
 	friend bool DEBUG_HeavyIsBreakpoint(void);
 #endif
+	// agent 4.9.1 — read-only iteration over BPoints for debug.status
+	friend void DEBUG_AgentForEachBreakpoint(
+		void (*cb)(void *ctx, const AgentBreakpointInfo *info), void *ctx);
 };
 
 CBreakpoint::CBreakpoint(void):type(BKPNT_UNKNOWN),location(0),
@@ -750,6 +760,7 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
 
 		if ((bp->GetType() == BKPNT_PHYSICAL) && bp->IsActive() &&
 		    (bp->GetLocation() == GetAddress(seg, off))) {
+			bp->BumpHits();		// agent 4.9.1
 			/* Pass the previous instruction's CS:IP so consumers can attribute
 			 * the transfer source even when the source opcode isn't hooked. */
 			AGENT_EmitBpHit(seg, off, bp_index,
@@ -797,6 +808,7 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
                         return false;
                     }
 					DEBUG_ShowMsg("DEBUG: Memory breakpoint %s: %04X:%04X - %02X -> %02X\n",(bp->GetType()==BKPNT_MEMORY_PROT)?"(Prot)":"",bp->GetSegment(),bp->GetOffset(),bp->GetValue(),value);
+					bp->BumpHits();		// agent 4.9.1
 					AGENT_EmitBpHit(seg, off, bp_index,
 					                DEBUG_GetPrevCS(), DEBUG_GetPrevIP());
 					bp->SetValue(value);
@@ -824,6 +836,7 @@ bool CBreakpoint::CheckIntBreakpoint(PhysPt adr, uint8_t intNr, uint16_t ahValue
 		CBreakpoint* bp = (*i);
 		if ((bp->GetType()==BKPNT_INTERRUPT) && bp->IsActive() && (bp->GetIntNr()==intNr)) {
 			if (((bp->GetValue()==BPINT_ALL) || (bp->GetValue()==ahValue)) && ((bp->GetOther()==BPINT_ALL) || (bp->GetOther()==alValue))) {
+				bp->BumpHits();		// agent 4.9.1
 				AGENT_EmitBpHit(SegValue(cs), reg_eip, bp_index,
 				                DEBUG_GetPrevCS(), DEBUG_GetPrevIP());
 				// Ignore it once ?
@@ -839,6 +852,54 @@ bool CBreakpoint::CheckIntBreakpoint(PhysPt adr, uint8_t intNr, uint16_t ahValue
 		}
 	}
 	return false;
+}
+
+/* ---- Agent observability bridge (proposal 4.9) ------------------------- */
+
+void DEBUG_AgentForEachBreakpoint(
+	void (*cb)(void *ctx, const AgentBreakpointInfo *info), void *ctx)
+{
+	if (!cb) return;
+	int index = 0;
+	for (auto i = CBreakpoint::BPoints.begin(); i != CBreakpoint::BPoints.end(); ++i, ++index) {
+		CBreakpoint *bp = *i;
+		AgentBreakpointInfo info;
+		info.index   = index;
+		info.seg     = bp->GetSegment();
+		info.off     = bp->GetOffset();
+		info.intnr   = bp->GetIntNr();
+		info.enabled = bp->IsActive();
+		info.hits    = bp->GetHits();
+		switch (bp->GetType()) {
+			case BKPNT_PHYSICAL:      info.kind = AGENT_BPKIND_EXEC; break;
+			case BKPNT_INTERRUPT:     info.kind = AGENT_BPKIND_INT;  break;
+			case BKPNT_MEMORY:
+			case BKPNT_MEMORY_PROT:
+			case BKPNT_MEMORY_LINEAR:
+			case BKPNT_MEMORY_FREEZE: info.kind = AGENT_BPKIND_MEM;  break;
+			default:                  info.kind = AGENT_BPKIND_OTHER; break;
+		}
+		info.linear  = (info.kind == AGENT_BPKIND_INT)
+		               ? 0u : (uint32_t)GetAddress(info.seg, info.off);
+		cb(ctx, &info);
+	}
+}
+
+/* Disassemble one instruction at guest seg:off. Real-mode programs and the
+ * current CS use cpu.code.big for operand size; an arbitrary protected-mode
+ * selector with a different default size is not handled (matches DrawCode's
+ * behaviour for the current segment). */
+int DEBUG_AgentDisasmOne(uint16_t seg, uint32_t off, char *text, size_t textsz)
+{
+	if (!text || textsz == 0) return 0;
+	char dline[200];
+	PhysPt start = (PhysPt)GetAddress(seg, off);
+	Bitu size = DasmI386(dline, start, off, cpu.code.big);
+	size_t n = strlen(dline);
+	if (n >= textsz) n = textsz - 1;
+	memcpy(text, dline, n);
+	text[n] = '\0';
+	return (int)size;
 }
 
 void CBreakpoint::DeleteAll()
@@ -6139,6 +6200,12 @@ bool DEBUG_HeavyIsBreakpoint(void) {
 	const uint16_t prev_ip = g_dbg_prev_ip;
 	g_dbg_prev_cs = cur_cs;
 	g_dbg_prev_ip = cur_ip;
+
+	/* Agent execution probe (4.9.2) and trace ring (4.9.3). Each is gated on
+	 * a fast bool so a disarmed observer costs only that load. Recorded for
+	 * every executed instruction, before any early-return below. */
+	if (AGENT_ProbeActive()) AGENT_ProbeCheck(cur_cs, cur_ip);
+	if (AGENT_TraceActive()) AGENT_TraceRecord(cur_cs, cur_ip);
 
 	if (cpuLog) {
 		if (cpuLogCounter>0) {
