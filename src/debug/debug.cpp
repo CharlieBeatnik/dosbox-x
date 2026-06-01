@@ -4454,6 +4454,10 @@ int DEBUG_AgentStep(bool over) {
 	return 1;
 }
 
+bool DEBUG_AgentIsPaused(void) {
+	return debugging;
+}
+
 uint32_t DEBUG_CheckKeys(void) {
 	/* When the curses debugger has not been initialised (e.g. headless
 	 * agent-driven debugging), there is no stdscr for `getch` to read

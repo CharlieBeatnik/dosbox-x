@@ -129,11 +129,16 @@ Goal: a reproducible end-to-end test.
 
 ## Iteration 7+ — Phase 2 (each bullet is its own iteration)
 
+> Much of this list was delivered by the **proposal-4.9 (observability & trust)**
+> work — see `HANDOFF.md` for the canonical status of those iterations. Items
+> below are checked off where 4.9 covered them.
+
 - [ ] `bp.add` / `bp.list` / `bp.del` typed (direct `CBreakpoint::*`).
-- [ ] `mem.read` (binary, base64).
-- [ ] `mem.write`.
-- [ ] `regs.get` / `regs.set` typed.
-- [ ] `cpu.step` / `cpu.step_over` with structured output.
-- [ ] `disasm` `{addr, count}` via `DasmI386`.
+- [x] `mem.read` (binary, base64). *(shipped)*
+- [ ] `mem.write` (typed store; `mem.watch` write-intercept shipped in 4.9.4).
+- [x] `regs.get` typed. *(shipped)* — `regs.set` still TODO.
+- [x] `cpu.step` / `cpu.step_over` with structured output. *(4.9.7)*
+- [x] `disasm` `{addr, count}` via `DasmI386` — `cpu.disasm`. *(4.9.6)*
+- [x] `state.save` / `state.restore` — slot-based, headless. *(4.9.8)*
 - [ ] `mouse.move` / `mouse.click`.
-- [ ] `vm.screenshot`.
+- [x] `vm.screenshot` — `screen.capture` (deferred reply). *(shipped)*

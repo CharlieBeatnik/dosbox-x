@@ -769,4 +769,59 @@ TEST_F(AgentObservabilityTest, CpuStepOverBusyWhilePending)
     g_stepOverPending = false;   /* don't leak into the next test */
 }
 
+/* ---- state.save / state.restore (4.9.8) ----------------------------- */
+/* The save/restore themselves drive the whole savestate subsystem (zip I/O,
+ * every device component, MemBase) and require a paused CPU + initialised
+ * core, none of which exist in -tests mode. So these exercise the two gates
+ * that run before any of that: argument validation (a bad/missing slot is
+ * rejected with bad_args, checked first so it is testable headless) and the
+ * paused gate (a valid slot while the CPU is not paused refuses with bad_state,
+ * never touching SaveState). The real round-trip is covered live by
+ * tests/agent_live/test_observability.py phase 8. */
+
+TEST_F(AgentObservabilityTest, StateSaveRejectsBadSlot)
+{
+    /* Out-of-range slot (>= 100) -> bad_args, before the paused check. */
+    JsonValue v = parse(dispatchLine(
+        "{\"id\":8,\"cmd\":\"state.save\",\"args\":{\"slot\":100}}"));
+    ASSERT_TRUE(v.get("ok"));
+    EXPECT_FALSE(v.get("ok")->b);
+    ASSERT_TRUE(v.get("error") && v.get("error")->get("code"));
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+
+    /* Missing slot -> bad_args too. */
+    v = parse(dispatchLine("{\"id\":8,\"cmd\":\"state.save\"}"));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+}
+
+TEST_F(AgentObservabilityTest, StateSaveRequiresPause)
+{
+    /* Valid slot, but the CPU is not paused in -tests mode -> bad_state. */
+    JsonValue v = parse(dispatchLine(
+        "{\"id\":8,\"cmd\":\"state.save\",\"args\":{\"slot\":7}}"));
+    ASSERT_TRUE(v.get("ok"));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_state");
+}
+
+TEST_F(AgentObservabilityTest, StateRestoreRejectsBadSlot)
+{
+    JsonValue v = parse(dispatchLine(
+        "{\"id\":9,\"cmd\":\"state.restore\",\"args\":{\"slot\":-1}}"));
+    ASSERT_TRUE(v.get("ok"));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+}
+
+TEST_F(AgentObservabilityTest, StateRestoreRequiresPause)
+{
+    /* Valid slot, not paused -> bad_state, before the empty-slot / load path. */
+    JsonValue v = parse(dispatchLine(
+        "{\"id\":9,\"cmd\":\"state.restore\",\"args\":{\"slot\":7}}"));
+    ASSERT_TRUE(v.get("ok"));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_state");
+}
+
 }  /* anonymous namespace */

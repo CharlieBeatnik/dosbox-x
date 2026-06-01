@@ -195,6 +195,29 @@ class DbxAgent:
         """
         return self.call("cpu.step_over", timeout=timeout)
 
+    def state_save(self, slot: int) -> dict:
+        """Snapshot the whole machine to save ``slot`` (0-99). CPU must be paused.
+
+        Headless wrapper over DOSBox-X's savestate subsystem with the remark /
+        confirmation dialogs suppressed and the slot argument always honoured
+        (independent of any ``savefile=`` config). Returns ``{slot, name}``
+        where ``name`` is the human-readable slot label. Errors ``bad_args``
+        (slot out of range), ``bad_state`` (CPU not paused), ``unsupported``
+        (guest memory over the 1 GB savestate limit), or ``io_error``.
+        """
+        return self.call("state.save", slot=slot)
+
+    def state_restore(self, slot: int) -> dict:
+        """Restore the whole machine from save ``slot`` (0-99). CPU must be paused.
+
+        The companion to ``state_save``: restores in place and replies with the
+        restored ``{regs, cs_ip, insn}`` (same shape as ``cpu_step``) plus
+        ``slot`` and ``name``, so you immediately see where the machine will
+        resume. Errors ``bad_args`` (slot out of range), ``bad_state`` (CPU not
+        paused), ``not_found`` (slot empty), or ``unsupported``.
+        """
+        return self.call("state.restore", slot=slot)
+
     def regs_get(self) -> dict:
         """Snapshot all CPU registers in one structured reply.
 

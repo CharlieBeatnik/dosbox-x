@@ -163,6 +163,13 @@ JsonValue   handleCpuStep(double id, const JsonValue &args);
 std::string handleCpuStepOver(double id, const JsonValue &args);
 JsonObject  buildStepResult(void);
 
+/* state.save / state.restore (proposal 4.9.8), implemented in agent_cpu.cpp.
+ * Slot-based, headless wrappers over the savestate subsystem (UI prompts
+ * suppressed). Both require the CPU paused; state.restore replies with the
+ * restored {regs, cs_ip, insn} so the client sees where the machine resumes. */
+JsonValue handleStateSave(double id, const JsonValue &args);
+JsonValue handleStateRestore(double id, const JsonValue &args);
+
 /* Pending cpu.step_over reply slot (defined in agent.cpp). Single-slot because
  * Phase 1 is single-client and a step-over can't be issued while one is in
  * flight (the CPU is running until the temp BP fires). */

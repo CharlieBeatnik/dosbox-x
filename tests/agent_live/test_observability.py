@@ -683,6 +683,91 @@ def phase7_step(agent, cs, trace_a, trace_end, call_at, call_ret, sub, rep) -> N
             agent.cpu_run(); _drain_events(agent)
 
 
+def phase8_savestate(agent, cs, trace_a, rep) -> None:
+    # 4.9.8: state.save / state.restore round-trip the whole machine. Pause at a
+    # known landmark (trace_a, the phase-3 chain head, where `mov ax,AAAA` has
+    # NOT yet executed), snapshot to a slot, single-step three instructions so
+    # CS:IP advances and ax/bx/dx load AAAA/BBBB/DDDD, then restore and assert
+    # the CPU snapped back to the EXACT saved registers and CS:IP. Both ends
+    # require the CPU paused, which it already is at the BP. Breakpoints are a
+    # debugger construct and are not part of the snapshot, so we delete the BP
+    # before saving to keep the stepping unambiguous.
+    name = "phase8: state.save/state.restore round-trips full CPU state"
+    slot = 7   # high slot; avoids clobbering the user's slot 0/1
+    try:
+        _reset(agent)
+        agent.debugger_command(f"BP {cs:04X}:{trace_a:04X}")
+        agent.cpu_run(); _drain_events(agent)
+        agent.keyboard_tap("3")
+        _wait_for_event(agent, "bp.hit", timeout=8.0)
+        agent.debugger_command("BPDEL 0 *")
+        _drain_events(agent)
+
+        problems = []
+        saved = agent.regs_get()
+        if saved["eip"] & 0xFFFF != trace_a:
+            problems.append(
+                f"paused at {saved['eip'] & 0xFFFF:04X}, expected trace_a {trace_a:04X}")
+
+        sres = agent.state_save(slot)
+        if sres.get("slot") != slot:
+            problems.append(f"state.save slot={sres.get('slot')} (expected {slot})")
+
+        # Advance: three movs -> ax=AAAA, bx=BBBB, dx=DDDD; CS:IP moves forward.
+        for _ in range(3):
+            agent.cpu_step()
+        moved = agent.regs_get()
+        if moved["eip"] & 0xFFFF == trace_a:
+            problems.append("CS:IP did not advance after 3 steps")
+        if moved["eax"] & 0xFFFF != 0xAAAA:
+            problems.append(f"after steps eax={moved['eax']:#x} (want low AAAA)")
+
+        # Restore: the machine must snap back to the saved point.
+        r = agent.state_restore(slot)
+        if "regs" not in r or "cs_ip" not in r:
+            problems.append(f"state.restore result missing regs/cs_ip: {r}")
+        else:
+            if _off_of(r.get("cs_ip", "")) != trace_a:
+                problems.append(
+                    f"restore cs_ip {r.get('cs_ip')} != trace_a {trace_a:04X}")
+            # Every register in the restore reply must equal the save snapshot.
+            for k, want in saved.items():
+                if r["regs"].get(k) != want:
+                    problems.append(f"restore regs[{k}]={r['regs'].get(k)} != saved {want}")
+                    break
+            # The instruction now at CS:IP must match guest memory (anti-fabrication).
+            insn = r.get("insn", {})
+            gotbytes = (insn.get("bytes") or "").upper().split()
+            csip = insn.get("cs_ip", "")
+            if gotbytes and csip:
+                seg_s, _, off_s = csip.partition(":")
+                mem = agent.mem_read("seg:off", f"{seg_s}:{off_s}", len(gotbytes))
+                if [f"{x:02X}" for x in mem] != gotbytes:
+                    problems.append(f"@{csip} restore insn.bytes {gotbytes} != mem")
+
+        # Independent confirmation: live regs read back match the snapshot, not
+        # the moved-forward state.
+        live = agent.regs_get()
+        for k, want in saved.items():
+            if live.get(k) != want:
+                problems.append(f"post-restore live regs[{k}]={live.get(k)} != saved {want}")
+                break
+
+        if problems:
+            rep.record(name, False, "; ".join(problems[:4]))
+        else:
+            rep.record(name, True,
+                       f"saved+restored at trace_a {trace_a:04X}; "
+                       f"all 16 regs round-tripped (slot {slot})")
+    except Exception as exc:
+        rep.record(name, False, repr(exc))
+    finally:
+        with contextlib.suppress(Exception):
+            agent.cpu_pause(); _drain_events(agent)
+            agent.debugger_command("BPDEL 0 *")
+            agent.cpu_run(); _drain_events(agent)
+
+
 def run(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dosbox", default=str(DEFAULT_DOSBOX))
@@ -734,6 +819,7 @@ def run(argv=None) -> int:
             phase5_vga_memwatch(agent, cs, vga_store, rep)
             phase6_multi_sentinel(agent, cs, msa, msb, rep)
             phase7_step(agent, cs, trace_a, trace_end, call_at, call_ret, sub, rep)
+            phase8_savestate(agent, cs, trace_a, rep)
 
             with contextlib.suppress(Exception):
                 _reset(agent)

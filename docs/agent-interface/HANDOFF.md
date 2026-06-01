@@ -6,7 +6,98 @@ Leave-behind for the next agent continuing the **proposal-4.9** work on the
 Source proposal:
 `X2RE/.claude/notes/dosbox-x-fixes/PROPOSAL_4.9_observability_and_trust.md`.
 
-## What shipped this iteration (4.9.7 — `cpu.step` / `cpu.step_over`)
+## What shipped this iteration (4.9.8 — `state.save` / `state.restore`)
+
+Headless agent entry points into the existing savestate subsystem, so an agent
+can snapshot the bug window once and re-run from it instantly — deterministic,
+byte-identical iteration instead of the ~25 s re-drive (boot/mount/launch/
+navigate) every loop. Built, **111 unit tests pass**, and verified end-to-end (a
+new OBSTEST phase 8 that round-trips the full register file). 4.9.8 complete.
+
+| # | Item | Proves | Status |
+|---|------|--------|--------|
+| 4.9.8 | `state.save` / `state.restore` `{slot}` → headless snapshot/restore (restore returns `{regs, cs_ip, insn}`) | "snapshot here, re-run from here instantly and deterministically" | ✅ |
+
+### Design / code map
+
+- **Reuses `SaveState::instance().save/load/isEmpty/getName`** (`include/dosbox.h`
+  / `src/misc/savestates.cpp`) — the same slot-based subsystem the *Capture →
+  Save/Load state* menu drives. No new serialization; the headline value is the
+  *headless, deterministic* wrapping, not a new format.
+- **Handlers in `src/agent/agent_cpu.cpp`** (`handleStateSave` /
+  `handleStateRestore`), next to `cpu.step` because they share its "must be
+  paused" gate and the `buildStepResult()` reply builder. Dispatch: two cases in
+  `agent.cpp`; two prototypes in `agent_internal.h`.
+- **Paused gate.** Both require the CPU paused — new bridge
+  `bool DEBUG_AgentIsPaused(void)` (`src/debug/debug.cpp`, declared in
+  `include/debug.h`) returns the same `debugging` flag `DEBUG_AgentStep` checks.
+  The agent dispatch while paused runs inside `DEBUG_Loop` (CPU halted between
+  instructions — a safe point to replace whole-machine state). Running →
+  `bad_state`, exactly like `cpu.step`.
+- **Headless suppression — the crux.** `SaveState::save/load` are UI-coupled: a
+  `tinyfd_inputBox` remark prompt on save, `loadstateconfirm` (GUI_Shortcut)
+  version/program/memory/machine confirms on load, and `notifyError`
+  (`systemmessagebox`) modals — all of which would block the single-threaded
+  agent forever. The handlers temporarily set `noremark_save_state=true` (save)
+  / `force_load_state=true` (restore), and pin `use_save_file=false` so the
+  `slot` argument is always honoured regardless of any user `savefile=` config.
+  These three are plain globals (`use_save_file` in sdlmain.cpp; the other two in
+  savestates.cpp) — **declared `extern` at *global* scope** at the top of
+  agent_cpu.cpp, not inside `namespace agent` (a block-scope `extern` there mints
+  `agent::`-mangled symbols → LNK2001; learned the hard way this session).
+- **Pre-validation closes the remaining modal paths** the suppression flags
+  don't cover: out-of-range slot → `bad_args` (checked *first*, so it is
+  unit-testable headless); empty slot on restore → `not_found` (before load()'s
+  empty-slot `notifyError`); >1 GB guest memory → `unsupported` (before
+  save/load's own modal+return). Save returns void, so success is inferred from
+  `!isEmpty(slot)` afterwards (→ `io_error` if the write didn't land).
+- **Restore reply reuses `buildStepResult()`** → `{regs, cs_ip, insn}` of the
+  restored CPU, plus `slot`/`name`, so the client sees where the machine resumes
+  with no follow-up `regs.get`. Save reply is just `{slot, name}` (state
+  unchanged). `name` = `getName(slot)` (read-only zip peek; no modal).
+
+### Reply shape
+
+```json
+state.save    → {"slot":7,"name":"[Program: OBSTEST] (2026-06-01 14:02)"}
+state.restore → {"slot":7,"name":"…","regs":{…},"cs_ip":"0814:0000017D",
+                 "insn":{"cs_ip":"0814:017D","bytes":"B8 AA AA","text":"mov ax,0xaaaa"}}
+```
+
+Errors: `bad_args` (slot missing / outside [0,99]), `bad_state` (not paused),
+`not_found` (restore: empty slot), `unsupported` (>1 GB memory), `io_error`
+(save: write didn't land).
+
+### Tests
+
+- **`tests/agent_observability_tests.cpp`** — 4 new gTests. The save/load drive
+  the whole subsystem (zip I/O, every device component, MemBase) and need a
+  paused CPU, none of which exist in `-tests` mode, so these exercise the two
+  pre-paused gates: `bad_args` for an out-of-range/missing slot (validated first)
+  and `bad_state` for a valid slot while not paused (never touches SaveState).
+  **111 Agent gTests total, all pass.** The real round-trip is covered live.
+- **`tests/agent_live/test_observability.py`** — **Phase 8** reuses the existing
+  `trace_a` landmark (no OBSTEST.COM rebuild): pause at `trace_a` (chain head,
+  `mov ax,AAAA` not yet run), `BPDEL` (breakpoints aren't part of a snapshot),
+  `regs.get` snapshot, `state.save 7`, `cpu.step`×3 (ax/bx/dx ← AAAA/BBBB/DDDD,
+  CS:IP advances), `state.restore 7`, then assert the restore reply's `cs_ip` ==
+  `trace_a`, **all 16 registers == the saved snapshot**, `insn.bytes` == the
+  guest memory there, and an independent `regs.get` confirms the live state
+  snapped back. **All 10 phases pass.**
+
+### Notes for a future refinement
+
+- **Slot-based, on-disk** (the existing subsystem). Fine for the iteration
+  use-case; a future in-memory / named-snapshot variant would be faster and
+  isolate from the user's slots, but the proposal asked for "entry points into
+  the *existing* subsystem" and this delivers that.
+- **The residual modal risk** (genuine disk-I/O failure on save; loading an
+  externally-corrupted slot, where a *component's* `setBytes` can call
+  `savestatecorrupt()`) is documented in USAGE.md. It cannot occur in the normal
+  save→restore cycle. Add a global "suppress savestate modals" flag only if a
+  real consumer trips it.
+
+## Previously shipped (4.9.7 — `cpu.step` / `cpu.step_over`)
 
 Structured single-step: `cpu.step` (trace into) and `cpu.step_over` (treat
 `CALL`/`INT`/`LOOP`/`REP` as one unit). Each returns the post-step register
@@ -397,16 +488,16 @@ python tests/agent_live/test_observability.py
 
 ## Not done / deferred (pick up here, in proposal priority order)
 
-- **4.9.4, 4.9.5 and 4.9.7 are now complete.** Next items:
-- **4.9.8 `state.save` / `state.restore`** — agent entry points into the
-  existing savestate subsystem for deterministic, instant iteration. This is the
-  recommended next item (highest remaining proposal value: kills the ~25 s
-  re-drive to the bug window and makes runs deterministic).
+- **4.9.4, 4.9.5, 4.9.7 and 4.9.8 are now complete.** Next item:
 - **4.9.9 conditional / Nth-hit BP + on-hit command macro** — `bp.set {if, do,
-  continue}`. Pairs with the per-BP hit counter already added (`hits==N`
-  conditions are now cheap).
+  continue}`. This is the recommended next item. Pairs with the per-BP hit
+  counter already added (`hits==N` conditions are now cheap) and with 4.9.8
+  (restore to a snapshot, then arm a conditional BP for the Nth hit). Likely
+  needs a debugger-side bridge to evaluate a condition expression and run a
+  command macro at the stop, plus a way to auto-continue when the condition is
+  false (mirror how `CBreakpoint` already checks/continues).
 
-### Notes for whoever does 4.9.8 / a future step refinement
+### Notes for whoever does a future step / savestate refinement
 
 - **`cpu.step_over` reason on the temp-BP `bp.hit`.** A step-over of a CALL
   emits a `bp.hit` for its *internal* temporary breakpoint (whatever `bp_index`
@@ -428,7 +519,8 @@ python tests/agent_live/test_observability.py
   was. A Linux/macOS build needs the agent TU list updated; verify on a Unix
   host.
 - **`contrib/agent-client/dbxagent.py`** now has typed wrappers for the 4.9.7
-  commands (`cpu_step()`, `cpu_step_over()`), but still not for the earlier 4.9
+  commands (`cpu_step()`, `cpu_step_over()`) and the 4.9.8 commands
+  (`state_save()`, `state_restore()`), but still not for the earlier 4.9
   commands — clients use `call("debug.status")` etc. Add `debug_status()`,
   `cpu_probe()`, `cpu_trace_ring()`, `cpu_traceback()`, `cpu_disasm()` when
   convenient.
@@ -457,7 +549,9 @@ python tests/agent_live/test_observability.py
   through the trace chain with verified per-instruction register transitions)
   and phase7b (`cpu.step` descends into a `CALL` → `landmark_sub`;
   `cpu.step_over` treats it as one unit → `landmark_call_ret`).
-- 4.9.8 acceptance test deferred with that item.
+- 4.9.8 "snapshot here, re-run from here" → phase8 (`state.save` at `trace_a`,
+  step three instructions, `state.restore` — restore reply `cs_ip` == `trace_a`
+  and **all 16 registers** == the pre-step snapshot; live `regs.get` confirms).
 
 ## Environment note
 

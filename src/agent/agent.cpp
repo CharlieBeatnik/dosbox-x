@@ -627,6 +627,8 @@ std::string dispatchLine(const std::string &line) {
     if (cmd->s == "cpu.run")           return jsonEncode(handleCpuRun(id, a));
     if (cmd->s == "regs.get")          return jsonEncode(handleRegsGet(id, a));
     if (cmd->s == "mem.read")          return jsonEncode(handleMemRead(id, a));
+    if (cmd->s == "state.save")        return jsonEncode(handleStateSave(id, a));
+    if (cmd->s == "state.restore")     return jsonEncode(handleStateRestore(id, a));
     if (cmd->s == "cpu.step")          return jsonEncode(handleCpuStep(id, a));
     /* cpu.step_over may return "" (deferred) when it steps over a CALL/INT/
      * LOOP/REP — its reply is sent from AGENT_OnDebuggerPaused. */

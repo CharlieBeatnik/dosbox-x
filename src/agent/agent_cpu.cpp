@@ -18,12 +18,18 @@
 
 /* Agent control channel — typed CPU-state queries.
  *
- * regs.get  - all GPRs + segregs + EIP + EFLAGS in one structured reply.
- * mem.read  - read N bytes from guest memory, returned base64-encoded.
+ * regs.get      - all GPRs + segregs + EIP + EFLAGS in one structured reply.
+ * mem.read      - read N bytes from guest memory, returned base64-encoded.
+ * cpu.step      - structured single-step (proposal 4.9.7).
+ * state.save    - snapshot the whole machine to a save slot (proposal 4.9.8).
+ * state.restore - restore the machine from a save slot (proposal 4.9.8).
  *
- * These exist because the legacy ParseCommand passthrough cannot reach the
- * curses register pane (drawn directly to ncurses windows, never via
- * DEBUG_ShowMsg) and the MEMDUMP commands only produce a file on disk. */
+ * regs.get/mem.read exist because the legacy ParseCommand passthrough cannot
+ * reach the curses register pane (drawn directly to ncurses windows, never via
+ * DEBUG_ShowMsg) and the MEMDUMP commands only produce a file on disk.
+ * state.save/state.restore wrap the existing savestate subsystem in a headless,
+ * deterministic form so an agent can snapshot the bug window once and re-run
+ * from it instantly instead of re-driving the whole guest every iteration. */
 
 #include "config.h"
 
@@ -41,6 +47,14 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+
+/* Savestate UI-suppression levers, defined as plain globals elsewhere
+ * (use_save_file in sdlmain.cpp; noremark/force in savestates.cpp). Declared
+ * at global scope here so the references inside namespace agent resolve to the
+ * real globals rather than minting agent::-namespaced symbols. */
+extern bool use_save_file;
+extern bool noremark_save_state;
+extern bool force_load_state;
 
 namespace agent {
 
@@ -286,6 +300,116 @@ JsonValue handleMemRead(double id, const JsonValue &args) {
     JsonObject r;
     r.emplace("bytes", JsonValue::makeString(base64Encode(buf.data(), len)));
     r.emplace("len",   JsonValue::makeNumber(double(len)));
+    return makeReplyOk(id, std::move(r));
+}
+
+/* ---- state.save / state.restore (4.9.8) ------------------------------ */
+
+/* Headless wrappers over the savestate subsystem. The menu/mapper save & load
+ * are heavily UI-coupled: a remark input box on save, version/program/memory/
+ * machine confirmation dialogs on load, and modal error boxes — every one of
+ * which would block the single-threaded agent forever. We:
+ *   - require the CPU to be paused (same gate as cpu.step) so save/restore run
+ *     at a safe point between instructions and snapshot settled registers;
+ *   - pin use_save_file=false so the agent's `slot` argument is always honoured
+ *     regardless of any user `savefile=` config;
+ *   - suppress the remark prompt (noremark_save_state) and the load confirms
+ *     (force_load_state) for the duration of the call;
+ *   - pre-validate the cases that would otherwise pop a modal (out-of-range
+ *     slot, empty slot on restore, oversize guest memory).
+ * A genuine disk I/O or file-corruption failure can still raise a modal, but
+ * that cannot occur in the normal save-then-restore cycle and is documented. */
+
+namespace {
+
+/* SaveState slots are [0, SLOT_COUNT*MAX_PAGE) == [0, 100). */
+const size_t STATE_SLOT_COUNT = SaveState::SLOT_COUNT * SaveState::MAX_PAGE;
+
+/* SaveState::save/load refuse (and pop a modal) above 1 GB of guest memory. */
+bool stateMemoryTooLarge(void) {
+    return (size_t(MEM_TotalPages()) * 4096 / 1024 / 1024) > 1024;
+}
+
+/* Validate the required "slot" argument into [0, STATE_SLOT_COUNT). On failure
+ * fills `err` with a ready-to-return bad_args reply and returns false. */
+bool parseStateSlot(double id, const JsonValue &args, size_t &slot, JsonValue &err) {
+    const JsonValue *vSlot = args.get("slot");
+    if (!vSlot || !vSlot->isNumber() || vSlot->n < 0 ||
+        vSlot->n >= double(STATE_SLOT_COUNT)) {
+        err = makeReplyError(id, "bad_args",
+            std::string("expected \"slot\": integer in [0,") +
+            std::to_string(STATE_SLOT_COUNT - 1) + "]");
+        return false;
+    }
+    slot = size_t(vSlot->n);
+    return true;
+}
+
+}  /* anonymous namespace */
+
+JsonValue handleStateSave(double id, const JsonValue &args) {
+    size_t slot; JsonValue err;
+    if (!parseStateSlot(id, args, slot, err)) return err;
+
+    if (!DEBUG_AgentIsPaused())
+        return makeReplyError(id, "bad_state",
+            "state.save requires the CPU to be paused (call cpu.pause first)");
+
+    if (stateMemoryTooLarge())
+        return makeReplyError(id, "unsupported",
+            "guest memory exceeds the 1 GB savestate limit");
+
+    bool prevUseFile  = use_save_file;
+    bool prevNoRemark = noremark_save_state;
+    use_save_file     = false;     /* always honour the slot argument */
+    noremark_save_state = true;    /* no remark input box */
+    SaveState::instance().save(slot);
+    noremark_save_state = prevNoRemark;
+    use_save_file       = prevUseFile;
+
+    /* save() returns void and reports failure only via the log / a modal; an
+     * empty slot afterwards is our proxy for "the write did not land". */
+    if (SaveState::instance().isEmpty(slot))
+        return makeReplyError(id, "io_error",
+            "save failed to write the slot (see emulator log)");
+
+    JsonObject r;
+    r.emplace("slot", JsonValue::makeNumber(double(slot)));
+    r.emplace("name", JsonValue::makeString(SaveState::instance().getName(slot)));
+    return makeReplyOk(id, std::move(r));
+}
+
+JsonValue handleStateRestore(double id, const JsonValue &args) {
+    size_t slot; JsonValue err;
+    if (!parseStateSlot(id, args, slot, err)) return err;
+
+    if (!DEBUG_AgentIsPaused())
+        return makeReplyError(id, "bad_state",
+            "state.restore requires the CPU to be paused (call cpu.pause first)");
+
+    /* Pre-check empties so we never reach load()'s "empty slot" modal. */
+    if (SaveState::instance().isEmpty(slot))
+        return makeReplyError(id, "not_found",
+            std::string("save slot ") + std::to_string(slot) + " is empty");
+
+    if (stateMemoryTooLarge())
+        return makeReplyError(id, "unsupported",
+            "guest memory exceeds the 1 GB savestate limit");
+
+    bool prevUseFile = use_save_file;
+    bool prevForce   = force_load_state;
+    use_save_file    = false;      /* always honour the slot argument */
+    force_load_state = true;       /* no version/program/memory/machine confirms */
+    SaveState::instance().load(slot);
+    force_load_state = prevForce;
+    use_save_file    = prevUseFile;
+
+    /* Reply with where the restored CPU will resume — same {regs, cs_ip, insn}
+     * shape cpu.step returns — so the client needs no follow-up regs.get to see
+     * that the machine snapped back to the saved point. */
+    JsonObject r = buildStepResult();
+    r.emplace("slot", JsonValue::makeNumber(double(slot)));
+    r.emplace("name", JsonValue::makeString(SaveState::instance().getName(slot)));
     return makeReplyOk(id, std::move(r));
 }
 

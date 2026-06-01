@@ -84,6 +84,13 @@ int DEBUG_AgentDisasmOne(uint16_t seg, uint32_t off, char *text, size_t textsz);
  * a CALL/INT/LOOP/REP (the pause arrives later, via AGENT_OnDebuggerPaused). */
 int DEBUG_AgentStep(bool over);
 
+/* True when the guest CPU is paused in the debugger (the agent dispatch is then
+ * running at a safe point between instructions). state.save / state.restore
+ * (proposal 4.9.8) gate on this: replacing the whole machine state mid-
+ * instruction would corrupt the emulator, and a well-defined snapshot needs
+ * settled registers. Reports the same `debugging` flag DEBUG_AgentStep checks. */
+bool DEBUG_AgentIsPaused(void);
+
 #ifdef C_HEAVY_DEBUG
 bool DEBUG_HeavyIsBreakpoint(void);
 void DEBUG_HeavyWriteLogInstruction(void);

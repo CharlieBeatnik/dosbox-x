@@ -119,6 +119,8 @@ events don't. The reference client does this in a single reader thread.
 | `cpu.run`           | none                          | `{}`                                |
 | `cpu.step`          | none                          | `{regs, cs_ip, insn}` (paused only) |
 | `cpu.step_over`     | none                          | `{regs, cs_ip, insn}` (paused only) |
+| `state.save`        | `{slot}`                      | `{slot, name}` (paused only)        |
+| `state.restore`     | `{slot}`                      | `{slot, name, regs, cs_ip, insn}` (paused only) |
 | `keyboard.type`     | `{text}`                      | `{queued}` (byte count)             |
 | `keyboard.press`    | `{key}`                       | `{}`                                |
 | `keyboard.release`  | `{key}`                       | `{}`                                |
@@ -796,6 +798,59 @@ Caveats:
   curses `P` step has).
 - `from`/disassembly text needs no special build, but like the other 4.9 tools
   this is a debug-build-only feature.
+
+### `state.save` / `state.restore` — deterministic, instant iteration (4.9.8)
+
+Snapshot the whole machine once you have driven the guest to the interesting
+point, then restore to it instantly as many times as you like — instead of
+re-driving the guest (boot, mount, launch, navigate) every iteration. This is
+what makes an investigate-fix-retry loop fast *and* deterministic: every
+restore lands on byte-identical state.
+
+```json
+{"id":1,"cmd":"state.save","args":{"slot":7}}
+  → {"slot":7,"name":"[Program: OBSTEST] (2026-06-01 14:02)"}
+
+{"id":2,"cmd":"state.restore","args":{"slot":7}}
+  → {"slot":7,"name":"…",
+     "regs":{"eax":43690, … ,"eflags":518},
+     "cs_ip":"0814:0000017D",
+     "insn":{"cs_ip":"0814:017D","bytes":"B8 AA AA","text":"mov ax,0xaaaa"}}
+```
+
+Both **require the CPU to be paused** (`cpu.pause`, or stopped at a breakpoint)
+and reply `bad_state` otherwise — replacing the machine state mid-instruction
+would corrupt the emulator, and a clean snapshot needs settled registers.
+
+- **`slot`** (required) — an integer save slot in `[0,99]`. These are the same
+  slots the *Capture → Save/Load state* menu uses, so pick a high slot (e.g. 7)
+  to avoid clobbering a state you saved by hand. Out of range → `bad_args`.
+- **`name`** — the human-readable slot label (program name + timestamp + any
+  remark), the same string the menu shows.
+- `state.restore` additionally returns the restored CPU as `{regs, cs_ip,
+  insn}` — the exact `cpu.step` shape — so you can see where the machine resumes
+  without a follow-up `regs.get`. `insn` is the instruction now at `CS:IP`.
+
+The agent's save/restore is **headless**: the interactive remark prompt and the
+version / program / memory / machine-type confirmation dialogs are suppressed,
+and the `slot` argument is always honoured regardless of any `savefile=` config.
+
+Errors:
+- **`bad_state`** — the CPU was not paused. Call `cpu.pause` first.
+- **`bad_args`** — `slot` missing or outside `[0,99]`.
+- **`not_found`** (restore) — the slot is empty.
+- **`unsupported`** — guest memory exceeds the 1 GB savestate limit.
+- **`io_error`** (save) — the slot file could not be written (see the log).
+
+Notes / limits:
+- Breakpoints, the trace ring, `cpu.probe` points and `mem.watch` are
+  agent/debugger constructs and are **not** part of the snapshot — they survive
+  a restore unchanged. Only guest state (CPU, memory, devices) is saved.
+- A genuine disk-I/O failure on save, or loading an externally-corrupted slot,
+  can still raise a modal dialog inside the emulator (the underlying subsystem
+  has no headless error path). This does not happen in the normal
+  save-then-restore cycle.
+- Debug-build only, like the other 4.9 tools.
 
 ### `mem.watch` — write-intercept that names the storing instruction
 
