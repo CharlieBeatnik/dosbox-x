@@ -764,12 +764,29 @@ def phase8_savestate(agent, cs, trace_a, rep) -> None:
                 problems.append(f"post-restore live regs[{k}]={live.get(k)} != saved {want}")
                 break
 
+        # Decisive regression check for the restore->run crash: resume the CPU
+        # and let it run for >1s. Before the fix, the savestate restore rebuilt
+        # the PIC per-tick handler list and left the agent's own tickPoll slot
+        # as a NULL function pointer; TIMER_AddTick() calls every handler each
+        # millisecond, so the emulator died ~0.5s after resume (WER BEX64). With
+        # the fix the agent repairs its tick handler after load(), so the VM
+        # survives a resume-and-run and stays responsive.
+        agent.cpu_run()
+        _drain_events(agent)
+        time.sleep(1.5)
+        try:
+            st = agent.call("debug.status")
+            if st.get("cpu") not in ("running", "paused"):
+                problems.append(f"unexpected cpu state after restore+run: {st.get('cpu')!r}")
+        except Exception as exc:
+            problems.append(f"VM died after restore+run (savestate crash): {exc!r}")
+
         if problems:
             rep.record(name, False, "; ".join(problems[:4]))
         else:
             rep.record(name, True,
-                       f"saved+restored at trace_a {trace_a:04X}; "
-                       f"all 16 regs round-tripped (slot {slot})")
+                       f"saved+restored at trace_a {trace_a:04X}; all 16 regs "
+                       f"round-tripped (slot {slot}); survived resume+run")
     except Exception as exc:
         rep.record(name, False, repr(exc))
     finally:
@@ -972,19 +989,13 @@ def run(argv=None) -> int:
             phase5_vga_memwatch(agent, cs, vga_store, rep)
             phase6_multi_sentinel(agent, cs, msa, msb, rep)
             phase7_step(agent, cs, trace_a, trace_end, call_at, call_ret, sub, rep)
-            phase9_cond_bp(agent, cs, loopbody, iters, rep)
-            # phase8 runs LAST: a state.restore leaves the machine in a state
-            # where resuming the CPU triggers a pre-existing, asynchronous
-            # savestate crash ~0.5s later (a Windows callback thread invokes a
-            # function pointer the restore left stale — WER BEX64, a near-NULL
-            # call FROM ntdll; suspected mixer/audio channel handler). It is
-            # unrelated to 4.9.9 (reproduces with zero conditional-BP surface)
-            # and breaks the proposal's 4.9.8+4.9.9 "restore then arm a
-            # conditional BP" pairing. Until that savestate bug is fixed, no
-            # phase may run after phase 8: its own assertions all complete while
-            # paused (before its finally resumes), so it still passes, and the
-            # async crash lands in ignored teardown. See HANDOFF.md.
+            # Natural proposal order: 4.9.8 (phase 8) then 4.9.9 (phase 9).
+            # phase 8 now resumes a healthy VM after restore (the restore->run
+            # tick-handler crash is fixed; see HANDOFF.md), and phase 9 running
+            # after it on the same instance proves the 4.9.8+4.9.9 "restore then
+            # arm a conditional BP" pairing end-to-end.
             phase8_savestate(agent, cs, trace_a, rep)
+            phase9_cond_bp(agent, cs, loopbody, iters, rep)
 
             with contextlib.suppress(Exception):
                 _reset(agent)

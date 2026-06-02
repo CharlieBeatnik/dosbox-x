@@ -40,6 +40,14 @@ void AGENT_StartIfRequested(void);
 /* Stop the agent server, close sockets, remove the port file. Idempotent. */
 void AGENT_Stop(void);
 
+/* Called from SaveState::load() after a savestate restore. The savestate PIC
+ * component rebuilds the per-tick handler list from a fixed table that doesn't
+ * include the agent's own tickPoll, so a restore leaves a NULL handler in the
+ * list (TIMER_AddTick calls it every ms -> a guaranteed crash once the CPU
+ * resumes) and drops our poll. This removes the dead slot and re-installs
+ * tickPoll. Cheap no-op when the agent isn't running. */
+void AGENT_OnStateRestored(void);
+
 /* Service the agent: accept new connections, drain recv buffers, dispatch
  * any complete JSON lines, flush outbound queue. Called periodically from
  * a TIMER_AddTickHandler and additionally from DEBUG_Loop's paused branch
@@ -192,6 +200,7 @@ bool AGENT_CondBpCheck(uint16_t cur_cs, uint16_t cur_off,
 
 static inline void AGENT_StartIfRequested(void) {}
 static inline void AGENT_Stop(void) {}
+static inline void AGENT_OnStateRestored(void) {}
 static inline void AGENT_Poll(bool /*paused*/) {}
 static inline void AGENT_EmitBpHit(uint16_t /*seg*/, uint32_t /*off*/, int /*bp_index*/,
                                    uint16_t /*from_cs*/ = 0, uint16_t /*from_ip*/ = 0) {}

@@ -405,6 +405,12 @@ JsonValue handleStateRestore(double id, const JsonValue &args) {
     force_load_state = prevForce;
     use_save_file    = prevUseFile;
 
+    /* NOTE: SaveState::load() rebuilds the PIC per-tick handler list and nulls
+     * the agent's own tickPoll slot (it isn't in pic.cpp's pic_state_timer_table),
+     * which would crash the next emulator tick after resume. That is repaired by
+     * AGENT_OnStateRestored(), called from inside SaveState::load() itself so it
+     * covers every restore path (this command and the GUI/menu load-state). */
+
     /* Reply with where the restored CPU will resume — same {regs, cs_ip, insn}
      * shape cpu.step returns — so the client needs no follow-up regs.get to see
      * that the machine snapped back to the saved point. */

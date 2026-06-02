@@ -858,16 +858,12 @@ Notes / limits:
   has no headless error path). This does not happen in the normal
   save-then-restore cycle.
 - Debug-build only, like the other 4.9 tools.
-- ⚠️ **Known pre-existing bug (Windows): `state.restore` then *resuming the CPU*
-  crashes the emulator ~0.5 s later.** The crash is asynchronous (a Windows
-  callback thread invokes a function pointer the restore left stale — WER
-  `BEX64`, a near-NULL call from `ntdll`; suspected mixer/audio channel handler)
-  and reproduces with **no** conditional-BP / 4.9.9 surface involved. So while a
-  restore *plus paused inspection* (`regs.get`, `mem.read`, `cpu.step`,
-  `cpu.disasm`, `debug.status`) works, **restore → `cpu.run` → … is unsafe**
-  until the savestate bug is fixed. This currently blocks the proposal's
-  "restore to a snapshot, then arm a conditional BP" workflow. Tracked in
-  `HANDOFF.md`.
+- `state.restore` followed by `cpu.run` is fully supported: restore to a
+  snapshot, resume, run for as long as you like, then (e.g.) arm a conditional
+  BP — the proposal's "restore to a snapshot, then arm a conditional BP"
+  workflow. (An earlier build crashed ~0.5 s after resuming a restored machine
+  because the savestate's per-tick-handler restore nulled the agent's own poll
+  handler; the restore now repairs it. See `HANDOFF.md`.)
 
 ### `bp.set` / `bp.clear` — conditional / Nth-hit breakpoints + on-hit macros (4.9.9)
 

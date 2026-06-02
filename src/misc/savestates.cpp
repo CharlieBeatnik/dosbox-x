@@ -15,6 +15,7 @@
 #include "control.h"
 #include "logging.h"
 #include "mixer.h"
+#include "agent.h"
 #include "build_timestamp.h"
 #ifdef WIN32
 #include "direct.h"
@@ -779,6 +780,14 @@ done:
 	}
 
 	if (!dos_kernel_disabled) flagged_restore((char *)save.c_str());
+
+	/* The per-component load above rebuilt the PIC per-tick handler list from a
+	 * fixed table that doesn't know the agent's own poll handler, leaving a NULL
+	 * in its place that TIMER_AddTick() would call (and crash on) the next tick
+	 * once the CPU resumes. Repair it here so every restore path is covered. No-op
+	 * unless the agent is running. */
+	AGENT_OnStateRestored();
+
 	if (!load_err) LOG_MSG("[%s]: Loaded. (Slot %d)", getTime().c_str(), (int)slot+1);
 }
 

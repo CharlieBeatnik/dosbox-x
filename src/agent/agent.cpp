@@ -691,6 +691,39 @@ void AGENT_Stop(void) {
     agent::g_started = false;
 }
 
+void AGENT_OnStateRestored(void) {
+    /* Called from SaveState::load() (src/misc/savestates.cpp) after every
+     * savestate restore — so it covers both the agent's state.restore command
+     * and a GUI/menu load-state while the agent is active.
+     *
+     * The savestate PIC component (SerializePic in src/hardware/pic.cpp)
+     * serializes the per-tick handler list by mapping each handler pointer
+     * through a fixed table (pic_state_timer_table) that knows only the core
+     * handlers (keyboard, mixer). The agent installs its own tickPoll handler
+     * via TIMER_AddTickHandler, which is NOT in that table, so on save it is
+     * written as the 0xffff "unknown" index and on load PIC_State_IndexTimer
+     * maps that back to NULL. TIMER_AddTick() then calls every registered
+     * handler unconditionally each millisecond, so the NULL slot is a
+     * guaranteed crash on the first tick after the CPU resumes — the
+     * "state.restore -> cpu.run -> ~crash" defect. Repair the list: drop the
+     * dead NULL slot the restore left behind, then re-arm tickPoll so the agent
+     * keeps servicing commands while the CPU runs.
+     *
+     * A restored slot whose handler is NULL can only ever be such a corruption
+     * (no live tick handler is NULL), so removing it is always safe. In the
+     * agent use-case (the save was taken by this same build) there is exactly
+     * one — ours. If the loaded state came from a build without the agent there
+     * is no NULL slot and our handler is simply absent; the del is then a no-op
+     * and the add re-installs it. Either way the list ends with a single live
+     * tickPoll and no NULL. Cheap no-op when the agent isn't running. */
+    if (!agent::g_started) return;
+    TIMER_DelTickHandler(nullptr);              /* remove the corrupted (nulled) slot */
+    if (agent::g_tickInstalled) {
+        TIMER_DelTickHandler(agent::tickPoll);  /* de-dup; a no-op after a restore */
+        TIMER_AddTickHandler(agent::tickPoll);
+    }
+}
+
 void AGENT_Poll(bool /*paused*/) {
     /* The tick handler already drives serverPoll() every 1 ms. The
      * paused-context call from DEBUG_Loop (added in iteration 5) needs

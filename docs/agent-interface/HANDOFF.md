@@ -6,7 +6,105 @@ Leave-behind for the next agent continuing the **proposal-4.9** work on the
 Source proposal:
 `X2RE/.claude/notes/dosbox-x-fixes/PROPOSAL_4.9_observability_and_trust.md`.
 
-## What shipped this iteration (4.9.9 — conditional / Nth-hit BP + on-hit macro)
+## What shipped this iteration (savestate restore→resume crash — FIXED)
+
+Root-caused and fixed the `state.restore` → `cpu.run` → ~crash defect the
+previous iteration discovered (it was documented as a "pre-existing savestate
+bug, suspected mixer handler"). The real cause is the **agent's own per-tick
+poll handler**. Built, **121 unit tests pass** (no change), and the live suite
+now passes **12/12 with phase 8 and phase 9 in natural proposal order**, with a
+new decisive check that resumes the restored machine and confirms it survives.
+
+### Root cause
+
+The agent installs `agent::tickPoll` via `TIMER_AddTickHandler` (`agent.cpp`,
+`AGENT_StartIfRequested`) so the server is serviced every emulator millisecond.
+The savestate **PIC** component (`SerializePic` in `src/hardware/pic.cpp`)
+serializes the per-tick handler list by mapping each handler pointer through a
+*fixed table*, `pic_state_timer_table`, which lists only the core handlers
+(keyboard, mixer). `PIC_State_FindTimer` returns `0xffff` for any handler not in
+the table; on load `PIC_State_IndexTimer(0xffff)` maps that back to **NULL**.
+So `SaveState::load()` rebuilds the ticker list with the agent's slot as a NULL
+handler. `TIMER_AddTick()` (`pic.cpp`) then calls **every** ticker handler
+unconditionally each millisecond — so on the first tick after `cpu.run` it calls
+NULL and the emulator dies. (The previous iteration's "WER `BEX64`, near-NULL
+call from `ntdll`, suspected mixer channel handler" was the symptom of exactly
+this NULL call; the table is shared with the genuinely-handled `MIXER_Mix` /
+`KEYBOARD_TickHandler`, which is why mixer looked suspicious. The agent ticker
+was the only un-tabled one active in the test config.)
+
+This is fundamentally a consequence of the agent registering a tick handler the
+core savestate table doesn't know about — i.e. an agent-introduced interaction,
+not a mixer defect.
+
+### The fix (one chokepoint, repair owned by the agent)
+
+New public hook `AGENT_OnStateRestored()` (`src/agent/agent.cpp`, declared in
+`include/agent.h` with the usual `#else` no-op) is called from the **end of
+`SaveState::load()`** (`src/misc/savestates.cpp`, right after `flagged_restore`).
+It:
+
+1. `TIMER_DelTickHandler(nullptr)` — removes the dead NULL slot the restore left
+   behind (a NULL ticker can only ever be such a corruption, so this is always
+   safe; in the agent use-case there is exactly one — ours).
+2. re-installs `tickPoll` (`TIMER_DelTickHandler(tickPoll)` de-dup +
+   `TIMER_AddTickHandler(tickPoll)`), so the agent keeps servicing commands
+   while the CPU runs.
+
+It is a cheap no-op when the agent isn't running (`if (!g_started) return;`).
+
+**Why the `SaveState::load()` chokepoint rather than `handleStateRestore`:** the
+identical crash also fires if a user triggers a **GUI/menu load-state** (the `L`
+mapper key) while the agent is active — that path calls `SaveState::load()`
+directly, not the agent's command. Hooking the single load chokepoint covers
+*every* restore path with one call; `handleStateRestore` therefore needs no
+explicit repair (it reaches `load()` like everyone else). This matches how the
+agent already integrates into core files (`AGENT_*` hooks in `sdlmain.cpp`,
+`hardware.cpp`, `debug.cpp`); `agent.h`'s no-op keeps `savestates.cpp` building
+with `C_DEBUG` off and needs no `#if` at the call site.
+
+Both savestate provenances are handled: an agent-build savestate (the agent
+ticker is present as `0xffff` → one NULL after load) and a foreign savestate (no
+agent ticker → our handler is simply absent after the list is rebuilt). Either
+way the list ends with a single live `tickPoll` and no NULL.
+
+**Chosen this over** adding the agent handler to `pic_state_timer_table`: that
+would couple core `pic.cpp` to an agent symbol behind `#if C_DEBUG` and *still*
+need the re-install (the core can't know to re-add `tickPoll`), so the
+agent-owned repair is both necessary and sufficient, and keeps the logic in
+`src/agent/` (the only core touch is the one-line hook call).
+
+### Tests
+
+- **Negative control performed:** with the repair call commented out and
+  rebuilt, the live suite's phase 8 fails with `VM died after restore+run
+  (savestate crash)` (the socket is forcibly closed — the process crashed) and
+  phase 9 fails behind it (9/12). With the repair restored, **12/12**. So the
+  test is load-bearing, not vacuous.
+- **`tests/agent_live/test_observability.py`** — phase 8 gained a decisive
+  regression check: after the register round-trip it does `cpu.run`, waits 1.5 s
+  (well past the documented ~0.5 s crash window), and asserts the VM is still
+  responsive (`debug.status` succeeds). phase 8 and phase 9 were restored to
+  natural proposal order (8 then 9) on the **same** instance, which exercises
+  the 4.9.8+4.9.9 "restore then arm a conditional BP" pairing end-to-end.
+- No unit test was added: the repair manipulates the live `firstticker` list via
+  the real savestate load, none of which exists in `-tests` mode; it is covered
+  live (same split as the rest of state.save/restore). **121 Agent gTests still
+  pass.**
+
+### Note for a future core hardening (optional, out of scope here)
+
+The same `pic_state_timer_table` / `pic_state_event_table` mechanism will NULL
+*any* tick/PIC-event handler not in its list — `IPX_*`, `NE2000_Poller`, and
+several device PIC events (`DSP_BusyComplete`, `GUS_DMA_Event`, the `IDE_*`
+events, `ACPI_PMTIMER_Event`, …) are likewise absent. They don't bite the agent
+use-case (those devices are inactive in the test config and rarely combined with
+savestates), but a principled core fix would have `SerializePic::setBytes` skip
+a `0xffff` index instead of installing a NULL. Left alone deliberately: it's a
+core-savestate behavior change, and the agent's own handler — the only one that
+breaks the proposal workflow — is now handled.
+
+## Previously shipped (4.9.9 — conditional / Nth-hit BP + on-hit macro)
 
 `bp.set` / `bp.clear`: a conditional breakpoint that pairs an execution address
 with an optional **`if` condition** (register / memory word / Nth-hit), an
@@ -95,40 +193,22 @@ gone id).
   once *without halting* (no `state.paused`), and `debug.status` shows
   `hits == iters*fires` — the reach-vs-fire distinction. **All 12 phases pass.**
 
-#### Phase ordering note — read this
+#### Phase ordering note
 
-Phase 9 runs **before** phase 8 in `run()`, on purpose. See the next section.
+Phase 8 then phase 9, natural proposal order, on the same instance. (An earlier
+revision ran 9 before 8 to dodge the restore→resume crash; that crash is fixed
+this iteration — see the top section — so the order was restored.)
 
-## ⚠️ Discovered pre-existing bug: savestate restore → resume crashes (NOT 4.9.9)
+## ✅ Resolved: savestate restore → resume crash
 
-While adding phase 9 (which runs right after phase 8 in proposal order) the
-live suite crashed. Root-caused to a **pre-existing 4.9.8 / savestate defect**,
-not this iteration's code:
-
-- **Repro (zero 4.9.9 surface):** `state.save` → `state.restore` → `cpu.run`,
-  then merely keep the CPU running — the emulator dies **~0.5 s later** with an
-  access violation. Reproduced with **no** `bp.set`/`bp.clear` and the cond-BP
-  hook gated off (`AGENT_CondBpActive()==false`), so 4.9.9 is not involved.
-- **Signature:** WER `BEX64`, faulting module `unknown`, near-NULL call (fault
-  address `0x8`) **from `ntdll`** — i.e. a Windows callback thread invoking a
-  function pointer the restore left stale. Strong suspect: a **MIXER channel
-  handler** (or similar device callback) that the savestate serializes/restores
-  but does not re-bind to a live function after load.
-- **Why it was never caught:** phase 8 was the last phase, and its own
-  assertions all complete *while paused* (before its `finally` resumes the CPU);
-  the async crash then lands in ignored teardown. Nothing ran after it.
-- **Impact:** breaks the proposal's headline 4.9.8+4.9.9 pairing ("restore to a
-  snapshot, then arm a conditional BP for the Nth hit"). A restore followed by
-  *paused* inspection (regs/mem/step/disasm/status) is fine; restore → `cpu.run`
-  is not.
-- **Workarounds in place:** phase 9 is ordered before phase 8 so the suite
-  passes and 4.9.9 is fully exercised on a healthy machine; `USAGE.md`
-  (`state.save`/`state.restore` notes) carries a user-facing warning.
-- **Next iteration should fix this** before the restore-and-rerun loop is
-  trusted. Start at the mixer/device savestate components (look for a serialized
-  callback / `MixerChannel` handler pointer that isn't re-pointed on load), or
-  bisect which POD component's load makes a subsequent run crash. A minimal
-  repro is trivial to recreate: save, restore, run, wait 1 s.
+The previous iteration's "pre-existing savestate defect (suspected mixer
+handler)" is **fixed this iteration** — see *What shipped this iteration*
+(savestate restore→resume crash) at the top. In short: the savestate's per-tick
+handler restore nulled the agent's own `tickPoll` handler (it isn't in
+`pic.cpp`'s `pic_state_timer_table`), and `TIMER_AddTick` then called NULL on the
+first tick after resume. `handleStateRestore` now repairs the ticker list after
+`load()`. Verified with a negative control (crash reproduces with the repair
+removed) and the strengthened phase-8 live check.
 
 ## Previously shipped (4.9.8 — `state.save` / `state.restore`)
 
@@ -612,14 +692,18 @@ python tests/agent_live/test_observability.py
 
 ## Not done / deferred (pick up here, in proposal priority order)
 
-- **All nine proposal-4.9 items (4.9.1–4.9.9) are now complete.** The most
-  valuable next thing is **not** a new proposal item — it is the **savestate
-  restore→resume crash** documented in its own section above. Fix that first: it
-  is a real, reproducible defect that breaks the 4.9.8+4.9.9 loop the proposal is
-  built around.
-- After that, the remaining Phase-2 surface from `TASKS.md` § Iteration 7+:
+- **All nine proposal-4.9 items (4.9.1–4.9.9) are complete, and the savestate
+  restore→resume crash that blocked the 4.9.8+4.9.9 loop is fixed** (top
+  section). The restore-and-rerun loop the proposal is built around is now
+  trustworthy.
+- Next, the remaining Phase-2 surface from `TASKS.md` § Iteration 7+:
   typed `bp.add`/`bp.list`/`bp.del` (stable handles), `regs.set`, `mem.write`
   (typed store), and mouse input (`mouse.move`/`mouse.click`).
+- *Optional core hardening:* make `SerializePic::setBytes` skip a `0xffff`
+  ticker/event index instead of installing a NULL handler, so the same class of
+  bug can't bite `IPX`/`NE2000`/other un-tabled handlers. Deliberately not done
+  here (core-behavior change; the agent's own handler is already repaired). See
+  the note under the top section.
 
 ### Notes for whoever does a future step / savestate refinement
 
