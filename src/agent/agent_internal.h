@@ -176,6 +176,88 @@ JsonValue handleStateRestore(double id, const JsonValue &args);
 extern bool   g_stepOverPending;
 extern double g_stepOverId;
 
+/* ---- Conditional / Nth-hit breakpoints (proposal 4.9.9) ----------------
+ * A conditional breakpoint is checked once per instruction from the heavy-
+ * debug hook (AGENT_CondBpCheck), the same path cpu.probe / cpu.trace_ring
+ * use, so a disarmed table costs only the g_condBpActive bool load. On a
+ * match it can evaluate a small condition expression (register / memory word /
+ * Nth-hit), run an allowlisted read-only command macro whose output is
+ * captured atomically at the trigger instant (no round-trip through the
+ * command poll), and either halt the CPU or auto-resume ("run-and-continue").
+ *
+ * Heavy-debug only: the per-instruction check is what lets a condition-false
+ * reach continue cleanly (just don't halt this instruction). A non-heavy
+ * physical BP traps via an injected 0xCC and cannot be "un-halted" from the
+ * trap, so bp.set returns `unsupported` in a non-heavy build. This mirrors how
+ * cpu.probe / cpu.trace_ring only function under C_HEAVY_DEBUG. */
+
+enum BpCmpOp { BP_EQ, BP_NE, BP_LT, BP_LE, BP_GT, BP_GE };
+
+/* A leaf value source in a condition: an immediate, a register, or the
+ * breakpoint's own hit count (`hits`). */
+struct BpValSrc {
+    enum Kind { IMM, REG, HITS } kind = IMM;
+    uint32_t imm = 0;   /* IMM                                   */
+    int      reg = 0;   /* REG -> BpReg id (table in agent_cpu.cpp) */
+};
+
+/* One operand: either a direct value source, or a real-mode memory
+ * dereference [seg:off] read at a given access width (1/2/4 bytes). */
+struct BpOperand {
+    bool     isMem = false;
+    BpValSrc direct;          /* when !isMem */
+    BpValSrc memSeg;          /* when isMem  */
+    BpValSrc memOff;
+    int      memSize = 2;
+};
+
+/* A single comparison: (lhs [& mask]) OP rhs. */
+struct BpCondition {
+    bool      present = false;   /* false -> unconditional (always true)        */
+    BpOperand lhs;
+    bool      hasMask = false;
+    uint32_t  mask = 0;
+    int       op = BP_EQ;        /* one of BpCmpOp                              */
+    BpOperand rhs;
+};
+
+/* One macro step: an allowlisted read-only command name + its args object. */
+struct BpMacroCmd {
+    std::string cmd;
+    JsonValue   args;
+};
+
+/* A conditional breakpoint. */
+struct CondBp {
+    uint32_t                id = 0;
+    uint16_t                seg = 0;
+    uint16_t                off = 0;
+    BpCondition             cond;
+    std::string             condStr;   /* echo of the `if` string ("" = none)  */
+    std::vector<BpMacroCmd> macro;
+    bool                    cont = false;
+    uint64_t                hits = 0;   /* every reach (the `hits` operand)     */
+    uint64_t                fires = 0;  /* reaches where the condition held     */
+};
+
+/* Defined in agent_cpu.cpp; read by debug.status (agent_observe.cpp) and the
+ * hot-path hook AGENT_CondBpCheck. g_condBpActive == !g_condBps.empty(). */
+extern std::vector<CondBp> g_condBps;
+extern bool                g_condBpActive;
+
+/* Parse the `if` condition mini-language into `out`. Returns false and fills
+ * `err` with a short message on a malformed expression. Pure (touches no CPU
+ * state) so it is unit-testable without MemBase. */
+bool parseBpCondition(const std::string &s, BpCondition &out, std::string &err);
+
+/* Evaluate a parsed condition against live CPU registers / memory plus the
+ * breakpoint's current hit count. */
+bool evalBpCondition(const BpCondition &c, uint64_t hits);
+
+/* Dispatch entry points implemented in agent_cpu.cpp. */
+JsonValue handleBpSet(double id, const JsonValue &args);
+JsonValue handleBpClear(double id, const JsonValue &args);
+
 /* ---- Observability (proposal 4.9) --------------------------------------
  * Watch state + hit counters live in agent.cpp (read on the CPU hot path,
  * written from the main thread). debug.status in agent_observe.cpp reads

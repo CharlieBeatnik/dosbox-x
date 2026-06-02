@@ -6,7 +6,131 @@ Leave-behind for the next agent continuing the **proposal-4.9** work on the
 Source proposal:
 `X2RE/.claude/notes/dosbox-x-fixes/PROPOSAL_4.9_observability_and_trust.md`.
 
-## What shipped this iteration (4.9.8 — `state.save` / `state.restore`)
+## What shipped this iteration (4.9.9 — conditional / Nth-hit BP + on-hit macro)
+
+`bp.set` / `bp.clear`: a conditional breakpoint that pairs an execution address
+with an optional **`if` condition** (register / memory word / Nth-hit), an
+optional **`do` command macro** (a read-only snapshot captured *atomically at
+the trigger instant*, before the emulator advances), and a **`continue`** flag
+(run the macro then auto-resume instead of halting). Built, **121 unit tests
+pass** (+10), and verified end-to-end (a new OBSTEST **phase 9**, reusing the
+phase-1 loop with no `.COM` rebuild). 4.9.9 complete.
+
+| # | Item | Proves | Status |
+|---|------|--------|--------|
+| 4.9.9 | `bp.set {addr, if, do, continue}` / `bp.clear` → `bp.cond` event | "halt only on the interesting case, snapshot it atomically, optionally don't even stop" | ✅ |
+
+### Design / code map
+
+- **Approach: an agent-side conditional-BP table checked from the heavy-debug
+  per-instruction hook** — the *same* slot `cpu.probe` / `cpu.trace_ring` use —
+  not a field threaded through `CBreakpoint`. One line added to
+  `DEBUG_HeavyIsBreakpoint` (`src/debug/debug.cpp`, right after the watch
+  fallback): `if (AGENT_CondBpActive() && AGENT_CondBpCheck(cur_cs, cur_ip,
+  prev_cs, prev_ip)) return true;`. Returning true enters the debugger exactly
+  as a `CheckBreakpoint` match does. This keeps the debugger core almost
+  untouched, is fully introspectable via `debug.status`, and is naturally
+  heavy-debug-scoped (a condition-false reach just *doesn't halt this
+  instruction* — the per-instruction check is what makes that clean; a non-heavy
+  0xCC-trap BP can't be un-halted, so `bp.set` returns `unsupported` there).
+- **Everything else lives in `src/agent/agent_cpu.cpp`** (no new TU): the
+  condition mini-language parser + evaluator, the macro runner (an allowlist of
+  read-only commands — `regs.get`, `mem.read`, `cpu.disasm`, `cpu.traceback`,
+  `debug.status` — dispatched to the existing handlers), `handleBpSet` /
+  `handleBpClear`, the `g_condBps` table, and the `AGENT_CondBpActive` /
+  `AGENT_CondBpCheck` global bridges. Types (`CondBp`, `BpCondition`, …) and the
+  externs are in `agent_internal.h`; two dispatch cases in `agent.cpp`; the
+  `bp.cond` event and the `cond_breakpoints` section of `debug.status`
+  (`agent_observe.cpp`).
+- **Condition language** (one comparison, `operand [& mask] op operand`):
+  operands are a register, the literal `hits` (this BP's reach count), a number
+  (decimal or `0x`-hex), or `[byte|word|dword] [seg:off]` (bare-hex halves, the
+  agent's SEG:OFF convention — implemented by reusing `parseHexU32` for memref
+  halves while standalone immediates stay C-style decimal/0x). The parser is a
+  hand tokenizer + recursive descent; it is **pure** (no CPU state) and
+  unit-tested directly. The evaluator reads `reg_e*` (all sub-registers derived
+  by mask/shift, no reg_ax/al macros needed), `SegValue`, `reg_flags`, and
+  `phys_readb` for memory; comparisons are unsigned.
+- **Atomicity / safety.** The macro runs *inside* `AGENT_CondBpCheck` on the CPU
+  thread at the trigger, so the snapshot is of the exact pre-instruction state —
+  no command-poll round-trip. The allowlist is enforced at `bp.set` time (clear
+  error up front) so a macro can never run `cpu.run` / `state.restore` / anything
+  that recurses the CPU or mutates run state from the hot path. `bp.cond` is
+  emitted via `serverBroadcastLine` (enqueue only — same as `AGENT_EmitBpHit`).
+
+### Reply / event shape
+
+```json
+bp.set → {"bp_id":1,"addr":"0824:6F8E","seg":2084,"off":28558,
+          "condition":"sp==0x0200","macro_len":2,"continue":false}
+
+bp.cond event → {"event":"bp.cond","bp_id":1,"addr":"0824:6F8E","seg":2084,
+   "off":28558,"hits":7,"halted":true,"from":"0824:6F10","from_cs":2084,
+   "from_ip":28432,"results":[{"cmd":"regs.get","ok":true,"result":{…}}, …]}
+```
+
+`debug.status` gains `cond_breakpoints:[{bp_id,addr,seg,off,condition,macro_len,
+continue,hits,fires}]` — `hits` = every reach (the `hits` operand), `fires` =
+reaches where the condition held. Errors: `bad_args` (addr / condition / macro /
+continue / caps), `unsupported` (non-heavy build), `not_found` (`bp.clear` of a
+gone id).
+
+### Tests
+
+- **`tests/agent_observability_tests.cpp`** — **10 new gTests** (parser accepts
+  the common forms + rejects malformed; evaluator over immediates/hits and
+  registers/mask; `bp.set` arg validation; `bp.set` → `debug.status` reflection;
+  `bp.clear` all / by-id / not_found; and the hot-path worker via
+  `AGENT_CondBpCheck` directly — counts/fires/halt-vote, condition gating,
+  continue=run-and-resume). All headless (parser is pure; the evaluator reads
+  reg globals; the worker's macro is empty/`regs.get` so no MemBase). **121
+  Agent gTests total, all pass.**
+- **`tests/agent_live/test_observability.py` Phase 9** — reuses the phase-1
+  bounded loop (`mov cx,iters` / `nop`@loopbody / `loop`), where at the Nth hit
+  `cx == iters+1-N`, so a register condition and an Nth-hit condition pick the
+  *same* iteration. **9a**: `bp.set if=hits==150 do=regs.get` halts on the 150th
+  hit; the `bp.cond` event says `hits==150, halted==true`, and the macro's
+  `regs.get` captured `cx==151` (taken before `loop` decrements it — proves the
+  atomic-at-trigger snapshot). **9b**: `bp.set if=cx==0x97 continue=true` fires
+  once *without halting* (no `state.paused`), and `debug.status` shows
+  `hits == iters*fires` — the reach-vs-fire distinction. **All 12 phases pass.**
+
+#### Phase ordering note — read this
+
+Phase 9 runs **before** phase 8 in `run()`, on purpose. See the next section.
+
+## ⚠️ Discovered pre-existing bug: savestate restore → resume crashes (NOT 4.9.9)
+
+While adding phase 9 (which runs right after phase 8 in proposal order) the
+live suite crashed. Root-caused to a **pre-existing 4.9.8 / savestate defect**,
+not this iteration's code:
+
+- **Repro (zero 4.9.9 surface):** `state.save` → `state.restore` → `cpu.run`,
+  then merely keep the CPU running — the emulator dies **~0.5 s later** with an
+  access violation. Reproduced with **no** `bp.set`/`bp.clear` and the cond-BP
+  hook gated off (`AGENT_CondBpActive()==false`), so 4.9.9 is not involved.
+- **Signature:** WER `BEX64`, faulting module `unknown`, near-NULL call (fault
+  address `0x8`) **from `ntdll`** — i.e. a Windows callback thread invoking a
+  function pointer the restore left stale. Strong suspect: a **MIXER channel
+  handler** (or similar device callback) that the savestate serializes/restores
+  but does not re-bind to a live function after load.
+- **Why it was never caught:** phase 8 was the last phase, and its own
+  assertions all complete *while paused* (before its `finally` resumes the CPU);
+  the async crash then lands in ignored teardown. Nothing ran after it.
+- **Impact:** breaks the proposal's headline 4.9.8+4.9.9 pairing ("restore to a
+  snapshot, then arm a conditional BP for the Nth hit"). A restore followed by
+  *paused* inspection (regs/mem/step/disasm/status) is fine; restore → `cpu.run`
+  is not.
+- **Workarounds in place:** phase 9 is ordered before phase 8 so the suite
+  passes and 4.9.9 is fully exercised on a healthy machine; `USAGE.md`
+  (`state.save`/`state.restore` notes) carries a user-facing warning.
+- **Next iteration should fix this** before the restore-and-rerun loop is
+  trusted. Start at the mixer/device savestate components (look for a serialized
+  callback / `MixerChannel` handler pointer that isn't re-pointed on load), or
+  bisect which POD component's load makes a subsequent run crash. A minimal
+  repro is trivial to recreate: save, restore, run, wait 1 s.
+
+## Previously shipped (4.9.8 — `state.save` / `state.restore`)
 
 Headless agent entry points into the existing savestate subsystem, so an agent
 can snapshot the bug window once and re-run from it instantly — deterministic,
@@ -488,14 +612,14 @@ python tests/agent_live/test_observability.py
 
 ## Not done / deferred (pick up here, in proposal priority order)
 
-- **4.9.4, 4.9.5, 4.9.7 and 4.9.8 are now complete.** Next item:
-- **4.9.9 conditional / Nth-hit BP + on-hit command macro** — `bp.set {if, do,
-  continue}`. This is the recommended next item. Pairs with the per-BP hit
-  counter already added (`hits==N` conditions are now cheap) and with 4.9.8
-  (restore to a snapshot, then arm a conditional BP for the Nth hit). Likely
-  needs a debugger-side bridge to evaluate a condition expression and run a
-  command macro at the stop, plus a way to auto-continue when the condition is
-  false (mirror how `CBreakpoint` already checks/continues).
+- **All nine proposal-4.9 items (4.9.1–4.9.9) are now complete.** The most
+  valuable next thing is **not** a new proposal item — it is the **savestate
+  restore→resume crash** documented in its own section above. Fix that first: it
+  is a real, reproducible defect that breaks the 4.9.8+4.9.9 loop the proposal is
+  built around.
+- After that, the remaining Phase-2 surface from `TASKS.md` § Iteration 7+:
+  typed `bp.add`/`bp.list`/`bp.del` (stable handles), `regs.set`, `mem.write`
+  (typed store), and mouse input (`mouse.move`/`mouse.click`).
 
 ### Notes for whoever does a future step / savestate refinement
 
@@ -519,11 +643,11 @@ python tests/agent_live/test_observability.py
   was. A Linux/macOS build needs the agent TU list updated; verify on a Unix
   host.
 - **`contrib/agent-client/dbxagent.py`** now has typed wrappers for the 4.9.7
-  commands (`cpu_step()`, `cpu_step_over()`) and the 4.9.8 commands
-  (`state_save()`, `state_restore()`), but still not for the earlier 4.9
-  commands — clients use `call("debug.status")` etc. Add `debug_status()`,
-  `cpu_probe()`, `cpu_trace_ring()`, `cpu_traceback()`, `cpu_disasm()` when
-  convenient.
+  commands (`cpu_step()`, `cpu_step_over()`), the 4.9.8 commands (`state_save()`,
+  `state_restore()`), and the 4.9.9 commands (`bp_set()`, `bp_clear()`), but
+  still not for the earlier 4.9 commands — clients use `call("debug.status")`
+  etc. Add `debug_status()`, `cpu_probe()`, `cpu_trace_ring()`,
+  `cpu_traceback()`, `cpu_disasm()` when convenient.
 - **Heavy-debug only:** `cpu.probe` and `cpu.trace_ring` rely on
   `DEBUG_HeavyIsBreakpoint`, which only runs in a `C_HEAVY_DEBUG` build
   (`vs/config.h` has it on). A plain `C_DEBUG` build compiles them but they
@@ -552,6 +676,11 @@ python tests/agent_live/test_observability.py
 - 4.9.8 "snapshot here, re-run from here" → phase8 (`state.save` at `trace_a`,
   step three instructions, `state.restore` — restore reply `cs_ip` == `trace_a`
   and **all 16 registers** == the pre-step snapshot; live `regs.get` confirms).
+- 4.9.9 "halt only on the interesting case + atomic on-hit macro" → phase9a
+  (`bp.set if=hits==150 do=regs.get` halts on the 150th loop hit; `bp.cond`
+  `hits==150, halted==true`; macro `regs.get` captured `cx==151`) and phase9b
+  (`bp.set if=cx==0x97 continue=true` fires once without halting;
+  `hits==iters*fires` in `debug.status`).
 
 ## Environment note
 

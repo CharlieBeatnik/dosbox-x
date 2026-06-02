@@ -121,6 +121,8 @@ events don't. The reference client does this in a single reader thread.
 | `cpu.step_over`     | none                          | `{regs, cs_ip, insn}` (paused only) |
 | `state.save`        | `{slot}`                      | `{slot, name}` (paused only)        |
 | `state.restore`     | `{slot}`                      | `{slot, name, regs, cs_ip, insn}` (paused only) |
+| `bp.set`            | `{addr, if?, do?, continue?}` | `{bp_id, addr, …}` (heavy-debug; emits `bp.cond`) |
+| `bp.clear`          | `{bp_id?}`                    | `{cleared, remaining}` (`bp_id` omitted = clear all) |
 | `keyboard.type`     | `{text}`                      | `{queued}` (byte count)             |
 | `keyboard.press`    | `{key}`                       | `{}`                                |
 | `keyboard.release`  | `{key}`                       | `{}`                                |
@@ -671,7 +673,12 @@ consuming the event stream:
                "size":2,"predicate":"new_eq=0x853"}
   },
   "probe": [ {"addr":"0824:6F10","seg":2084,"off":28432,"hits":0} ],
-  "trace": {"enabled":true,"depth":256,"count":256,"seg":2084}
+  "trace": {"enabled":true,"depth":256,"count":256,"seg":2084},
+  "cond_breakpoints": [                // 4.9.9 — see bp.set below
+    {"bp_id":1,"addr":"0824:6F8E","seg":2084,"off":28558,
+     "condition":"sp==0x0200","macro_len":2,"continue":false,
+     "hits":31,"fires":1}             // reached 31x, condition held once
+  ]
 }
 ```
 
@@ -851,6 +858,86 @@ Notes / limits:
   has no headless error path). This does not happen in the normal
   save-then-restore cycle.
 - Debug-build only, like the other 4.9 tools.
+- ⚠️ **Known pre-existing bug (Windows): `state.restore` then *resuming the CPU*
+  crashes the emulator ~0.5 s later.** The crash is asynchronous (a Windows
+  callback thread invokes a function pointer the restore left stale — WER
+  `BEX64`, a near-NULL call from `ntdll`; suspected mixer/audio channel handler)
+  and reproduces with **no** conditional-BP / 4.9.9 surface involved. So while a
+  restore *plus paused inspection* (`regs.get`, `mem.read`, `cpu.step`,
+  `cpu.disasm`, `debug.status`) works, **restore → `cpu.run` → … is unsafe**
+  until the savestate bug is fixed. This currently blocks the proposal's
+  "restore to a snapshot, then arm a conditional BP" workflow. Tracked in
+  `HANDOFF.md`.
+
+### `bp.set` / `bp.clear` — conditional / Nth-hit breakpoints + on-hit macros (4.9.9)
+
+A conditional breakpoint pairs an execution address with three optional pieces:
+an **`if` condition** (halt only on the interesting case — a register value, a
+memory word, or the Nth hit), an on-hit **`do` macro** (a snapshot taken
+*atomically at the trigger instant*, before the emulator advances — no manual
+break/inspect/resume round-trip), and a **`continue`** flag (run the macro then
+auto-resume instead of halting). It removes the timing skew between "halt" and
+"capture" and the manual break/inspect/continue loop that is itself a race.
+
+```json
+{"id":1,"cmd":"bp.set","args":{
+   "addr":"0824:6F8E",
+   "if":"sp==0x0200",
+   "do":[{"cmd":"regs.get"},{"cmd":"cpu.traceback","args":{"count":64}}],
+   "continue":false}}
+  → {"bp_id":1,"addr":"0824:6F8E","seg":2084,"off":28558,
+     "condition":"sp==0x0200","macro_len":2,"continue":false}
+```
+
+When the breakpoint is reached and the condition holds, it emits a **`bp.cond`**
+event carrying the macro output, then (unless `continue` is true) halts with the
+usual `debugger.entered` / `state.paused`:
+
+```json
+{"event":"bp.cond","bp_id":1,"addr":"0824:6F8E","seg":2084,"off":28558,
+ "hits":7,"halted":true,"from":"0824:6F10","from_cs":2084,"from_ip":28432,
+ "results":[{"cmd":"regs.get","ok":true,"result":{…}},
+            {"cmd":"cpu.traceback","ok":true,"result":{"entries":[…]}}]}
+```
+
+- **`addr`** (required) — `"SEG:OFF"` (hex), the execution address to watch.
+- **`if`** (optional) — a single comparison, `operand [& mask] op operand`:
+  - **op**: `==` `!=` `<` `<=` `>` `>=` (unsigned).
+  - **operand**: a register (`ax bx cx dx si di bp sp ip`, the 8-bit halves
+    `al ah …`, `eax…eip`, `cs ds es ss fs gs`, `flags`/`eflags`), the literal
+    **`hits`** (this BP's own reach count, for Nth-hit like `"hits==7"`), a
+    number (decimal, or `0x`-hex), or a memory reference
+    `[byte|word|dword] [seg:off]` (`word` default; bare-hex halves like the rest
+    of the agent, e.g. `"[ss:01F8]==0x1234"`, `"byte [es:di]==0x5A"`).
+  - An optional `& mask` is applied to the left operand: `"flags&0x40!=0"`.
+  - Omitted → the BP always fires (an unconditional halt + macro).
+- **`do`** (optional) — a list of read-only macro commands run when the condition
+  holds, each `{"cmd":…,"args":{…}}`. Allowed cmds: `regs.get`, `mem.read`,
+  `cpu.disasm`, `cpu.traceback`, `debug.status` (the read-only snapshot set;
+  anything else is rejected at `bp.set` time). Their replies appear in the
+  `bp.cond` event's `results`.
+- **`continue`** (optional, default `false`) — `true` runs the macro then
+  auto-resumes (a non-halting probe that still reports each fire); `false` halts.
+
+`bp.clear` removes conditional BPs: `{"bp_id":N}` removes one (`not_found` if it
+is already gone), no args removes them all. Both reply `{cleared, remaining}`.
+
+`debug.status` reports every conditional BP under **`cond_breakpoints`**, each
+with its reach counter `hits` (the value the `hits` operand sees) and `fires`
+(the subset where the condition held) — so you can tell "reached but never
+matched" from "matched N times" without consuming the `bp.cond` stream, exactly
+the 4.9.1 "fired or not?" guarantee applied to conditional BPs.
+
+Errors / limits:
+- **`bad_args`** — bad `addr`, a malformed `if` condition (the message names the
+  parse error), a `do` entry that isn't `{cmd,args}` or whose cmd isn't on the
+  allowlist, a non-bool `continue`, or more than 32 BPs / 16 macro commands.
+- **`unsupported`** — a non-heavy-debug build. The per-instruction condition
+  check that lets a condition-false reach continue cleanly only exists under
+  `C_HEAVY_DEBUG` (the same constraint as `cpu.probe` / `cpu.trace_ring`).
+- Conditions read memory as **physical real-mode** bytes (`(seg<<4)+off`); they
+  do not page-translate. Comparisons are unsigned. The macro commands run on the
+  CPU thread at the trigger, so keep them to the read-only snapshot set above.
 
 ### `mem.watch` — write-intercept that names the storing instruction
 

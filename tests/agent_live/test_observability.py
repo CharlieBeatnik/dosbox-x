@@ -22,6 +22,15 @@ guest, that the proposal-4.9 commands report the truth:
      cpu.traceback shows the chain in execution order, most-recent-last,
      ending at trace_end.
 
+  Phases 4-8 cover mem.watch (4.9.4 + VGA), multi-sentinel watches (4.9.5),
+  cpu.step/step_over (4.9.7), and state.save/restore (4.9.8).
+
+  Phase 9 (4.9.9): conditional / Nth-hit breakpoints with on-hit macros,
+     reusing the phase-1 loop (cx == iters+1-N at the Nth hit). 9a halts on the
+     Nth hit and captures a regs.get macro atomically at the trigger; 9b uses a
+     register condition with continue=true to fire-and-resume, proving the
+     hits-vs-fires distinction.
+
 The landmark offsets are read from a fixed table in the guest at runtime
 (CS:0103), so the driver never hardcodes volatile offsets.
 
@@ -115,6 +124,8 @@ def _reset(agent: DbxAgent) -> None:
         agent.call("cpu.trace_ring", enabled=False)
     with contextlib.suppress(Exception):
         agent.call("mem.unwatch")
+    with contextlib.suppress(Exception):
+        agent.call("bp.clear")
     _drain_events(agent)
 
 
@@ -768,6 +779,148 @@ def phase8_savestate(agent, cs, trace_a, rep) -> None:
             agent.cpu_run(); _drain_events(agent)
 
 
+def phase9_cond_bp(agent, cs, loopbody, iters, rep) -> None:
+    # 4.9.9: conditional / Nth-hit breakpoints with on-hit command macros.
+    # Reuses the phase-1 bounded loop (`mov cx,iters` / nop@loopbody / loop):
+    # at the Nth execution of loopbody, cx == iters + 1 - N (loop decrements cx
+    # AFTER the nop). So a register condition and an Nth-hit condition pick the
+    # SAME iteration, which lets the two sub-checks cross-validate.
+    target_n = iters // 2                 # 150
+    expected_cx = iters + 1 - target_n    # 151
+
+    # 9a: halt on the Nth hit, with a regs.get macro captured atomically at the
+    # trigger instant. The macro's cx must equal expected_cx (taken before the
+    # `loop` that decrements it), proving the snapshot is at the trigger, and
+    # the bp.cond event must say hits==N and halted==true.
+    name = "phase9a: Nth-hit conditional BP halts with atomic on-hit macro"
+    try:
+        _reset(agent)
+        r = agent.bp_set(f"{cs:04X}:{loopbody:04X}", if_=f"hits=={target_n}",
+                         do=[{"cmd": "regs.get"}], cont=False)
+        if "bp_id" not in r:
+            rep.record(name, False, f"bp.set reply: {r}")
+            return
+        agent.cpu_run(); _drain_events(agent)
+        agent.keyboard_tap("1")
+        ev = _wait_for_event(agent, "bp.cond", timeout=8.0)
+
+        problems = []
+        if ev.get("hits") != target_n:
+            problems.append(f"event hits={ev.get('hits')} expected {target_n}")
+        if ev.get("halted") is not True:
+            problems.append(f"halted={ev.get('halted')!r} expected True")
+        if ev.get("seg") != cs or ev.get("off") != loopbody:
+            problems.append(f"addr {ev.get('seg'):04X}:{ev.get('off'):04X}")
+        results = ev.get("results", [])
+        if not results or results[0].get("cmd") != "regs.get" or not results[0].get("ok"):
+            problems.append(f"macro results={results}")
+        else:
+            # regs.get's result IS the register object (no "regs" wrapper; that
+            # nesting is only in cpu.step's reply).
+            macro_cx = results[0]["result"]["ecx"] & 0xFFFF
+            if macro_cx != expected_cx:
+                problems.append(f"macro cx={macro_cx:#x} expected {expected_cx:#x}")
+
+        # The halt must be real: the CPU is paused and the counters surface.
+        st = agent.call("debug.status")
+        if st.get("cpu") != "paused":
+            problems.append(f"cpu={st.get('cpu')!r} (expected paused)")
+        cbs = st.get("cond_breakpoints", [])
+        cb = cbs[0] if cbs else {}
+        if cb.get("hits", 0) < target_n:
+            problems.append(f"cond hits={cb.get('hits')} (< {target_n})")
+        if cb.get("fires", 0) < 1:
+            problems.append(f"cond fires={cb.get('fires')}")
+        # Independent confirmation off the live registers.
+        live_cx = agent.regs_get()["ecx"] & 0xFFFF
+        if live_cx != expected_cx:
+            problems.append(f"live cx={live_cx:#x} expected {expected_cx:#x}")
+
+        if problems:
+            rep.record(name, False, "; ".join(problems[:4]))
+        else:
+            rep.record(name, True,
+                       f"halted at hit {target_n} (cx={expected_cx:#x}); macro captured cx")
+    except Exception as exc:
+        rep.record(name, False, repr(exc))
+    finally:
+        with contextlib.suppress(Exception):
+            agent.cpu_pause(); _drain_events(agent)
+            agent.bp_clear()
+            agent.debugger_command("BPDEL 0 *")
+            agent.cpu_run(); _drain_events(agent)
+
+    # 9b: a register condition with continue=true fires once (at the same
+    # iteration cx==expected_cx) WITHOUT halting — proving run-and-resume, and
+    # the hits-vs-fires distinction: the BP is reached every iteration (hits ==
+    # iters) but its condition holds exactly once (fires == 1).
+    name = "phase9b: continue=true conditional BP runs-and-resumes (hits vs fires)"
+    try:
+        _reset(agent)
+        r = agent.bp_set(f"{cs:04X}:{loopbody:04X}", if_=f"cx=={expected_cx:#x}",
+                         cont=True)
+        if "bp_id" not in r:
+            rep.record(name, False, f"bp.set reply: {r}")
+            return
+        agent.cpu_run(); _drain_events(agent)
+        agent.keyboard_tap("1")
+
+        # Collect events for a beat: exactly one bp.cond (halted false), and no
+        # state.paused (we must never have halted).
+        cond_events = []
+        paused = False
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            e = agent.next_event(timeout=max(0.05, deadline - time.monotonic()))
+            if e is None:
+                continue
+            if e.get("event") == "bp.cond":
+                cond_events.append(e)
+            elif e.get("event") == "state.paused":
+                paused = True
+
+        problems = []
+        if paused:
+            problems.append("CPU halted (state.paused seen) despite continue=true")
+        if not cond_events:
+            problems.append("no bp.cond event arrived")
+        else:
+            if any(e.get("halted") is not False for e in cond_events):
+                problems.append("a bp.cond event had halted=True despite continue=true")
+            # The first fire is always at the 150th reach (hits counts from 1).
+            if cond_events[0].get("hits") != target_n:
+                problems.append(f"first event hits={cond_events[0].get('hits')} expected {target_n}")
+
+        # debug.status (read while running) proves the hits-vs-fires distinction.
+        # The '1' key may auto-repeat before the slow paste pump releases it, so
+        # the loop can run more than once (the same quirk phases 4/5/6 tolerate).
+        # What MUST hold regardless of run count N: the BP fired once per run
+        # (fires == N >= 1) yet was REACHED `iters` times per run, i.e.
+        # hits == iters * fires. That equality is the whole point of the test.
+        st = agent.call("debug.status")
+        cbs = st.get("cond_breakpoints", [])
+        cb = cbs[0] if cbs else {}
+        fires = cb.get("fires", 0)
+        hits = cb.get("hits", 0)
+        if fires < 1:
+            problems.append(f"cond fires={fires} (expected >=1)")
+        if hits != iters * fires:
+            problems.append(f"cond hits={hits} != iters*fires ({iters}*{fires})")
+
+        if problems:
+            rep.record(name, False, "; ".join(problems[:4]))
+        else:
+            rep.record(name, True,
+                       f"fired {fires}x (hits={hits}={iters}*{fires}), never halted")
+    except Exception as exc:
+        rep.record(name, False, repr(exc))
+    finally:
+        with contextlib.suppress(Exception):
+            agent.cpu_pause(); _drain_events(agent)
+            agent.bp_clear()
+            agent.cpu_run(); _drain_events(agent)
+
+
 def run(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dosbox", default=str(DEFAULT_DOSBOX))
@@ -819,6 +972,18 @@ def run(argv=None) -> int:
             phase5_vga_memwatch(agent, cs, vga_store, rep)
             phase6_multi_sentinel(agent, cs, msa, msb, rep)
             phase7_step(agent, cs, trace_a, trace_end, call_at, call_ret, sub, rep)
+            phase9_cond_bp(agent, cs, loopbody, iters, rep)
+            # phase8 runs LAST: a state.restore leaves the machine in a state
+            # where resuming the CPU triggers a pre-existing, asynchronous
+            # savestate crash ~0.5s later (a Windows callback thread invokes a
+            # function pointer the restore left stale — WER BEX64, a near-NULL
+            # call FROM ntdll; suspected mixer/audio channel handler). It is
+            # unrelated to 4.9.9 (reproduces with zero conditional-BP surface)
+            # and breaks the proposal's 4.9.8+4.9.9 "restore then arm a
+            # conditional BP" pairing. Until that savestate bug is fixed, no
+            # phase may run after phase 8: its own assertions all complete while
+            # paused (before its finally resumes), so it still passes, and the
+            # async crash lands in ignored teardown. See HANDOFF.md.
             phase8_savestate(agent, cs, trace_a, rep)
 
             with contextlib.suppress(Exception):

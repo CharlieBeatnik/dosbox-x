@@ -451,6 +451,33 @@ JsonValue handleDebugStatus(double id, const JsonValue & /*args*/) {
         r.emplace("trace", JsonValue::makeObject(std::move(t)));
     }
 
+    /* Conditional / Nth-hit breakpoints (4.9.9). Each carries the reach
+     * counter `hits` (the value the `hits` operand sees) and `fires` (the
+     * subset where the condition held and the macro ran) so an agent can tell
+     * "reached but never matched" from "matched N times" without consuming the
+     * bp.cond event stream — the 4.9.1 "fired or not?" principle applied to
+     * conditional BPs too. */
+    {
+        JsonArray cbs;
+        for (const CondBp &bp : g_condBps) {
+            JsonObject o;
+            o.emplace("bp_id", JsonValue::makeNumber(double(bp.id)));
+            char addr[24];
+            snprintf(addr, sizeof(addr), "%04X:%04X", unsigned(bp.seg), unsigned(bp.off));
+            o.emplace("addr", JsonValue::makeString(addr));
+            o.emplace("seg",  JsonValue::makeNumber(double(bp.seg)));
+            o.emplace("off",  JsonValue::makeNumber(double(bp.off)));
+            o.emplace("condition", bp.condStr.empty()
+                      ? JsonValue::makeNull() : JsonValue::makeString(bp.condStr));
+            o.emplace("macro_len", JsonValue::makeNumber(double(bp.macro.size())));
+            o.emplace("continue",  JsonValue::makeBool(bp.cont));
+            o.emplace("hits",  JsonValue::makeNumber(double(bp.hits)));
+            o.emplace("fires", JsonValue::makeNumber(double(bp.fires)));
+            cbs.push_back(JsonValue::makeObject(std::move(o)));
+        }
+        r.emplace("cond_breakpoints", JsonValue::makeArray(std::move(cbs)));
+    }
+
     return makeReplyOk(id, std::move(r));
 }
 

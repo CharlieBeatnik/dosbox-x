@@ -134,6 +134,7 @@ Goal: a reproducible end-to-end test.
 > below are checked off where 4.9 covered them.
 
 - [ ] `bp.add` / `bp.list` / `bp.del` typed (direct `CBreakpoint::*`).
+- [x] `bp.set` / `bp.clear` — conditional / Nth-hit BP + on-hit macro. *(4.9.9)*
 - [x] `mem.read` (binary, base64). *(shipped)*
 - [ ] `mem.write` (typed store; `mem.watch` write-intercept shipped in 4.9.4).
 - [x] `regs.get` typed. *(shipped)* — `regs.set` still TODO.

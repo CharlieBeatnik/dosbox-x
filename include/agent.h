@@ -173,6 +173,21 @@ bool AGENT_IsHeadless(void);
  * No-op when no step-over is pending. */
 void AGENT_OnDebuggerPaused(void);
 
+/* Conditional / Nth-hit breakpoints with on-hit command macros (proposal
+ * 4.9.9). Checked once per instruction from DEBUG_HeavyIsBreakpoint — the same
+ * hot-path slot cpu.probe / cpu.trace_ring use — so AGENT_CondBpActive() is the
+ * fast gate that costs a single bool load when no conditional BP is armed.
+ * AGENT_CondBpCheck(cur_cs, cur_off, from_cs, from_ip) is called only when
+ * armed; for each conditional BP at (cur_cs, cur_off) it bumps the reach
+ * counter, evaluates the condition, and — if it holds — runs the BP's macro
+ * (its output captured atomically here, before the instruction retires) and
+ * emits a `bp.cond` event. It returns true when at least one matching BP wants
+ * to halt (its `continue` flag is false); returning true causes the heavy hook
+ * to enter the debugger exactly as a normal breakpoint match does. */
+bool AGENT_CondBpActive(void);
+bool AGENT_CondBpCheck(uint16_t cur_cs, uint16_t cur_off,
+                       uint16_t from_cs, uint16_t from_ip);
+
 #else /* !C_DEBUG */
 
 static inline void AGENT_StartIfRequested(void) {}
@@ -217,6 +232,9 @@ static inline void AGENT_OnLoopChange(void) {}
 static inline void AGENT_OnScreenCaptured(const char * /*path*/, bool /*raw*/) {}
 static inline bool AGENT_IsHeadless(void) { return false; }
 static inline void AGENT_OnDebuggerPaused(void) {}
+static inline bool AGENT_CondBpActive(void) { return false; }
+static inline bool AGENT_CondBpCheck(uint16_t /*cur_cs*/, uint16_t /*cur_off*/,
+                                     uint16_t /*from_cs*/, uint16_t /*from_ip*/) { return false; }
 
 #endif /* C_DEBUG */
 

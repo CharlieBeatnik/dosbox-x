@@ -70,6 +70,7 @@ public:
         dispatchLine("{\"id\":99,\"cmd\":\"cpu.trace_ring\",\"args\":{\"depth\":256}}");
         dispatchLine("{\"id\":99,\"cmd\":\"cpu.trace_ring\",\"args\":{\"enabled\":false}}");
         dispatchLine("{\"id\":99,\"cmd\":\"mem.unwatch\"}");
+        dispatchLine("{\"id\":99,\"cmd\":\"bp.clear\"}");   /* 4.9.9 cond BPs */
         g_stepOverPending = false;   /* no cpu.step_over (4.9.7) in flight */
         /* Clear the BP list so debug.status never reads bytes_now (no MemBase). */
         dispatchLine("{\"id\":99,\"cmd\":\"debugger.command\",\"args\":{\"text\":\"BPDEL 0 *\"}}");
@@ -81,6 +82,7 @@ public:
         dispatchLine("{\"id\":99,\"cmd\":\"cpu.probe\",\"args\":{\"points\":[]}}");
         dispatchLine("{\"id\":99,\"cmd\":\"cpu.trace_ring\",\"args\":{\"enabled\":false}}");
         dispatchLine("{\"id\":99,\"cmd\":\"mem.unwatch\"}");
+        dispatchLine("{\"id\":99,\"cmd\":\"bp.clear\"}");
     }
 
     static JsonValue parse(const std::string &reply) {
@@ -822,6 +824,245 @@ TEST_F(AgentObservabilityTest, StateRestoreRequiresPause)
     ASSERT_TRUE(v.get("ok"));
     EXPECT_FALSE(v.get("ok")->b);
     EXPECT_EQ(v.get("error")->get("code")->s, "bad_state");
+}
+
+/* ---- conditional / Nth-hit breakpoints (4.9.9) ----------------------- */
+/* The condition parser and evaluator are pure functions (the evaluator reads
+ * register globals, which exist in -tests mode), so they are exercised
+ * directly here. The hot-path worker AGENT_CondBpCheck mutates agent-side
+ * state and reads registers only (empty / regs.get macros), so it too runs
+ * headless. The actual halt-into-the-debugger and mem.read/disasm macros need
+ * a running guest and are covered live by test_observability.py phase 9. */
+
+TEST_F(AgentObservabilityTest, CondParseAcceptsCommonForms)
+{
+    const char *ok[] = {
+        "sp==0x0200", "hits==7", "cx==151", "ax!=0", "eax>=0x10000",
+        "[ss:01F8]==0x1234", "byte [es:di]==0x5A", "dword [ds:bx]<=0xFF",
+        "flags&0x40!=0", "ip>0x100",
+    };
+    for (const char *s : ok) {
+        BpCondition c; std::string err;
+        EXPECT_TRUE(parseBpCondition(s, c, err)) << s << " :: " << err;
+        EXPECT_TRUE(c.present) << s;
+    }
+
+    /* Spot-check a couple of parsed structures. */
+    BpCondition c; std::string err;
+    ASSERT_TRUE(parseBpCondition("hits==7", c, err));
+    EXPECT_EQ(c.op, BP_EQ);
+    EXPECT_FALSE(c.lhs.isMem);
+    EXPECT_EQ(c.lhs.direct.kind, BpValSrc::HITS);
+    EXPECT_EQ(c.rhs.direct.kind, BpValSrc::IMM);
+    EXPECT_EQ(c.rhs.direct.imm, 7u);
+
+    ASSERT_TRUE(parseBpCondition("flags&0x40!=0", c, err));
+    EXPECT_TRUE(c.hasMask);
+    EXPECT_EQ(c.mask, 0x40u);
+    EXPECT_EQ(c.op, BP_NE);
+
+    ASSERT_TRUE(parseBpCondition("byte [es:di]==0x5A", c, err));
+    EXPECT_TRUE(c.lhs.isMem);
+    EXPECT_EQ(c.lhs.memSize, 1);
+    EXPECT_EQ(c.lhs.memOff.kind, BpValSrc::REG);
+}
+
+TEST_F(AgentObservabilityTest, CondParseRejectsMalformed)
+{
+    const char *bad[] = {
+        "", "ax", "ax==", "==5", "ax===5", "[ss]==1", "foo==1",
+        "ax & == 5", "ax & bx == 1", "ax == 5 == 1", "ax <> 5", "byte ax==1",
+    };
+    for (const char *s : bad) {
+        BpCondition c; std::string err;
+        EXPECT_FALSE(parseBpCondition(s, c, err)) << "should reject: " << s;
+        EXPECT_FALSE(err.empty()) << s;
+    }
+}
+
+TEST_F(AgentObservabilityTest, CondEvalImmediatesAndHits)
+{
+    BpCondition c; std::string err;
+
+    ASSERT_TRUE(parseBpCondition("hits==7", c, err));
+    EXPECT_TRUE (evalBpCondition(c, 7));
+    EXPECT_FALSE(evalBpCondition(c, 6));
+
+    ASSERT_TRUE(parseBpCondition("hits>=3", c, err));
+    EXPECT_FALSE(evalBpCondition(c, 2));
+    EXPECT_TRUE (evalBpCondition(c, 3));
+    EXPECT_TRUE (evalBpCondition(c, 99));
+
+    /* An unconditional (default) condition always holds. */
+    BpCondition none;
+    EXPECT_TRUE(evalBpCondition(none, 0));
+}
+
+TEST_F(AgentObservabilityTest, CondEvalRegistersAndMask)
+{
+    BpCondition c; std::string err;
+
+    reg_ecx = 0x00010151;                 /* cx low = 0x0151, ecx full = 0x10151 */
+    ASSERT_TRUE(parseBpCondition("cx==0x151", c, err));
+    EXPECT_TRUE(evalBpCondition(c, 0));
+    ASSERT_TRUE(parseBpCondition("ecx==0x10151", c, err));
+    EXPECT_TRUE(evalBpCondition(c, 0));
+    ASSERT_TRUE(parseBpCondition("cx<0x151", c, err));
+    EXPECT_FALSE(evalBpCondition(c, 0));
+
+    reg_eax = 0x0000005A;
+    ASSERT_TRUE(parseBpCondition("al==0x5A", c, err));
+    EXPECT_TRUE(evalBpCondition(c, 0));
+    ASSERT_TRUE(parseBpCondition("ah==0", c, err));
+    EXPECT_TRUE(evalBpCondition(c, 0));
+
+    reg_flags = 0x0246;                   /* bit 0x40 set */
+    ASSERT_TRUE(parseBpCondition("flags&0x40!=0", c, err));
+    EXPECT_TRUE(evalBpCondition(c, 0));
+    reg_flags = 0x0202;                   /* bit 0x40 clear */
+    EXPECT_FALSE(evalBpCondition(c, 0));
+}
+
+TEST_F(AgentObservabilityTest, BpSetValidatesArgs)
+{
+    /* Missing addr. */
+    JsonValue v = parse(dispatchLine("{\"id\":1,\"cmd\":\"bp.set\"}"));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+
+    /* Bad addr. */
+    v = parse(dispatchLine("{\"id\":1,\"cmd\":\"bp.set\",\"args\":{\"addr\":\"nope\"}}"));
+    EXPECT_FALSE(v.get("ok")->b);
+
+    /* Bad condition. */
+    v = parse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"bp.set\",\"args\":{\"addr\":\"0824:0166\",\"if\":\"foo==1\"}}"));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+
+    /* Macro command not on the read-only allowlist. */
+    v = parse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"bp.set\",\"args\":{\"addr\":\"0824:0166\","
+        "\"do\":[{\"cmd\":\"cpu.run\"}]}}"));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+
+    /* 'continue' wrong type. */
+    v = parse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"bp.set\",\"args\":{\"addr\":\"0824:0166\",\"continue\":\"yes\"}}"));
+    EXPECT_FALSE(v.get("ok")->b);
+}
+
+TEST_F(AgentObservabilityTest, BpSetSucceedsAndAppearsInStatus)
+{
+    JsonValue v = parse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"bp.set\",\"args\":{\"addr\":\"0824:0166\","
+        "\"if\":\"hits==150\",\"do\":[{\"cmd\":\"regs.get\"}],\"continue\":false}}"));
+    ASSERT_TRUE(v.get("ok") && v.get("ok")->b) << "bp.set should succeed";
+    const JsonValue *r = v.get("result");
+    ASSERT_TRUE(r && r->isObject());
+    EXPECT_EQ(r->get("addr")->s, "0824:0166");
+    EXPECT_EQ(uint16_t(r->get("seg")->n), 0x0824u);
+    EXPECT_EQ(uint16_t(r->get("off")->n), 0x0166u);
+    EXPECT_EQ(r->get("condition")->s, "hits==150");
+    EXPECT_EQ(int(r->get("macro_len")->n), 1);
+    EXPECT_FALSE(r->get("continue")->b);
+    int bp_id = int(r->get("bp_id")->n);
+
+    /* It surfaces in debug.status with zeroed hit/fire counters. */
+    JsonValue st = status();
+    const JsonValue *cbs = st.get("result")->get("cond_breakpoints");
+    ASSERT_TRUE(cbs && cbs->isArray());
+    ASSERT_EQ(cbs->a->size(), 1u);
+    const JsonValue &cb = (*cbs->a)[0];
+    EXPECT_EQ(int(cb.get("bp_id")->n), bp_id);
+    EXPECT_EQ(cb.get("addr")->s, "0824:0166");
+    EXPECT_EQ(cb.get("condition")->s, "hits==150");
+    EXPECT_EQ(uint64_t(cb.get("hits")->n), 0u);
+    EXPECT_EQ(uint64_t(cb.get("fires")->n), 0u);
+}
+
+TEST_F(AgentObservabilityTest, BpClearAllAndById)
+{
+    dispatchLine("{\"id\":1,\"cmd\":\"bp.set\",\"args\":{\"addr\":\"0824:0100\"}}");
+    JsonValue v2 = parse(dispatchLine(
+        "{\"id\":2,\"cmd\":\"bp.set\",\"args\":{\"addr\":\"0824:0200\"}}"));
+    int id2 = int(v2.get("result")->get("bp_id")->n);
+
+    /* Clear one by id -> one remains. */
+    JsonValue c = parse(dispatchLine(
+        std::string("{\"id\":3,\"cmd\":\"bp.clear\",\"args\":{\"bp_id\":") +
+        std::to_string(id2) + "}}"));
+    ASSERT_TRUE(c.get("ok")->b);
+    EXPECT_EQ(uint64_t(c.get("result")->get("remaining")->n), 1u);
+
+    /* Clearing a now-missing id -> not_found. */
+    JsonValue nf = parse(dispatchLine(
+        std::string("{\"id\":4,\"cmd\":\"bp.clear\",\"args\":{\"bp_id\":") +
+        std::to_string(id2) + "}}"));
+    EXPECT_FALSE(nf.get("ok")->b);
+    EXPECT_EQ(nf.get("error")->get("code")->s, "not_found");
+
+    /* Clear all -> none remain. */
+    JsonValue all = parse(dispatchLine("{\"id\":5,\"cmd\":\"bp.clear\"}"));
+    ASSERT_TRUE(all.get("ok")->b);
+    EXPECT_EQ(uint64_t(all.get("result")->get("remaining")->n), 0u);
+
+    JsonValue st = status();
+    EXPECT_EQ(st.get("result")->get("cond_breakpoints")->a->size(), 0u);
+}
+
+TEST_F(AgentObservabilityTest, CondBpHotPathCountsFiresAndVotesHalt)
+{
+    /* Unconditional, halting BP at 0824:0166. The hot path must count every
+     * reach, fire each time (no condition), and vote to halt. A reach at a
+     * different address must do nothing. */
+    parse(dispatchLine("{\"id\":1,\"cmd\":\"bp.set\","
+                       "\"args\":{\"addr\":\"0824:0166\"}}"));
+
+    EXPECT_TRUE (AGENT_CondBpCheck(0x0824, 0x0166, 0x0824, 0x0164));  /* halt */
+    EXPECT_FALSE(AGENT_CondBpCheck(0x0824, 0x9999, 0x0824, 0x0166));  /* miss */
+    EXPECT_TRUE (AGENT_CondBpCheck(0x0824, 0x0166, 0x0824, 0x0164));
+
+    JsonValue st = status();
+    const JsonValue &cb = (*st.get("result")->get("cond_breakpoints")->a)[0];
+    EXPECT_EQ(uint64_t(cb.get("hits")->n),  2u);
+    EXPECT_EQ(uint64_t(cb.get("fires")->n), 2u);
+}
+
+TEST_F(AgentObservabilityTest, CondBpConditionGatesHalt)
+{
+    /* Nth-hit: halt only on the 2nd reach. */
+    parse(dispatchLine("{\"id\":1,\"cmd\":\"bp.set\","
+                       "\"args\":{\"addr\":\"0824:0166\",\"if\":\"hits==2\"}}"));
+
+    EXPECT_FALSE(AGENT_CondBpCheck(0x0824, 0x0166, 0, 0));  /* hits=1, no halt */
+    EXPECT_TRUE (AGENT_CondBpCheck(0x0824, 0x0166, 0, 0));  /* hits=2, halt   */
+    EXPECT_FALSE(AGENT_CondBpCheck(0x0824, 0x0166, 0, 0));  /* hits=3, no halt */
+
+    JsonValue st = status();
+    const JsonValue &cb = (*st.get("result")->get("cond_breakpoints")->a)[0];
+    EXPECT_EQ(uint64_t(cb.get("hits")->n),  3u);   /* reached three times      */
+    EXPECT_EQ(uint64_t(cb.get("fires")->n), 1u);   /* condition held only once */
+}
+
+TEST_F(AgentObservabilityTest, CondBpContinueFiresWithoutHalting)
+{
+    /* continue=true with a register condition: fires once (run-and-resume),
+     * never votes to halt. */
+    parse(dispatchLine("{\"id\":1,\"cmd\":\"bp.set\","
+                       "\"args\":{\"addr\":\"0824:0166\",\"if\":\"cx==0x151\","
+                       "\"continue\":true}}"));
+
+    reg_ecx = 0x151;
+    EXPECT_FALSE(AGENT_CondBpCheck(0x0824, 0x0166, 0, 0));  /* matches, but continue */
+    reg_ecx = 0x999;
+    EXPECT_FALSE(AGENT_CondBpCheck(0x0824, 0x0166, 0, 0));  /* condition false       */
+
+    JsonValue st = status();
+    const JsonValue &cb = (*st.get("result")->get("cond_breakpoints")->a)[0];
+    EXPECT_EQ(uint64_t(cb.get("hits")->n),  2u);
+    EXPECT_EQ(uint64_t(cb.get("fires")->n), 1u);
 }
 
 }  /* anonymous namespace */

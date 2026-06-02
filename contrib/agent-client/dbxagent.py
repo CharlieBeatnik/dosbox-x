@@ -218,6 +218,44 @@ class DbxAgent:
         """
         return self.call("state.restore", slot=slot)
 
+    def bp_set(self, addr: str, *, if_: Optional[str] = None,
+               do: Optional[list] = None, cont: bool = False) -> dict:
+        """Arm a conditional / Nth-hit breakpoint with an optional on-hit macro.
+
+        ``addr`` is "SEG:OFF" (hex). ``if_`` is an optional condition string —
+        a single comparison ``operand [& mask] op operand`` where an operand is
+        a register (ax/eax/al/cs/flags/...), ``hits`` (the BP's own reach
+        count), a number (decimal, or 0x-hex; bare hex inside ``[seg:off]``), or
+        a memory reference ``[byte|word|dword] [seg:off]``. Examples:
+        ``"hits==150"``, ``"cx==0x151"``, ``"byte [es:di]==0x5A"``,
+        ``"flags&0x40!=0"``. ``do`` is an optional list of read-only macro
+        commands run atomically when the condition holds — each a dict
+        ``{"cmd": ..., "args": {...}}`` with cmd in {regs.get, mem.read,
+        cpu.disasm, cpu.traceback, debug.status}; their output is delivered in
+        the ``bp.cond`` event's ``results``. ``cont=True`` runs the macro then
+        auto-resumes instead of halting.
+
+        Returns ``{bp_id, addr, seg, off, condition, macro_len, continue}``.
+        When the BP fires you receive a ``bp.cond`` event (and, if it halts,
+        the usual debugger.entered / state.paused). Heavy-debug build only —
+        errors ``unsupported`` otherwise, or ``bad_args`` on a malformed addr /
+        condition / macro entry. (`if` is a Python keyword, hence ``if_``.)
+        """
+        args: dict = {"addr": addr, "continue": cont}
+        if if_ is not None:
+            args["if"] = if_
+        if do is not None:
+            args["do"] = do
+        return self.call("bp.set", **args)
+
+    def bp_clear(self, bp_id: Optional[int] = None) -> dict:
+        """Clear conditional breakpoints. With ``bp_id``, removes just that one
+        (``not_found`` if it is gone); without, removes them all. Returns
+        ``{cleared, remaining}``."""
+        if bp_id is None:
+            return self.call("bp.clear")
+        return self.call("bp.clear", bp_id=bp_id)
+
     def regs_get(self) -> dict:
         """Snapshot all CPU registers in one structured reply.
 

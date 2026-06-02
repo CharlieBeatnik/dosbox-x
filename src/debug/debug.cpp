@@ -6309,6 +6309,17 @@ bool DEBUG_HeavyIsBreakpoint(void) {
 			AGENT_EmitRangeEnter("hbp_exec", cur_cs, cur_ip, prev_cs, prev_ip);
 	}
 
+	/* Conditional / Nth-hit breakpoints with on-hit macros (proposal 4.9.9).
+	 * Same per-instruction slot the probe/trace hooks use. When a conditional
+	 * BP's predicate holds, AGENT_CondBpCheck runs its macro + emits bp.cond
+	 * here (atomically, before this instruction retires); it returns true only
+	 * when a matching BP wants to halt, in which case we enter the debugger
+	 * exactly as a CheckBreakpoint match would. The from CS:IP is the previous
+	 * instruction captured above. */
+	if (AGENT_CondBpActive() && AGENT_CondBpCheck(cur_cs, cur_ip, prev_cs, prev_ip)) {
+		return true;
+	}
+
 	if (!CBreakpoint::BPoints.empty() && CBreakpoint::CheckBreakpoint(cur_cs, reg_eip)) {
 		return true;
 	}
