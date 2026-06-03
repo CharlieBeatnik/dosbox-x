@@ -176,9 +176,12 @@ bool parseSegOff(const std::string &s, uint32_t &seg, uint32_t &off) {
 
 /* Render `len` real-mode bytes at seg:off as space-separated uppercase hex
  * ("B8 34 12"). phys_readb matches mem.read's "physical" semantics (no
- * paging, OOB returns 0xFF); for real-mode code physical == linear. */
+ * paging, OOB returns 0xFF); for real-mode code physical == linear. Returns
+ * "" when the memory subsystem is not up (MemBase==NULL, e.g. -tests mode) so
+ * bp.list's bytes_now never dereferences a null base. */
 std::string bytesHex(uint16_t seg, uint16_t off, int len) {
     std::string out;
+    if (MemBase == nullptr) return out;
     uint32_t base = uint32_t(seg) << 4;
     for (int k = 0; k < len; ++k) {
         if (k) out.push_back(' ');
@@ -1058,6 +1061,188 @@ JsonValue handleBpClear(double id, const JsonValue &args) {
     JsonObject r;
     r.emplace("cleared",   JsonValue::makeNumber(double(n)));
     r.emplace("remaining", JsonValue::makeNumber(0.0));
+    return makeReplyOk(id, std::move(r));
+}
+
+/* ---- bp.add / bp.list / bp.del : typed real breakpoints with stable handles
+ *
+ * The typed replacement for the `debugger.command "BP …"` / "BPINT …" /
+ * "BPDEL" strings the client used in Phase 1. These create real CBreakpoints
+ * (the kind that halt the CPU in the debugger), each addressed by a stable id
+ * assigned at construction, so a handle stays valid as other breakpoints are
+ * added and removed — retiring the carry-over that the bp.hit `bp_index` was an
+ * iteration position, not a handle. The bp.hit event now also carries `bp_id`,
+ * so a consumer can correlate a hit with the breakpoint it added here.
+ *
+ * Distinct from bp.set / bp.clear above: those manage the agent-side
+ * conditional / Nth-hit table (heavy-debug per-instruction checks). bp.add
+ * makes an ordinary execution or interrupt breakpoint via the existing
+ * CBreakpoint machinery. */
+
+namespace {
+
+/* Collector for DEBUG_AgentForEachBreakpoint — appends one breakpoint object
+ * to the JsonArray in ctx. Mirrors agent_observe.cpp's debug.status collector
+ * but leads with the stable `bp_id` (and keeps `index` for back-compat with the
+ * legacy BPDEL/bp_index world). */
+void bpListCollector(void *ctx, const AgentBreakpointInfo *info) {
+    JsonArray *arr = static_cast<JsonArray *>(ctx);
+    JsonObject o;
+    o.emplace("bp_id", JsonValue::makeNumber(double(info->id)));
+    o.emplace("index", JsonValue::makeNumber(double(info->index)));
+    const char *kind = "other";
+    switch (info->kind) {
+        case AGENT_BPKIND_EXEC: kind = "exec"; break;
+        case AGENT_BPKIND_INT:  kind = "int";  break;
+        case AGENT_BPKIND_MEM:  kind = "mem";  break;
+        default: break;
+    }
+    o.emplace("kind",    JsonValue::makeString(kind));
+    o.emplace("enabled", JsonValue::makeBool(info->enabled));
+    o.emplace("hits",    JsonValue::makeNumber(double(info->hits)));
+    if (info->kind == AGENT_BPKIND_INT) {
+        o.emplace("int", JsonValue::makeNumber(double(info->intnr)));
+    } else {
+        char addr[24];
+        snprintf(addr, sizeof(addr), "%04X:%04X",
+                 unsigned(info->seg), unsigned(info->off & 0xFFFF));
+        o.emplace("addr", JsonValue::makeString(addr));
+        o.emplace("seg",  JsonValue::makeNumber(double(info->seg)));
+        o.emplace("off",  JsonValue::makeNumber(double(info->off)));
+        if (info->kind == AGENT_BPKIND_EXEC)
+            o.emplace("bytes_now",
+                JsonValue::makeString(bytesHex(info->seg, uint16_t(info->off), 4)));
+    }
+    arr->push_back(JsonValue::makeObject(std::move(o)));
+}
+
+void bpCounter(void *ctx, const AgentBreakpointInfo * /*info*/) {
+    (*static_cast<size_t *>(ctx))++;
+}
+
+size_t bpCount(void) {
+    size_t n = 0;
+    DEBUG_AgentForEachBreakpoint(&bpCounter, &n);
+    return n;
+}
+
+/* Validate an optional AH/AL byte arg into [0,255]; out=-1 means "absent"
+ * (the BPINT "any" wildcard). Returns false on a present-but-out-of-range or
+ * wrong-typed value. */
+bool parseOptByte(const JsonValue &args, const char *key, int &out) {
+    out = -1;
+    const JsonValue *v = args.get(key);
+    if (!v) return true;
+    uint32_t b;
+    if (!parseU32Arg(*v, b) || b > 0xFF) return false;
+    out = int(b);
+    return true;
+}
+
+}  /* anonymous namespace */
+
+JsonValue handleBpAdd(double id, const JsonValue &args) {
+    std::string kind = args.getString("kind", "exec");
+
+    if (kind == "exec") {
+        const JsonValue *vaddr = args.get("addr");
+        if (!vaddr || !vaddr->isString())
+            return makeReplyError(id, "bad_args",
+                "exec breakpoint needs {\"addr\":\"SEG:OFF\"}");
+        uint32_t seg, off;
+        if (!parseSegOff(vaddr->s, seg, off))
+            return makeReplyError(id, "bad_args", "addr must be \"SEG:OFF\" in hex");
+
+        uint32_t bpId = DEBUG_AgentAddExecBreakpoint(uint16_t(seg), off);
+        if (!bpId)
+            return makeReplyError(id, "io_error", "failed to add execution breakpoint");
+
+        JsonObject r;
+        r.emplace("bp_id", JsonValue::makeNumber(double(bpId)));
+        r.emplace("kind",  JsonValue::makeString("exec"));
+        char addr[24];
+        snprintf(addr, sizeof(addr), "%04X:%04X",
+                 unsigned(seg & 0xFFFF), unsigned(off & 0xFFFF));
+        r.emplace("addr", JsonValue::makeString(addr));
+        r.emplace("seg",  JsonValue::makeNumber(double(seg & 0xFFFF)));
+        r.emplace("off",  JsonValue::makeNumber(double(off & 0xFFFF)));
+        return makeReplyOk(id, std::move(r));
+    }
+
+    if (kind == "int") {
+        const JsonValue *vint = args.get("int");
+        uint32_t intnr;
+        if (!vint || !parseU32Arg(*vint, intnr) || intnr > 0xFF)
+            return makeReplyError(id, "bad_args",
+                "int breakpoint needs {\"int\":<0..255>} (optional \"ah\",\"al\")");
+
+        int ah, al;
+        if (!parseOptByte(args, "ah", ah))
+            return makeReplyError(id, "bad_args", "\"ah\" must be 0..255");
+        if (!parseOptByte(args, "al", al))
+            return makeReplyError(id, "bad_args", "\"al\" must be 0..255");
+        if (al >= 0 && ah < 0)
+            return makeReplyError(id, "bad_args", "\"al\" requires \"ah\"");
+
+        uint32_t bpId = DEBUG_AgentAddIntBreakpoint(uint8_t(intnr), ah, al);
+        if (!bpId)
+            return makeReplyError(id, "io_error", "failed to add interrupt breakpoint");
+
+        JsonObject r;
+        r.emplace("bp_id", JsonValue::makeNumber(double(bpId)));
+        r.emplace("kind",  JsonValue::makeString("int"));
+        r.emplace("int",   JsonValue::makeNumber(double(intnr)));
+        if (ah >= 0) r.emplace("ah", JsonValue::makeNumber(double(ah)));
+        if (al >= 0) r.emplace("al", JsonValue::makeNumber(double(al)));
+        return makeReplyOk(id, std::move(r));
+    }
+
+    return makeReplyError(id, "bad_args",
+        std::string("unknown kind: \"") + kind + "\" (expected \"exec\" or \"int\")");
+}
+
+JsonValue handleBpList(double id, const JsonValue & /*args*/) {
+    JsonArray bps;
+    DEBUG_AgentForEachBreakpoint(&bpListCollector, &bps);
+    JsonObject r;
+    r.emplace("count", JsonValue::makeNumber(double(bps.size())));
+    r.emplace("breakpoints", JsonValue::makeArray(std::move(bps)));
+    return makeReplyOk(id, std::move(r));
+}
+
+JsonValue handleBpDel(double id, const JsonValue &args) {
+    /* Delete-all is opt-in (explicit {"all":true}) so an omitted bp_id can
+     * never silently wipe every breakpoint — including the debugger's own
+     * default INT3 trap and any the user set in curses. This is stricter than
+     * bp.clear (where an omitted bp_id clears the whole conditional table),
+     * deliberately, because these are the real CPU-halting breakpoints. */
+    if (const JsonValue *vall = args.get("all")) {
+        if (!vall->isBool())
+            return makeReplyError(id, "bad_args", "\"all\" must be a bool");
+        if (vall->b) {
+            size_t n = DEBUG_AgentDeleteAllBreakpoints();
+            JsonObject r;
+            r.emplace("deleted",   JsonValue::makeNumber(double(n)));
+            r.emplace("remaining", JsonValue::makeNumber(double(bpCount())));
+            return makeReplyOk(id, std::move(r));
+        }
+    }
+
+    const JsonValue *vid = args.get("bp_id");
+    if (!vid || !vid->isNumber() || vid->n < 0)
+        return makeReplyError(id, "bad_args",
+            "expected {\"bp_id\":<id from bp.add/bp.list>} or {\"all\":true}");
+
+    uint32_t want = uint32_t(vid->n);
+    bool ok = DEBUG_AgentDeleteBreakpointById(want);
+    if (!ok)
+        return makeReplyError(id, "not_found",
+            std::string("no breakpoint with bp_id ") + std::to_string(want));
+
+    JsonObject r;
+    r.emplace("deleted",   JsonValue::makeNumber(1.0));
+    r.emplace("bp_id",     JsonValue::makeNumber(double(want)));
+    r.emplace("remaining", JsonValue::makeNumber(double(bpCount())));
     return makeReplyOk(id, std::move(r));
 }
 

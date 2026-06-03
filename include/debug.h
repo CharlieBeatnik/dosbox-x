@@ -56,6 +56,7 @@ enum AgentBpKind {
 };
 
 struct AgentBreakpointInfo {
+    uint32_t  id;       /* stable handle (bp.add/list/del) — survives reorder */
     int       index;    /* BPoints iteration order — matches bp.hit bp_index */
     int       kind;     /* one of AgentBpKind                                */
     uint16_t  seg;      /* segment for EXEC/MEM kinds (0 for INT)            */
@@ -71,6 +72,19 @@ struct AgentBreakpointInfo {
 /* Invoke `cb` once per breakpoint, in BPoints iteration order. */
 void DEBUG_AgentForEachBreakpoint(
     void (*cb)(void *ctx, const AgentBreakpointInfo *info), void *ctx);
+
+/* Typed breakpoint add/delete with stable handles (bp.add / bp.del). Each
+ * CBreakpoint carries a monotonic id assigned at construction, so a handle
+ * stays valid as other breakpoints come and go (unlike the BPoints iteration
+ * index that bp.hit's bp_index and BPDEL use). The exec/int adders return the
+ * new breakpoint's id (>0), 0 on failure. For an interrupt breakpoint pass
+ * ah/al < 0 to match any AH/AL (the BPINT "all" wildcard). DeleteById removes
+ * one breakpoint by handle (false if no such id); DeleteAll removes every
+ * breakpoint and returns how many were removed. */
+uint32_t DEBUG_AgentAddExecBreakpoint(uint16_t seg, uint32_t off);
+uint32_t DEBUG_AgentAddIntBreakpoint(uint8_t intnr, int ah, int al);
+bool     DEBUG_AgentDeleteBreakpointById(uint32_t id);
+size_t   DEBUG_AgentDeleteAllBreakpoints(void);
 
 /* Disassemble one instruction at guest seg:off into `text` (NUL-terminated,
  * truncated to textsz). Returns the instruction length in bytes (0 if

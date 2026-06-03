@@ -80,7 +80,7 @@ with DbxAgent(portfile="dbxport.txt") as a:
 **Expect — in this order:**
 ```
 {'event': 'state.running'}
-{'event': 'bp.hit', 'seg': ..., 'off': ..., 'bp_index': 0}
+{'event': 'bp.hit', 'seg': ..., 'off': ..., 'bp_index': 0, 'bp_id': ...}
 {'event': 'debugger.entered', 'reason': 'breakpoint'}
 {'event': 'state.paused'}
 ```

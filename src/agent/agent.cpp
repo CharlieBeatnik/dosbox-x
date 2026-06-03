@@ -633,6 +633,9 @@ std::string dispatchLine(const std::string &line) {
     if (cmd->s == "state.restore")     return jsonEncode(handleStateRestore(id, a));
     if (cmd->s == "bp.set")            return jsonEncode(handleBpSet(id, a));
     if (cmd->s == "bp.clear")          return jsonEncode(handleBpClear(id, a));
+    if (cmd->s == "bp.add")            return jsonEncode(handleBpAdd(id, a));
+    if (cmd->s == "bp.list")           return jsonEncode(handleBpList(id, a));
+    if (cmd->s == "bp.del")            return jsonEncode(handleBpDel(id, a));
     if (cmd->s == "cpu.step")          return jsonEncode(handleCpuStep(id, a));
     /* cpu.step_over may return "" (deferred) when it steps over a CALL/INT/
      * LOOP/REP — its reply is sent from AGENT_OnDebuggerPaused. */

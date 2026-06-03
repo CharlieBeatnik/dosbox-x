@@ -588,6 +588,13 @@ public:
 	uint64_t				GetHits			(void)						{ return hits; };
 	void					BumpHits		(void)						{ hits++; };
 
+	// Stable handle (agent bp.add / bp.list / bp.del). Assigned once at
+	// construction from a process-wide monotonic counter, so it identifies
+	// this breakpoint regardless of its position in BPoints — unlike the
+	// iteration index that bp.hit's bp_index and BPDEL key on, which shifts
+	// whenever another breakpoint is added or removed.
+	uint32_t				GetBpId			(void)						{ return bpId; };
+
 	// statics
 	static CBreakpoint*		AddBreakpoint		(uint16_t seg, uint32_t off, bool once);
 	static CBreakpoint*		AddIntBreakpoint	(uint8_t intNum, uint16_t ah, uint16_t al, bool once);
@@ -602,7 +609,9 @@ public:
 	static bool				IsBreakpoint		(uint16_t seg, uint32_t off);
 	static bool				DeleteBreakpoint	(uint16_t seg, uint32_t off);
 	static bool				DeleteByIndex		(uint16_t index);
+	static bool				DeleteByBpId		(uint32_t id);
 	static void				DeleteAll			(void);
+	static size_t			Count				(void)						{ return BPoints.size(); };
 	static void				ShowList			(void);
 
 
@@ -623,8 +632,10 @@ private:
 	bool		active;
 	bool		once;
 	uint64_t	hits = 0;	// agent proposal 4.9.1 — see GetHits/BumpHits
+	uint32_t	bpId;		// agent bp.add/list/del — stable handle (see GetBpId)
 
 	static std::list<CBreakpoint*>	BPoints;
+	static uint32_t					nextBpId;	// monotonic source for bpId
 #if C_HEAVY_DEBUG
 	friend bool DEBUG_HeavyIsBreakpoint(void);
 #endif
@@ -637,7 +648,7 @@ CBreakpoint::CBreakpoint(void):type(BKPNT_UNKNOWN),location(0),
 #if !C_HEAVY_DEBUG
 oldData(0xCC),
 #endif
-segment(0),offset(0),intNr(0),ahValue(0),alValue(0),active(false),once(false) { }
+segment(0),offset(0),intNr(0),ahValue(0),alValue(0),active(false),once(false),bpId(++nextBpId) { }
 
 void CBreakpoint::Activate(bool _active)
 {
@@ -681,6 +692,7 @@ void CBreakpoint::Activate(bool _active)
 
 // Statics
 std::list<CBreakpoint*> CBreakpoint::BPoints;
+uint32_t CBreakpoint::nextBpId = 0;		// first breakpoint gets id 1 (0 = "none")
 
 CBreakpoint* CBreakpoint::AddBreakpoint(uint16_t seg, uint32_t off, bool once)
 {
@@ -762,8 +774,9 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
 		    (bp->GetLocation() == GetAddress(seg, off))) {
 			bp->BumpHits();		// agent 4.9.1
 			/* Pass the previous instruction's CS:IP so consumers can attribute
-			 * the transfer source even when the source opcode isn't hooked. */
-			AGENT_EmitBpHit(seg, off, bp_index,
+			 * the transfer source even when the source opcode isn't hooked.
+			 * bp_id is the stable handle bp.add/list/del use. */
+			AGENT_EmitBpHit(seg, off, bp_index, bp->GetBpId(),
 			                DEBUG_GetPrevCS(), DEBUG_GetPrevIP());
 			// Found
 			if (bp->GetOnce()) {
@@ -809,7 +822,7 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
                     }
 					DEBUG_ShowMsg("DEBUG: Memory breakpoint %s: %04X:%04X - %02X -> %02X\n",(bp->GetType()==BKPNT_MEMORY_PROT)?"(Prot)":"",bp->GetSegment(),bp->GetOffset(),bp->GetValue(),value);
 					bp->BumpHits();		// agent 4.9.1
-					AGENT_EmitBpHit(seg, off, bp_index,
+					AGENT_EmitBpHit(seg, off, bp_index, bp->GetBpId(),
 					                DEBUG_GetPrevCS(), DEBUG_GetPrevIP());
 					bp->SetValue(value);
 					return true;
@@ -837,7 +850,7 @@ bool CBreakpoint::CheckIntBreakpoint(PhysPt adr, uint8_t intNr, uint16_t ahValue
 		if ((bp->GetType()==BKPNT_INTERRUPT) && bp->IsActive() && (bp->GetIntNr()==intNr)) {
 			if (((bp->GetValue()==BPINT_ALL) || (bp->GetValue()==ahValue)) && ((bp->GetOther()==BPINT_ALL) || (bp->GetOther()==alValue))) {
 				bp->BumpHits();		// agent 4.9.1
-				AGENT_EmitBpHit(SegValue(cs), reg_eip, bp_index,
+				AGENT_EmitBpHit(SegValue(cs), reg_eip, bp_index, bp->GetBpId(),
 				                DEBUG_GetPrevCS(), DEBUG_GetPrevIP());
 				// Ignore it once ?
 				// Found
@@ -864,6 +877,7 @@ void DEBUG_AgentForEachBreakpoint(
 	for (auto i = CBreakpoint::BPoints.begin(); i != CBreakpoint::BPoints.end(); ++i, ++index) {
 		CBreakpoint *bp = *i;
 		AgentBreakpointInfo info;
+		info.id      = bp->GetBpId();
 		info.index   = index;
 		info.seg     = bp->GetSegment();
 		info.off     = bp->GetOffset();
@@ -883,6 +897,37 @@ void DEBUG_AgentForEachBreakpoint(
 		               ? 0u : (uint32_t)GetAddress(info.seg, info.off);
 		cb(ctx, &info);
 	}
+}
+
+/* Typed breakpoint add/delete for the agent (bp.add / bp.del). These wrap the
+ * existing CBreakpoint statics so the agent never needs the file-local
+ * BPINT_ALL / CBreakpoint internals, and return the new breakpoint's stable
+ * id. AddBreakpoint / AddIntBreakpoint Activate() immediately, so a breakpoint
+ * added while the CPU runs fires without a subsequent RUN (same as fix 4.1). */
+uint32_t DEBUG_AgentAddExecBreakpoint(uint16_t seg, uint32_t off)
+{
+	CBreakpoint *bp = CBreakpoint::AddBreakpoint(seg, off, false);
+	return bp ? bp->GetBpId() : 0u;
+}
+
+uint32_t DEBUG_AgentAddIntBreakpoint(uint8_t intnr, int ah, int al)
+{
+	uint16_t ahv = (ah < 0) ? (uint16_t)BPINT_ALL : (uint16_t)(ah & 0xFF);
+	uint16_t alv = (al < 0) ? (uint16_t)BPINT_ALL : (uint16_t)(al & 0xFF);
+	CBreakpoint *bp = CBreakpoint::AddIntBreakpoint(intnr, ahv, alv, false);
+	return bp ? bp->GetBpId() : 0u;
+}
+
+bool DEBUG_AgentDeleteBreakpointById(uint32_t id)
+{
+	return CBreakpoint::DeleteByBpId(id);
+}
+
+size_t DEBUG_AgentDeleteAllBreakpoints(void)
+{
+	size_t n = CBreakpoint::Count();
+	CBreakpoint::DeleteAll();
+	return n;
 }
 
 /* Disassemble one instruction at guest seg:off. Real-mode programs and the
@@ -929,6 +974,23 @@ bool CBreakpoint::DeleteByIndex(uint16_t index)
 			return true;
 		}
 		nr++;
+	}
+	return false;
+}
+
+// agent bp.del — delete by stable handle (see GetBpId). Unlike DeleteByIndex
+// the id does not shift when other breakpoints are added/removed.
+bool CBreakpoint::DeleteByBpId(uint32_t id)
+{
+	std::list<CBreakpoint*>::iterator i;
+	for(i=BPoints.begin(); i != BPoints.end(); ++i) {
+		CBreakpoint* bp = (*i);
+		if (bp->GetBpId() == id) {
+			(BPoints.erase)(i);
+			bp->Activate(false);
+			delete bp;
+			return true;
+		}
 	}
 	return false;
 }

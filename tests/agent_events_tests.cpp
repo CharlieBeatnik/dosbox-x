@@ -38,7 +38,7 @@ TEST_F(AgentEventsTest, EmittersSafeWithoutClient)
 {
     /* In test mode no agent has been started; every emit must short-
      * circuit cleanly inside serverBroadcastLine. */
-    AGENT_EmitBpHit(0x1234, 0x5678, 0);
+    AGENT_EmitBpHit(0x1234, 0x5678, 0, 1);
     AGENT_EmitDebuggerEntered("breakpoint");
     AGENT_EmitDebuggerEntered(nullptr);
     AGENT_EmitStateRunning();

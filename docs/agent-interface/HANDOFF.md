@@ -6,7 +6,100 @@ Leave-behind for the next agent continuing the **proposal-4.9** work on the
 Source proposal:
 `X2RE/.claude/notes/dosbox-x-fixes/PROPOSAL_4.9_observability_and_trust.md`.
 
-## What shipped this iteration (Phase-2 mutation: `regs.set` + `mem.write`)
+## What shipped this iteration (typed breakpoints: `bp.add` / `bp.list` / `bp.del`)
+
+The typed replacement for the `debugger.command "BP …"` / "BPINT …" / "BPDEL"
+strings — real CPU-halting breakpoints addressed by a **stable handle**, closing
+the longest-standing rough edge (`bp_index` was an iteration position, not a
+handle). Built (0 errors), **142 Agent gTests pass** (+8), and verified
+end-to-end (a new live **phase 11**, no OBSTEST rebuild). All Phase-2 breakpoint
+surface is now typed.
+
+| Item | Proves | Status |
+|------|--------|--------|
+| `bp.add {addr}` / `{kind:"int",int,ah?,al?}` → `{bp_id, kind, …}` | "set a breakpoint and get a handle that survives other edits" | ✅ |
+| `bp.list` → `{count, breakpoints:[{bp_id, index, kind, …}]}` | "what is armed, by stable handle" | ✅ |
+| `bp.del {bp_id}` / `{all:true}` → `{deleted, remaining}` | "remove exactly this one by handle, or all" | ✅ |
+| `bp.hit` event now carries `bp_id` (alongside `bp_index`) | "correlate a hit with the handle I created" | ✅ |
+
+### Design / code map
+
+- **Stable handle = a monotonic id on `CBreakpoint`.** `src/debug/debug.cpp`:
+  the class gains a `uint32_t bpId` assigned at construction from a process-wide
+  `static uint32_t nextBpId` (`GetBpId()`), so *every* breakpoint — including
+  internal temp/step-over ones — has a unique id that is independent of its
+  position in `BPoints`. This is the crux: deleting BP #2 no longer renumbers
+  the rest. New `CBreakpoint::DeleteByBpId(id)` (mirrors `DeleteByIndex`) and
+  `Count()`. `DEBUG_AgentForEachBreakpoint` now fills `info.id`
+  (`AgentBreakpointInfo` gained a leading `uint32_t id`).
+- **Thin debug.cpp bridges** keep the agent off the file-local `CBreakpoint` /
+  `BPINT_ALL` internals: `DEBUG_AgentAddExecBreakpoint(seg,off)`,
+  `DEBUG_AgentAddIntBreakpoint(intnr, ah, al)` (ah/al `< 0` ⇒ the BPINT "any"
+  wildcard), `DEBUG_AgentDeleteBreakpointById(id)`,
+  `DEBUG_AgentDeleteAllBreakpoints()` (returns count). They wrap the existing
+  `AddBreakpoint`/`AddIntBreakpoint`, which already `Activate()` immediately
+  (fix 4.1), so a BP added mid-run fires without a subsequent RUN.
+- **Handlers in `src/agent/agent_cpu.cpp`** (`handleBpAdd`/`handleBpList`/
+  `handleBpDel`), next to `bp.set`/`bp.clear` — but operating on the *real*
+  CBreakpoint table, not the agent-side conditional table those manage. `bp.list`
+  reuses a local collector (same per-BP shape as `debug.status`, leading with
+  `bp_id`). Three dispatch cases in `agent.cpp`, three prototypes in
+  `agent_internal.h`. No new TU, no `Makefile.am` / vcxproj change.
+- **`bp.hit` carries the handle.** `AGENT_EmitBpHit` gained a `uint32_t bp_id`
+  parameter (`agent.h` decl + `#else` no-op, `agent_events.cpp` impl emits both
+  `bp_index` and `bp_id`); the three call sites in `CheckBreakpoint` /
+  `CheckIntBreakpoint` pass `bp->GetBpId()`. So a consumer that `bp.add`s a BP
+  and later sees `bp.hit` can match on `bp_id` without re-listing.
+- **`bytesHex` (agent_cpu.cpp) now returns `""` when `MemBase==NULL`** so
+  `bp.list`'s `bytes_now` is safe headlessly (it reads guest memory, which the
+  `-tests` binary doesn't bring up); harmless in production where MemBase is set.
+- **`bp.del` requires an explicit `{all:true}`** to clear everything (an omitted
+  `bp_id` is `bad_args`, not clear-all) — stricter than `bp.clear`, deliberately,
+  because these are the real CPU-halting breakpoints (including the debugger's
+  default INT3 trap).
+
+### Reply / event shapes
+
+```json
+bp.add  → {"bp_id":7,"kind":"exec","addr":"0824:6F8E","seg":2084,"off":28558}
+bp.add  → {"bp_id":8,"kind":"int","int":33,"ah":9}
+bp.list → {"count":1,"breakpoints":[{"bp_id":7,"index":0,"kind":"exec",
+            "enabled":true,"hits":0,"addr":"0824:6F8E","seg":2084,"off":28558,
+            "bytes_now":"8B 46 FE 50"}]}
+bp.del  → {"deleted":1,"bp_id":7,"remaining":0}     // or {"deleted":N,"remaining":0} for all
+bp.hit event → {"event":"bp.hit","seg":2084,"off":28558,"bp_index":0,"bp_id":7,
+                "from_cs":2084,"from_ip":28432}
+```
+
+Errors: `bp.add` — `bad_args` (unknown kind / missing or malformed addr / int
+out of range / `al` without `ah`), `io_error` (add failed). `bp.del` —
+`bad_args` (neither `bp_id` nor `all:true`), `not_found` (`bp_id` is gone).
+
+### Tests
+
+- **`tests/agent_breakpoint_tests.cpp`** — **8 new gTests** (a heavy-debug build
+  makes `Activate()` a flag set and BP matching a seg:off compare, so the whole
+  add/list/del path runs headless without MemBase, the same reason the existing
+  fix-4.1 tests there do): exec add returns a working handle (`DEBUG_Breakpoint()`
+  fires), int add, `bp.list` reflection, the headline **stable-id-survives-reorder**
+  (add 3, delete the middle by id, the survivors keep their handles while their
+  indices shift), `bp.del` not_found / requires-id-or-all / del-all-clears, and
+  add arg-validation. **142 Agent gTests total, all pass.** (Gotcha re-learned:
+  `GetAddress` special-cases `seg==SegValue(cs)` to use the hidden descriptor
+  base, so a unit test must set CS:IP *before* adding a BP at that CS, exactly as
+  the existing tests do; the live guest's descriptor cache is coherent so this is
+  test-harness-only.)
+- **`tests/agent_live/test_observability.py` phase 11** (no OBSTEST rebuild) —
+  **11a**: add two exec + one int BP, `bp.list` shows all three by stable id,
+  delete the middle by `bp_id`, confirm the survivors keep their handles (indices
+  shifted), re-delete is `not_found`, `bp.del all` clears. **11b**: `bp.add` at
+  the phase-1 loopbody, run, and assert the resulting `bp.hit` event's `bp_id`
+  equals the one `bp.add` returned — the handle correlates a hit. **All 15 phases
+  pass** (11b retries the `'1'` keytap, tolerating the known paste-pump drop —
+  see the env note; phases 1b/9b still tap once and remain intermittently flaky
+  on that same quirk, pre-existing).
+
+## What shipped (previous iteration: Phase-2 mutation — `regs.set` + `mem.write`)
 
 The first post-4.9 Phase-2 items from `TASKS.md` § Iteration 7+ — the *write*
 counterparts to the long-shipped `regs.get` / `mem.read`. Built (0 errors),
@@ -776,11 +869,12 @@ python tests/agent_live/test_observability.py
   restore→resume crash that blocked the 4.9.8+4.9.9 loop is fixed** (top
   section). The restore-and-rerun loop the proposal is built around is now
   trustworthy.
-- `regs.set` and `mem.write` (the typed write surface) shipped this iteration
-  (top section). Remaining Phase-2 surface from `TASKS.md` § Iteration 7+:
-  typed `bp.add`/`bp.list`/`bp.del` (stable handles — retires the `bp_index`
-  isn't-a-stable-handle carry-over), and mouse input
-  (`mouse.move`/`mouse.click`).
+- `bp.add`/`bp.list`/`bp.del` (typed breakpoints with stable handles) shipped
+  this iteration (top section), retiring the `bp_index` isn't-a-stable-handle
+  carry-over. `regs.set`/`mem.write` shipped the iteration before. The **only**
+  remaining Phase-2 surface from `TASKS.md` § Iteration 7+ is **mouse input**
+  (`mouse.move`/`mouse.click`) — `Mouse_CursorMoved` / `Mouse_ButtonPressed`
+  (`include/mouse.h`). Everything else in that list is done.
 - *Optional core hardening:* make `SerializePic::setBytes` skip a `0xffff`
   ticker/event index instead of installing a NULL handler, so the same class of
   bug can't bite `IPX`/`NE2000`/other un-tabled handlers. Deliberately not done
@@ -809,9 +903,10 @@ python tests/agent_live/test_observability.py
   was. A Linux/macOS build needs the agent TU list updated; verify on a Unix
   host.
 - **`contrib/agent-client/dbxagent.py`** has typed wrappers for **every** agent
-  command, including this iteration's `regs_set()` and `mem_write()` (added
-  alongside the handlers). An earlier iteration filled the 4.9 gap — the
-  commands:
+  command, including this iteration's `bp_add()` / `bp_list()` / `bp_del()` and
+  the prior `regs_set()` / `mem_write()` (each added alongside its handler;
+  the live phase-11 test drives them). An earlier iteration filled the 4.9 gap —
+  the commands:
   `debug_status()`, `cpu_probe()`, `cpu_trace_ring()`, `cpu_traceback()`,
   `cpu_disasm()`, plus the watch family `farcall_watch()`/`farcall_unwatch()`,
   `cpu_watch_target()`/`cpu_unwatch_target()`, `mem_watch()`/`mem_unwatch()`, and
@@ -858,6 +953,10 @@ python tests/agent_live/test_observability.py
   eax/ebx/esi confirmed via an independent `regs.get` with an un-named register
   intact and a bad request left atomic; `mem.write` a blob via `seg:off` plus an
   aliased `physical` write, both read back).
+- Phase-2 "typed breakpoints with stable handles" → phase11a (`bp.add` 3 BPs,
+  `bp.list` by `bp_id`, `bp.del` the middle by handle — survivors keep their
+  ids while indices shift; re-delete is `not_found`; `bp.del all` clears) and
+  phase11b (a `bp.hit` event carries the `bp_id` the `bp.add` returned).
 
 ## Environment note
 

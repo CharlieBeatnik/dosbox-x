@@ -1012,6 +1012,135 @@ def phase10_regs_set_mem_write(agent, cs, scratch, rep) -> None:
             agent.cpu_run(); _drain_events(agent)
 
 
+def phase11_typed_breakpoints(agent, cs, loopbody, trace_a, rep) -> None:
+    # bp.add / bp.list / bp.del — typed real breakpoints with STABLE handles.
+    # Reuses the phase-1 loopbody and the phase-3 trace_a landmarks (no OBSTEST
+    # rebuild). Two halves: (a) the handle stays valid as other breakpoints are
+    # added/removed, and the iteration index does not; (b) the live bp.hit event
+    # carries the same bp_id bp.add returned, so a hit correlates to the handle
+    # the consumer created — the whole point of retiring the bp_index rough edge.
+
+    # 11a: add three (two exec + one int), list, delete the MIDDLE one by id,
+    # and confirm the survivors keep their ids while their indices shift.
+    name = "phase11a: bp.add/list/del stable handle survives reorder"
+    try:
+        _reset(agent)                        # paused, clean BP list
+        agent.bp_del(all=True)
+
+        a = agent.bp_add(f"{cs:04X}:{loopbody:04X}")
+        b = agent.bp_add(f"{cs:04X}:{trace_a:04X}")
+        c = agent.bp_add(kind="int", int_=0x21, ah=0x09)
+        id_a, id_b, id_c = a["bp_id"], b["bp_id"], c["bp_id"]
+
+        problems = []
+        if not (id_a != id_b != id_c and id_a != id_c):
+            problems.append(f"ids not distinct: {id_a},{id_b},{id_c}")
+        if a.get("addr") != f"{cs:04X}:{loopbody:04X}":
+            problems.append(f"exec addr echo {a.get('addr')!r}")
+        if c.get("kind") != "int" or c.get("int") != 0x21:
+            problems.append(f"int add reply {c}")
+
+        lst = agent.bp_list()
+        by_id = {bp["bp_id"]: bp for bp in lst.get("breakpoints", [])}
+        if lst.get("count") != len(lst.get("breakpoints", [])):
+            problems.append(f"count {lst.get('count')} != len {len(lst.get('breakpoints', []))}")
+        for want in (id_a, id_b, id_c):
+            if want not in by_id:
+                problems.append(f"bp_id {want} missing from bp.list")
+        if id_a in by_id and by_id[id_a].get("kind") != "exec":
+            problems.append(f"id_a kind {by_id[id_a].get('kind')!r}")
+        if id_c in by_id and by_id[id_c].get("kind") != "int":
+            problems.append(f"id_c kind {by_id[id_c].get('kind')!r}")
+
+        # Delete the middle handle; a and c must remain, b must be gone.
+        d = agent.bp_del(id_b)
+        if d.get("deleted") != 1:
+            problems.append(f"bp.del deleted={d.get('deleted')}")
+        lst2 = agent.bp_list()
+        ids2 = {bp["bp_id"] for bp in lst2.get("breakpoints", [])}
+        if id_a not in ids2 or id_c not in ids2:
+            problems.append(f"survivor handle lost: have {sorted(ids2)} want {id_a},{id_c}")
+        if id_b in ids2:
+            problems.append(f"deleted handle {id_b} still listed")
+        # Re-deleting the gone handle is not_found (proves it is really gone).
+        try:
+            agent.bp_del(id_b)
+            problems.append("re-deleting a removed bp_id did not error")
+        except AgentError as e:
+            if e.code != "not_found":
+                problems.append(f"re-delete code={e.code} (want not_found)")
+
+        cleared = agent.bp_del(all=True)
+        if agent.bp_list().get("count") != 0:
+            problems.append("bp.del all left breakpoints behind")
+
+        if problems:
+            rep.record(name, False, "; ".join(problems[:4]))
+        else:
+            rep.record(name, True,
+                       f"3 added (ids {id_a}/{id_b}/{id_c}); deleted middle by id, "
+                       f"survivors kept handles; del all cleared {cleared.get('deleted')}")
+    except Exception as exc:
+        rep.record(name, False, repr(exc))
+    finally:
+        with contextlib.suppress(Exception):
+            agent.bp_del(all=True)
+            agent.debugger_command("BPDEL 0 *")
+            agent.cpu_run(); _drain_events(agent)
+
+    # 11b: the live bp.hit event carries the bp_id bp.add returned.
+    name = "phase11b: bp.hit event carries the stable bp_id from bp.add"
+    try:
+        _reset(agent)
+        added = agent.bp_add(f"{cs:04X}:{loopbody:04X}")
+        want_id = added["bp_id"]
+        agent.cpu_run(); _drain_events(agent)
+        # Tap '1' to run the phase-1 loop and trip the BP. The '1' keytap can be
+        # dropped against the slow paste pump (the same harness quirk phases
+        # 4/5/6 tolerate), so re-tap until the bp.hit arrives. Once it fires the
+        # CPU is paused and we stop; any buffered extra '1' is harmless.
+        ev = None
+        for _ in range(4):
+            agent.keyboard_tap("1")
+            try:
+                ev = _wait_for_event(agent, "bp.hit", timeout=3.0)
+                break
+            except TimeoutError:
+                continue
+        if ev is None:
+            raise TimeoutError("no bp.hit after retried '1' taps")
+
+        problems = []
+        if ev.get("seg") != cs or ev.get("off") != loopbody:
+            problems.append(f"bp.hit at {ev.get('seg'):04X}:{ev.get('off'):04X}")
+        if ev.get("bp_id") != want_id:
+            problems.append(f"bp.hit bp_id={ev.get('bp_id')} != bp.add id {want_id}")
+        st = agent.call("debug.status")
+        if st.get("cpu") != "paused":
+            problems.append(f"cpu={st.get('cpu')!r} (expected paused)")
+        # The handle is still listed (a non-once BP survives the hit) with hits>=1.
+        bp = next((b for b in agent.bp_list().get("breakpoints", [])
+                   if b.get("bp_id") == want_id), None)
+        if bp is None:
+            problems.append(f"handle {want_id} gone from bp.list after hit")
+        elif bp.get("hits", 0) < 1:
+            problems.append(f"hits={bp.get('hits')} after the hit")
+
+        if problems:
+            rep.record(name, False, "; ".join(problems[:4]))
+        else:
+            rep.record(name, True,
+                       f"bp.hit carried bp_id {want_id} (matches bp.add)")
+    except Exception as exc:
+        rep.record(name, False, repr(exc))
+    finally:
+        with contextlib.suppress(Exception):
+            agent.cpu_pause(); _drain_events(agent)
+            agent.bp_del(all=True)
+            agent.debugger_command("BPDEL 0 *")
+            agent.cpu_run(); _drain_events(agent)
+
+
 def run(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dosbox", default=str(DEFAULT_DOSBOX))
@@ -1070,9 +1199,11 @@ def run(argv=None) -> int:
             # arm a conditional BP" pairing end-to-end.
             phase8_savestate(agent, cs, trace_a, rep)
             phase9_cond_bp(agent, cs, loopbody, iters, rep)
-            # Phase-2 mutation surface (regs.set + mem.write); runs last and
-            # restores the registers it touches before the final resume.
+            # Phase-2 mutation surface (regs.set + mem.write); restores the
+            # registers it touches before the final resume.
             phase10_regs_set_mem_write(agent, cs, watch_target, rep)
+            # Typed real breakpoints with stable handles (bp.add/list/del).
+            phase11_typed_breakpoints(agent, cs, loopbody, trace_a, rep)
 
             with contextlib.suppress(Exception):
                 _reset(agent)

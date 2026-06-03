@@ -133,7 +133,8 @@ Goal: a reproducible end-to-end test.
 > work — see `HANDOFF.md` for the canonical status of those iterations. Items
 > below are checked off where 4.9 covered them.
 
-- [ ] `bp.add` / `bp.list` / `bp.del` typed (direct `CBreakpoint::*`).
+- [x] `bp.add` / `bp.list` / `bp.del` typed (direct `CBreakpoint::*`) — stable
+  `bp_id` handles; `bp.hit` now carries `bp_id`. *(shipped)*
 - [x] `bp.set` / `bp.clear` — conditional / Nth-hit BP + on-hit macro. *(4.9.9)*
 - [x] `mem.read` (binary, base64). *(shipped)*
 - [x] `mem.write` (typed store, base64). *(shipped)* — `mem.watch` write-intercept was 4.9.4.

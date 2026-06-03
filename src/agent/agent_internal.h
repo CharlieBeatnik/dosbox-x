@@ -260,6 +260,18 @@ bool evalBpCondition(const BpCondition &c, uint64_t hits);
 JsonValue handleBpSet(double id, const JsonValue &args);
 JsonValue handleBpClear(double id, const JsonValue &args);
 
+/* ---- Typed breakpoints with stable handles (bp.add / bp.list / bp.del) ----
+ * The typed replacement for `debugger.command "BP …"` / "BPINT …" / "BPDEL".
+ * These create *real* CBreakpoints (the kind that halt the CPU via the
+ * debugger), addressed by a stable id assigned at construction — so a handle
+ * survives other add/del operations, unlike the BPoints iteration index that
+ * the bp.hit `bp_index` and the legacy BPDEL command key on. The handlers wrap
+ * the DEBUG_AgentAdd / DEBUG_AgentDelete bridges in debug.cpp; they are distinct
+ * from the agent-side conditional table that bp.set / bp.clear manage. */
+JsonValue handleBpAdd(double id, const JsonValue &args);
+JsonValue handleBpList(double id, const JsonValue &args);
+JsonValue handleBpDel(double id, const JsonValue &args);
+
 /* ---- Observability (proposal 4.9) --------------------------------------
  * Watch state + hit counters live in agent.cpp (read on the CPU hot path,
  * written from the main thread). debug.status in agent_observe.cpp reads

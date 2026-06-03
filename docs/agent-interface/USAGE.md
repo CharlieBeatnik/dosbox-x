@@ -33,8 +33,9 @@ but the headlines are: anything the curses debugger draws into a pane
 the agent. `MEMDUMP` writes a file on disk rather than returning bytes
 inline. Single-stepping *is* available with structured output
 (`cpu.step` / `cpu.step_over`, below); register and memory *writes* are
-available too (`regs.set` / `mem.write`, below). Mouse input and typed
-breakpoint commands (`bp.add`/`bp.list`/`bp.del`) are still planned for Phase 2.
+available too (`regs.set` / `mem.write`, below); and typed breakpoints with
+stable handles (`bp.add`/`bp.list`/`bp.del`, below) replace the
+`debugger.command "BP …"` strings. Mouse input is still planned for Phase 2.
 (Screenshots are available via `screen.capture`.)
 
 ## Requirements
@@ -128,6 +129,9 @@ events don't. The reference client does this in a single reader thread.
 | `state.restore`     | `{slot}`                      | `{slot, name, regs, cs_ip, insn}` (paused only) |
 | `bp.set`            | `{addr, if?, do?, continue?}` | `{bp_id, addr, …}` (heavy-debug; emits `bp.cond`) |
 | `bp.clear`          | `{bp_id?}`                    | `{cleared, remaining}` (`bp_id` omitted = clear all) |
+| `bp.add`            | `{addr}` (exec) or `{kind:"int", int, ah?, al?}` | `{bp_id, kind, …}` (stable handle; emits `bp.hit`) |
+| `bp.list`           | none                          | `{count, breakpoints:[{bp_id, index, kind, …}]}` |
+| `bp.del`            | `{bp_id}` or `{all:true}`     | `{deleted, remaining[, bp_id]}` (`not_found` if id is gone) |
 | `keyboard.type`     | `{text}`                      | `{queued}` (byte count)             |
 | `keyboard.press`    | `{key}`                       | `{}`                                |
 | `keyboard.release`  | `{key}`                       | `{}`                                |
@@ -658,7 +662,7 @@ COMMAND.COM stop callbacks. None of these touch a hooked opcode.
 |--------------------|---------------------------------|-----------------------------------------------------------------|
 | `state.running`    | none                            | CPU resumed (after `cpu.run`, RUN, RUNWATCH, or auto-resume)    |
 | `state.paused`     | none                            | CPU halted (paired with `debugger.entered`)                     |
-| `bp.hit`           | `{seg, off, bp_index[, from_cs, from_ip]}` | Just before the debugger entry that a breakpoint triggered. In heavy-debug builds `from_cs`/`from_ip` carry the previous instruction's CS:IP (the source of the transfer to `seg:off`). |
+| `bp.hit`           | `{seg, off, bp_index, bp_id[, from_cs, from_ip]}` | Just before the debugger entry that a breakpoint triggered. `bp_id` is the stable handle (`bp.add`/`bp.list`); `bp_index` is its (shifting) `BPLIST` position. In heavy-debug builds `from_cs`/`from_ip` carry the previous instruction's CS:IP (the source of the transfer to `seg:off`). |
 | `debugger.entered` | `{reason}`                      | After `bp.hit`, or any other debugger entry                     |
 | `log.line`         | `{text}`                        | While subscribed                                                |
 | `farcall.transfer` | `{target_seg, target_off, from_cs, from_ip, kind, which}` | A `CALL FAR` / `JMP FAR` / `RETF` / `IRET` / interrupt dispatch whose target CS matched one of the active `farcall.watch` sentinels. `which` is the 0-based index of the matched sentinel. |
@@ -673,9 +677,11 @@ COMMAND.COM stop callbacks. None of these touch a hooked opcode.
 Notes:
 
 - `bp.hit.seg` and `bp.hit.off` are the linear `CS:EIP` (or memory address
-  for memory breakpoints). `bp_index` is the breakpoint's position in
-  `BPLIST` **at the moment it fired** — not stable across `BPDEL`. Phase 2
-  will add stable handles.
+  for memory breakpoints). `bp_id` is the **stable handle** assigned by
+  `bp.add` (and shown by `bp.list`): it stays valid as other breakpoints come
+  and go, so correlate hits on it. `bp_index` is the breakpoint's position in
+  `BPLIST` **at the moment it fired** — kept for back-compat with the legacy
+  `BPDEL`/`bp_index` world, but it shifts across add/del, so prefer `bp_id`.
 - `debugger.entered.reason` is currently always `"breakpoint"`. The four
   reasons in PLAN.md (`breakpoint`, `manual`, `int3`, `sysenter`) will be
   distinguished in a later iteration.
@@ -926,6 +932,60 @@ Notes / limits:
   workflow. (An earlier build crashed ~0.5 s after resuming a restored machine
   because the savestate's per-tick-handler restore nulled the agent's own poll
   handler; the restore now repairs it. See `HANDOFF.md`.)
+
+### `bp.add` / `bp.list` / `bp.del` — typed breakpoints with stable handles
+
+The typed replacement for setting plain breakpoints through `debugger.command`
+("BP CS:IP" / "BPINT 21 AH=09" / "BPDEL"). These create *real* CPU-halting
+breakpoints — the same kind the debugger uses — but address them by a **stable
+`bp_id` handle** assigned at creation, so a handle stays valid as other
+breakpoints are added and removed. (The legacy `bp_index` the `bp.hit` event and
+`BPDEL` report is an iteration position that shifts on every add/del; `bp.hit`
+now carries both so you can correlate on `bp_id`.)
+
+These are distinct from `bp.set` / `bp.clear` below: those manage the agent-side
+*conditional / Nth-hit* table (an `if` condition + on-hit macro, heavy-debug
+only). `bp.add` makes an ordinary unconditional execution or interrupt
+breakpoint.
+
+```jsonc
+// execution breakpoint at SEG:OFF (kind defaults to "exec")
+{"id":1,"cmd":"bp.add","args":{"addr":"0824:6F8E"}}
+  → {"bp_id":7,"kind":"exec","addr":"0824:6F8E","seg":2084,"off":28558}
+
+// interrupt breakpoint: INT 21h, optionally narrowed to AH (and AL)
+{"id":2,"cmd":"bp.add","args":{"kind":"int","int":33,"ah":9}}
+  → {"bp_id":8,"kind":"int","int":33,"ah":9}
+
+{"id":3,"cmd":"bp.list"}
+  → {"count":2,"breakpoints":[
+       {"bp_id":8,"index":0,"kind":"int","enabled":true,"hits":0,"int":33},
+       {"bp_id":7,"index":1,"kind":"exec","enabled":true,"hits":0,
+        "addr":"0824:6F8E","seg":2084,"off":28558,"bytes_now":"8B 46 FE 50"}]}
+
+{"id":4,"cmd":"bp.del","args":{"bp_id":7}}
+  → {"deleted":1,"bp_id":7,"remaining":1}      // not_found if the id is gone
+{"id":5,"cmd":"bp.del","args":{"all":true}}    // remove EVERY breakpoint
+  → {"deleted":1,"remaining":0}
+```
+
+- **`bp.add`** — `{"addr":"SEG:OFF"}` (or `{"kind":"exec","addr":…}`) for an
+  execution breakpoint; `{"kind":"int","int":N}` for an interrupt breakpoint,
+  optionally narrowed with `"ah"` and `"al"` (each 0–255; `al` requires `ah`).
+  When the breakpoint trips you get a `bp.hit` event carrying the same `bp_id`,
+  then the usual `debugger.entered` / `state.paused`. Added breakpoints activate
+  immediately (no pause/run cycle needed).
+- **`bp.list`** — every real breakpoint with its `bp_id`, the (shifting)
+  iteration `index`, `kind` (`exec`/`int`/`mem`), `enabled`, `hits`, and
+  `addr`/`seg`/`off` (plus `bytes_now`, the 4 bytes currently at an exec BP's
+  address, to catch a stale/relocated address) or `int` for interrupt BPs.
+- **`bp.del`** — `{"bp_id":N}` removes one by handle (`not_found` if it is
+  gone). `{"all":true}` removes *every* breakpoint, including the debugger's
+  default INT3 trap; it must be explicit so an omitted id never wipes the list
+  by accident (unlike `bp.clear`, whose omitted-`bp_id` clears the whole
+  conditional table).
+- Debug-build only, like the other typed commands. `bp.list`'s `bytes_now` is
+  the same memory read `mem.read` does.
 
 ### `bp.set` / `bp.clear` — conditional / Nth-hit breakpoints + on-hit macros (4.9.9)
 
@@ -1270,8 +1330,10 @@ a.keyboard_release("leftctrl")
 - **`keyboard.type` is ASCII only.** Non-ASCII input is silently mangled
   by the paste driver. For non-ASCII or modifier combos, use `press` /
   `release` / `tap` with named keys.
-- **`bp_index` is not stable.** If you `BPDEL 2`, the indices of all
-  later breakpoints shift down. Re-read `BPLIST` after any mutation.
+- **`bp_index` is not stable; `bp_id` is.** If you `BPDEL 2`, the indices of
+  all later breakpoints shift down. Use the typed `bp.add` / `bp.list` /
+  `bp.del` commands, which key on a stable `bp_id` handle, instead of the
+  legacy index. `bp.hit` carries both — correlate on `bp_id`.
 - **BPs added via `debugger.command` activate immediately.** The pause-
   set-resume pattern below still works, but is no longer required —
   setting `BP CS:IP`, `BPM`, `BPINT`, `BPPM`, `BPLM`, or `FM` while the

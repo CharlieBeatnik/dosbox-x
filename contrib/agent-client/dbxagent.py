@@ -333,6 +333,64 @@ class DbxAgent:
             return self.call("bp.clear")
         return self.call("bp.clear", bp_id=bp_id)
 
+    def bp_add(self, addr: Optional[str] = None, *, kind: str = "exec",
+               int_: Optional[int] = None, ah: Optional[int] = None,
+               al: Optional[int] = None) -> dict:
+        """Add a real (CPU-halting) breakpoint and get back a stable handle.
+
+        The typed replacement for ``debugger.command("BP …")`` / ``"BPINT …"``.
+        Two kinds:
+
+          * ``kind="exec"`` (default): execution breakpoint at ``addr`` =
+            "SEG:OFF" (hex), e.g. ``bp_add("0824:6F8E")``.
+          * ``kind="int"``: interrupt breakpoint on ``int_`` (0..255), optionally
+            narrowed to a specific ``ah`` and ``al`` (each 0..255; ``al``
+            requires ``ah``), e.g. ``bp_add(kind="int", int_=0x21, ah=0x09)``.
+
+        Returns ``{bp_id, kind, ...}``. ``bp_id`` is a *stable* handle: it stays
+        valid as other breakpoints are added/removed (unlike the BPoints
+        iteration index the ``bp.hit`` event's ``bp_index`` reports). When this
+        breakpoint trips you get a ``bp.hit`` event carrying the same ``bp_id``,
+        then the usual ``debugger.entered`` / ``state.paused``. Pass the
+        ``bp_id`` to :meth:`bp_del` to remove just this one.
+        """
+        if kind == "exec":
+            if not addr:
+                raise ValueError("bp_add(kind='exec') requires addr='SEG:OFF'")
+            return self.call("bp.add", kind="exec", addr=addr)
+        if kind == "int":
+            if int_ is None:
+                raise ValueError("bp_add(kind='int') requires int_=<0..255>")
+            args: dict = {"kind": "int", "int": int_}
+            if ah is not None:
+                args["ah"] = ah
+            if al is not None:
+                args["al"] = al
+            return self.call("bp.add", **args)
+        raise ValueError("kind must be 'exec' or 'int'")
+
+    def bp_list(self) -> dict:
+        """List the real breakpoints. Returns ``{count, breakpoints}`` where each
+        entry is ``{bp_id, index, kind, enabled, hits, …}`` — ``addr/seg/off``
+        (plus ``bytes_now`` for exec BPs) for exec/mem kinds, or ``int`` for an
+        interrupt BP. ``bp_id`` is the stable handle; ``index`` is the (shifting)
+        iteration position that the legacy ``bp_index`` / ``BPDEL`` key on."""
+        return self.call("bp.list")
+
+    def bp_del(self, bp_id: Optional[int] = None, *, all: bool = False) -> dict:
+        """Delete a real breakpoint by stable handle, or all of them.
+
+        ``bp_del(7)`` removes the breakpoint with ``bp_id`` 7 (``not_found`` if
+        it is gone). ``bp_del(all=True)`` removes *every* breakpoint — including
+        the debugger's default INT3 trap — and is required to be explicit so an
+        omitted id can never wipe the list by accident. Returns
+        ``{deleted, remaining[, bp_id]}``."""
+        if all:
+            return self.call("bp.del", all=True)
+        if bp_id is None:
+            raise ValueError("bp_del requires a bp_id, or all=True")
+        return self.call("bp.del", bp_id=bp_id)
+
     def regs_get(self) -> dict:
         """Snapshot all CPU registers in one structured reply.
 
