@@ -180,7 +180,7 @@ extern bool CPU_NMI_pending;
 extern bool do_seg_limits;
 
 /* `kind` labels the source of the interrupt so the agent control channel
- * (proposal 4.5) can distinguish int3 / int_sw / into / int_hw / int_exception
+ * can distinguish int3 / int_sw / into / int_hw / int_exception
  * / int_step_trap / int_nmi when reporting transfers. Callers that don't care
  * accept the default. */
 void CPU_Interrupt(Bitu num,Bitu type,uint32_t oldeip,const char *kind = "int");

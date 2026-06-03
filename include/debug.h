@@ -32,7 +32,7 @@ extern Bitu debugCallback;
 uint16_t DEBUG_GetPrevCS(void);
 uint16_t DEBUG_GetPrevIP(void);
 
-/* ---- Agent observability bridge (proposal 4.9) --------------------------
+/* ---- Agent observability bridge -----------------------------------------
  * Thin C-style entry points the agent subsystem uses to read debugger
  * internals (the CBreakpoint list is file-local to debug.cpp) without
  * coupling the agent translation units to the debugger's STL containers.
@@ -64,7 +64,7 @@ struct AgentBreakpointInfo {
     uint32_t  linear;   /* GetAddress(seg,off) — for the bytes_now read      */
     uint8_t   intnr;    /* interrupt number for INT kind                     */
     bool      enabled;  /* IsActive()                                        */
-    uint64_t  hits;     /* monotonic hit counter (4.9.1)                     */
+    uint64_t  hits;     /* monotonic hit counter                            */
 };
 
 #endif /* DOSBOX_DEBUG_AGENT_TYPES */
@@ -91,7 +91,7 @@ size_t   DEBUG_AgentDeleteAllBreakpoints(void);
  * textsz==0). Honours the current code-segment operand size. */
 int DEBUG_AgentDisasmOne(uint16_t seg, uint32_t off, char *text, size_t textsz);
 
-/* Single-step the guest from the agent dispatch (proposal 4.9.7). `over`
+/* Single-step the guest from the agent dispatch. `over`
  * false = trace into (one instruction); true = step over CALL/INT/LOOP/REP.
  * Returns 0 if the CPU is not paused, 1 if it stepped one instruction and is
  * still paused (read regs now), 2 if it launched an asynchronous step-over of
@@ -100,7 +100,7 @@ int DEBUG_AgentStep(bool over);
 
 /* True when the guest CPU is paused in the debugger (the agent dispatch is then
  * running at a safe point between instructions). state.save / state.restore
- * (proposal 4.9.8) gate on this: replacing the whole machine state mid-
+ * gate on this: replacing the whole machine state mid-
  * instruction would corrupt the emulator, and a well-defined snapshot needs
  * settled registers. Reports the same `debugging` flag DEBUG_AgentStep checks. */
 bool DEBUG_AgentIsPaused(void);

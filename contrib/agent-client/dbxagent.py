@@ -167,7 +167,7 @@ class DbxAgent:
         return self.call("vm.version")
 
     def debug_status(self) -> dict:
-        """One-shot snapshot of the agent's observability state (proposal 4.9.1).
+        """One-shot snapshot of the agent's observability state.
 
         Returns ``{cpu, cs_ip, cs, eip, instr_count, breakpoints, watches,
         probe, trace, cond_breakpoints}``:
@@ -219,7 +219,7 @@ class DbxAgent:
         return self.call("cpu.step_over", timeout=timeout)
 
     def cpu_probe(self, points: Optional[list] = None) -> dict:
-        """Arm non-halting execution counters at a set of addresses (proposal 4.9.2).
+        """Arm non-halting execution counters at a set of addresses.
 
         ``points`` is a list of ``"SEG:OFF"`` hex strings; each is counted every
         time the CPU executes there, at full speed and without halting — the
@@ -233,7 +233,7 @@ class DbxAgent:
 
     def cpu_trace_ring(self, enabled: bool = True, *, depth: Optional[int] = None,
                        seg: Optional[int] = None) -> dict:
-        """Arm/disarm the rolling CS:IP trace ring (proposal 4.9.3).
+        """Arm/disarm the rolling CS:IP trace ring.
 
         With ``enabled=True`` (the default) records the last ``depth``
         instructions (server default if omitted) into a ring buffer, optionally
@@ -250,7 +250,7 @@ class DbxAgent:
         return self.call("cpu.trace_ring", **args)
 
     def cpu_traceback(self, count: Optional[int] = None) -> dict:
-        """Dump the trace ring captured by ``cpu_trace_ring`` (proposal 4.9.3).
+        """Dump the trace ring captured by ``cpu_trace_ring``.
 
         Returns ``{entries}`` where each entry is ``{cs_ip, bytes, text}``
         (disassembled), ordered oldest-first so the array reads most-recent-last.
@@ -262,7 +262,7 @@ class DbxAgent:
         return self.call("cpu.traceback", count=count)
 
     def cpu_disasm(self, addr: str, count: int = 1) -> dict:
-        """Disassemble ``count`` instructions starting at ``addr`` (proposal 4.9.6).
+        """Disassemble ``count`` instructions starting at ``addr``.
 
         ``addr`` is ``"SEG:OFF"`` (hex); ``count`` is clamped to 64 server-side.
         Returns ``{insns}`` where each instruction is ``{cs_ip, bytes, text}`` —
@@ -475,7 +475,7 @@ class DbxAgent:
 
     def farcall_watch(self, target_seg: Optional[int] = None, *,
                       target_segs: Optional[list] = None) -> dict:
-        """Watch FAR calls/jumps into one or more target segments (proposal 4.9.5).
+        """Watch FAR calls/jumps into one or more target segments.
 
         Single form: ``farcall_watch(0x1234)`` arms a sentinel on segment
         ``0x1234``. Set form: ``farcall_watch(target_segs=[0x1234, 0x5678])``
@@ -494,7 +494,7 @@ class DbxAgent:
     def cpu_watch_target(self, target_seg: Optional[int] = None,
                         target_off: Optional[int] = None, *,
                         targets: Optional[list] = None) -> dict:
-        """Watch NEAR transfers to one or more exact CS:IP targets (proposal 4.9.5).
+        """Watch NEAR transfers to one or more exact CS:IP targets.
 
         Single form: ``cpu_watch_target(0x1234, 0x5678)``. Set form:
         ``cpu_watch_target(targets=["1234:5678", "1234:9ABC"])`` arms a *set* of
@@ -514,7 +514,7 @@ class DbxAgent:
 
     def cpu_watch_range(self, seg: Optional[int] = None, lo: Optional[int] = None,
                        hi: Optional[int] = None, *, ranges: Optional[list] = None) -> dict:
-        """Watch entry into one or more [seg, lo..hi] ranges from outside (4.9.5).
+        """Watch entry into one or more [seg, lo..hi] ranges from outside.
 
         Single form: ``cpu_watch_range(seg, lo, hi)`` fires on the boundary
         crossing *into* ``[seg, lo..hi]`` (use this over ``cpu_watch_target``
@@ -537,7 +537,7 @@ class DbxAgent:
     def mem_watch(self, seg: int, lo: int, hi: int, *, size: Optional[int] = None,
                   when: Optional[dict] = None) -> dict:
         """Intercept guest writes into [seg, lo..hi] and report the storing
-        instruction (proposal 4.9.4).
+        instruction.
 
         A real write-intercept (not a value-change poll): on a matching store
         you get a ``mem.write`` event naming the instruction

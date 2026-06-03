@@ -96,7 +96,7 @@ std::string jsonEncode(const JsonValue &v);
 
 /* ---- Server -------------------------------------------------------------
  * Owns the listening socket and the (currently single) client connection.
- * Phase-1 rejects a second concurrent connection with "busy". */
+ * A second concurrent connection is rejected with "busy". */
 
 void serverStart(const std::string &listen, const std::string &portfile, const std::string &auth_token);
 void serverStop();
@@ -155,7 +155,7 @@ JsonValue handleRegsSet(double id, const JsonValue &args);
 JsonValue handleMemRead(double id, const JsonValue &args);
 JsonValue handleMemWrite(double id, const JsonValue &args);
 
-/* Structured single-step (proposal 4.9.7), implemented in agent_cpu.cpp.
+/* Structured single-step, implemented in agent_cpu.cpp.
  * cpu.step always replies synchronously. cpu.step_over returns the empty
  * string (like screen.capture) when it stepped over a CALL/INT/LOOP/REP and
  * must defer its reply until the temp-BP pause; AGENT_OnDebuggerPaused sends
@@ -165,7 +165,7 @@ JsonValue   handleCpuStep(double id, const JsonValue &args);
 std::string handleCpuStepOver(double id, const JsonValue &args);
 JsonObject  buildStepResult(void);
 
-/* state.save / state.restore (proposal 4.9.8), implemented in agent_cpu.cpp.
+/* state.save / state.restore, implemented in agent_cpu.cpp.
  * Slot-based, headless wrappers over the savestate subsystem (UI prompts
  * suppressed). Both require the CPU paused; state.restore replies with the
  * restored {regs, cs_ip, insn} so the client sees where the machine resumes. */
@@ -173,12 +173,12 @@ JsonValue handleStateSave(double id, const JsonValue &args);
 JsonValue handleStateRestore(double id, const JsonValue &args);
 
 /* Pending cpu.step_over reply slot (defined in agent.cpp). Single-slot because
- * Phase 1 is single-client and a step-over can't be issued while one is in
+ * the agent is single-client and a step-over can't be issued while one is in
  * flight (the CPU is running until the temp BP fires). */
 extern bool   g_stepOverPending;
 extern double g_stepOverId;
 
-/* ---- Conditional / Nth-hit breakpoints (proposal 4.9.9) ----------------
+/* ---- Conditional / Nth-hit breakpoints ---------------------------------
  * A conditional breakpoint is checked once per instruction from the heavy-
  * debug hook (AGENT_CondBpCheck), the same path cpu.probe / cpu.trace_ring
  * use, so a disarmed table costs only the g_condBpActive bool load. On a
@@ -272,13 +272,13 @@ JsonValue handleBpAdd(double id, const JsonValue &args);
 JsonValue handleBpList(double id, const JsonValue &args);
 JsonValue handleBpDel(double id, const JsonValue &args);
 
-/* ---- Observability (proposal 4.9) --------------------------------------
+/* ---- Observability ------------------------------------------------------
  * Watch state + hit counters live in agent.cpp (read on the CPU hot path,
  * written from the main thread). debug.status in agent_observe.cpp reads
  * them via these externs to report each watch's armed/sentinels/hit-count
  * without halting the CPU or consuming the event stream.
  *
- * Multi-sentinel (proposal 4.9.5): each watch is a *set* of sentinels, each
+ * Multi-sentinel: each watch is a *set* of sentinels, each
  * carrying its own hit counter. `armed` is just `!empty()`. The matcher that
  * fires records the matched index in the paired g_*WatchWhich so the emitter
  * that runs immediately after (single-threaded, on the same CPU thread) can
@@ -295,13 +295,13 @@ extern int g_targetWatchWhich;
 extern int g_rangeWatchWhich;
 
 /* Dispatch entry points implemented in agent_observe.cpp. */
-JsonValue handleDebugStatus(double id, const JsonValue &args);    /* 4.9.1 */
-JsonValue handleCpuProbe(double id, const JsonValue &args);       /* 4.9.2 */
-JsonValue handleCpuTraceRing(double id, const JsonValue &args);   /* 4.9.3 */
-JsonValue handleCpuTraceback(double id, const JsonValue &args);   /* 4.9.3 */
-JsonValue handleCpuDisasm(double id, const JsonValue &args);      /* 4.9.6 */
-JsonValue handleMemWatch(double id, const JsonValue &args);       /* 4.9.4 */
-JsonValue handleMemUnwatch(double id, const JsonValue &args);     /* 4.9.4 */
+JsonValue handleDebugStatus(double id, const JsonValue &args);
+JsonValue handleCpuProbe(double id, const JsonValue &args);
+JsonValue handleCpuTraceRing(double id, const JsonValue &args);
+JsonValue handleCpuTraceback(double id, const JsonValue &args);
+JsonValue handleCpuDisasm(double id, const JsonValue &args);
+JsonValue handleMemWatch(double id, const JsonValue &args);
+JsonValue handleMemUnwatch(double id, const JsonValue &args);
 
 /* Reply helpers shared between agent.cpp and agent_keyboard.cpp. */
 JsonValue makeReplyOk(double id, JsonObject result);

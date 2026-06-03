@@ -55,7 +55,7 @@ static INLINE int32_t Fetchds() {
 		continue;											\
 	}
 
-/* Agent NEAR-transfer hook (proposal 4.4 + 4.8). Compiles to nothing
+/* Agent NEAR-transfer hook. Compiles to nothing
  * when C_DEBUG is off so the cycle cost stays zero in release builds.
  * KIND is a string literal naming the opcode group; FROM_IP is the
  * post-operand IP (i.e., the return address of the instruction that
@@ -63,9 +63,9 @@ static INLINE int32_t Fetchds() {
  * current CS.
  *
  * Two watch families fire from here:
- *   - cpu.watch_target (4.4): fires when (CS, IP) matches a sentinel
+ *   - cpu.watch_target: fires when (CS, IP) matches a sentinel
  *     pair. Use for "what instruction landed here?"
- *   - cpu.watch_range  (4.8): fires when target_off enters [lo, hi]
+ *   - cpu.watch_range: fires when target_off enters [lo, hi]
  *     and FROM_IP is outside [lo, hi]. Use for "what first entered
  *     this region?" — naturally suppresses intra-range fall-through
  *     since FROM_IP will be inside the range on subsequent steps. */

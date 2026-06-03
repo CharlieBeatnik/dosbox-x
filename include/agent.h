@@ -75,7 +75,7 @@ void AGENT_EmitFarTransfer(uint16_t target_seg, uint16_t target_ip,
                            uint16_t from_cs,     uint16_t from_ip,
                            const char *kind);
 
-/* Near-transfer event (proposal 4.4). Same shape as the FAR variant but
+/* Near-transfer event. Same shape as the FAR variant but
  * always within a single CS; emitted as `cpu.transfer`. `kind` is a short
  * literal naming the source opcode group ("jmp_near_indirect",
  * "call_near_indirect", "retn", ...). */
@@ -92,7 +92,7 @@ bool AGENT_FarWatchMatches(uint16_t seg);
 void AGENT_FarWatchSet(uint16_t seg);
 void AGENT_FarWatchClear(void);
 
-/* Near-transfer watch (proposal 4.4). Sentinel is a (seg, off) pair so
+/* Near-transfer watch. Sentinel is a (seg, off) pair so
  * the hot path can filter aggressively — NEAR transfers are far more
  * frequent than FAR. CPU core queries AGENT_TargetWatchMatches() at
  * every CALL NEAR / JMP NEAR (direct + indirect), every taken Jcc /
@@ -102,7 +102,7 @@ bool AGENT_TargetWatchMatches(uint16_t seg, uint16_t off);
 void AGENT_TargetWatchSet(uint16_t seg, uint16_t off);
 void AGENT_TargetWatchClear(void);
 
-/* Range-entry watch (proposal 4.8). Fires when a control transfer lands
+/* Range-entry watch. Fires when a control transfer lands
  * at `seg:target_off` with `lo<=target_off<=hi`, AND the previous
  * instruction was NOT in the same `[seg, lo..hi]` window. The "from
  * outside" gate suppresses the intra-range fall-through / LOOP flood —
@@ -118,7 +118,7 @@ void AGENT_EmitRangeEnter(const char *kind,
                           uint16_t target_seg, uint16_t target_off,
                           uint16_t from_cs,    uint16_t from_ip);
 
-/* Execution probe (proposal 4.9.2). A set of (seg, off) points each with a
+/* Execution probe. A set of (seg, off) points each with a
  * monotonic counter, checked once per instruction from the heavy-debug
  * per-instruction hook. Unlike a breakpoint it never halts the CPU and never
  * emits an event, so it runs at full speed and answers "was this address ever
@@ -128,7 +128,7 @@ void AGENT_EmitRangeEnter(const char *kind,
 bool AGENT_ProbeActive(void);
 void AGENT_ProbeCheck(uint16_t seg, uint16_t off);
 
-/* Instruction-trace ring (proposal 4.9.3). When armed, records the retired
+/* Instruction-trace ring. When armed, records the retired
  * (seg, off) of each executed instruction into a fixed-size ring so a later
  * cpu.traceback can answer "how did the CPU get here?" in one run. Optionally
  * filtered to a single CS to skip BIOS/IRET noise. AGENT_TraceActive() gates
@@ -136,7 +136,7 @@ void AGENT_ProbeCheck(uint16_t seg, uint16_t off);
 bool AGENT_TraceActive(void);
 void AGENT_TraceRecord(uint16_t seg, uint16_t off);
 
-/* Memory write-intercept watch (proposal 4.9.4). The guest memory-write path
+/* Memory write-intercept watch. The guest memory-write path
  * (mem_write{b,w,d}_inline in paging.h) calls AGENT_MemWatchNote on every
  * write *while armed*. AGENT_memWatchArmed is the fast gate so a disarmed
  * watch costs only a single bool load on that very hot path. On a match
@@ -179,13 +179,13 @@ bool AGENT_IsHeadless(void);
 
 /* Notified from DEBUG_EnableDebugger once a running->paused transition has
  * settled (after debugger.entered / state.paused are emitted). Used to send
- * the deferred reply for a cpu.step_over (proposal 4.9.7) that stepped over a
+ * the deferred reply for a cpu.step_over that stepped over a
  * CALL/INT/LOOP/REP and resumed the CPU until a temporary breakpoint fired.
  * No-op when no step-over is pending. */
 void AGENT_OnDebuggerPaused(void);
 
-/* Conditional / Nth-hit breakpoints with on-hit command macros (proposal
- * 4.9.9). Checked once per instruction from DEBUG_HeavyIsBreakpoint — the same
+/* Conditional / Nth-hit breakpoints with on-hit command macros.
+ * Checked once per instruction from DEBUG_HeavyIsBreakpoint — the same
  * hot-path slot cpu.probe / cpu.trace_ring use — so AGENT_CondBpActive() is the
  * fast gate that costs a single bool load when no conditional BP is armed.
  * AGENT_CondBpCheck(cur_cs, cur_off, from_cs, from_ip) is called only when

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live-fire test for cpu.watch_range (proposal 4.8).
+"""Live-fire test for cpu.watch_range.
 
 Arms a range watch on the BIOS INT 8 handler's segment + a small window
 around its known IP. Verifies:
@@ -108,10 +108,10 @@ def run(argv: list[str] | None = None) -> int:
             ip8, cs8 = struct.unpack("<HH", ivt8)
             print(f"IVT[8] = {cs8:04X}:{ip8:04X}", flush=True)
 
-            # ---- Phase A: arm a 16-byte window around IVT[8] ----------
+            # ---- Scenario A: arm a 16-byte window around IVT[8] ----------
             lo = ip8
             hi = (ip8 + 0x0F) & 0xFFFF
-            print(f"\nPhase A: cpu.watch_range seg={cs8:04X} lo={lo:04X} hi={hi:04X}",
+            print(f"\nScenario A: cpu.watch_range seg={cs8:04X} lo={lo:04X} hi={hi:04X}",
                   flush=True)
             res = agent.call("cpu.watch_range", seg=cs8, lo=lo, hi=hi)
             print(f"  arm reply: {res}", flush=True)
@@ -160,8 +160,8 @@ def run(argv: list[str] | None = None) -> int:
                 print(f"  OK: {int_hw_count} int_hw events (matches ~18.2 Hz timer rate)",
                       flush=True)
 
-            # ---- Phase B: a target OUTSIDE [lo, hi] should NOT match --
-            print(f"\nPhase B: re-arm with a 1-byte window AWAY from IVT[8]", flush=True)
+            # ---- Scenario B: a target OUTSIDE [lo, hi] should NOT match --
+            print(f"\nScenario B: re-arm with a 1-byte window AWAY from IVT[8]", flush=True)
             far_off = (ip8 + 0x800) & 0xFFFF  # well outside handler entry
             agent.call("cpu.watch_range", seg=cs8, lo=far_off, hi=far_off)
             t_start = time.monotonic()
@@ -177,8 +177,8 @@ def run(argv: list[str] | None = None) -> int:
                 print(f"  WARN: unexpected entries on a hopefully-quiet window: {far_entries[:3]}",
                       flush=True)
 
-            # ---- Phase C: cpu.unwatch_range clears -------------------
-            print(f"\nPhase C: cpu.unwatch_range clears the watch", flush=True)
+            # ---- Scenario C: cpu.unwatch_range clears -------------------
+            print(f"\nScenario C: cpu.unwatch_range clears the watch", flush=True)
             res = agent.call("cpu.unwatch_range")
             print(f"  unwatch reply: {res}", flush=True)
             if res.get("watching") is not False:

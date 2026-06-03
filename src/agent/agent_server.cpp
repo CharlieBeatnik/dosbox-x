@@ -18,7 +18,7 @@
 
 /* Agent control channel — SDL_net TCP accept/recv/send and per-client outbox.
  *
- * Phase-1 design: one listener, at most one connected client. A second
+ * Single-client design: one listener, at most one connected client. A second
  * concurrent connection is rejected with a single `{"event":"busy"}` line
  * and closed.
  *
@@ -81,7 +81,7 @@ struct Server {
     uint16_t            listenPort = 0;
     std::string         portfile;
     std::string         authToken;
-    /* Only one client in Phase 1. Kept as a pointer so we can later widen
+    /* Only one client is supported. Kept as a pointer so this can later widen
      * to std::vector<std::unique_ptr<Client>> without much churn. */
     std::unique_ptr<Client> client;
 };
@@ -342,7 +342,7 @@ static void acceptIfReady() {
     }
 
     if (g.client) {
-        /* One client at a time in Phase 1. Reject. */
+        /* Only one client at a time. Reject. */
         const char *reply = "{\"event\":\"busy\"}\n";
         SDLNet_TCP_Send(s, reply, static_cast<int>(strlen(reply)));
         SDLNet_TCP_Close(s);

@@ -16,10 +16,8 @@
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
  */
 
-/* Agent control channel — lifecycle and JSON dispatch loop.
- *
- * Iteration 2: the listener runs on demand; one command is implemented
- * (`vm.version`). The rest of the protocol surface still no-ops. */
+/* Agent control channel — lifecycle and JSON dispatch loop. The listener
+ * runs on demand; dispatchLine() routes each command to its handler. */
 
 #include "config.h"
 
@@ -57,9 +55,9 @@ namespace agent {
  * mutate it without going through dispatch. Read on the CPU dispatch hot
  * path; written only from the main thread.
  *
- * Multi-sentinel (proposal 4.9.5): each watch is a *set* of sentinels. Each
- * sentinel carries its own monotonic hit counter (proposal 4.9.1) bumped by
- * its matcher when that sentinel fires — i.e. once per emitted event. The
+ * Multi-sentinel: each watch is a *set* of sentinels. Each sentinel carries
+ * its own monotonic hit counter bumped by its matcher when that sentinel
+ * fires — i.e. once per emitted event. The
  * counts are read by debug.status (agent_observe.cpp) so an agent can prove
  * which sentinel was (or was not) exercised without consuming the event
  * stream. `armed` is just a non-empty set.
@@ -68,17 +66,17 @@ namespace agent {
  * emitter that runs immediately afterwards (same CPU thread, no intervening
  * code) reads it to stamp the event's `which` field. -1 means "no current
  * match" (the value seen by a direct emitter call with no preceding match). */
-std::vector<AgentFarSentinel>    g_farWatch;        /* proposal 4.4 / 4.9.5 */
-std::vector<AgentTargetSentinel> g_targetWatch;     /* proposal 4.4 / 4.9.5 */
-std::vector<AgentRangeSentinel>  g_rangeWatch;      /* proposal 4.8 / 4.9.5 */
+std::vector<AgentFarSentinel>    g_farWatch;
+std::vector<AgentTargetSentinel> g_targetWatch;
+std::vector<AgentRangeSentinel>  g_rangeWatch;
 int g_farWatchWhich    = -1;
 int g_targetWatchWhich = -1;
 int g_rangeWatchWhich  = -1;
 
-/* screen.capture pending-request state (proposal 4.7). The handler returns
+/* screen.capture pending-request state. The handler returns
  * an empty string so the protocol layer queues no immediate reply, then
  * AGENT_OnScreenCaptured (called from the capture subsystem after fclose)
- * sends the deferred reply. Single-slot because Phase 1 is single-client
+ * sends the deferred reply. Single-slot because the agent is single-client
  * and the capture subsystem itself only handles one screenshot at a time.
  *
  * The deadline uses `steady_clock` (wall time) not PIC_Ticks because the
@@ -90,7 +88,7 @@ bool                                            g_screenCaptureRaw = false;
 bool                                            g_screenCapturePending = false;
 std::chrono::steady_clock::time_point           g_screenCaptureDeadline;
 
-/* Pending cpu.step_over reply (proposal 4.9.7). When a step-over steps a
+/* Pending cpu.step_over reply. When a step-over steps a
  * CALL/INT/LOOP/REP the CPU resumes until a temporary breakpoint fires; the
  * reply is sent from AGENT_OnDebuggerPaused once that pause settles. */
 bool                                            g_stepOverPending = false;
@@ -302,8 +300,8 @@ bool parseSegOffArg(const JsonValue &v, uint16_t &seg, uint16_t &off) {
     return true;
 }
 
-/* farcall.watch — arm a *set* of FAR-transfer destination segments
- * (proposal 4.9.5). Two request shapes:
+/* farcall.watch — arm a *set* of FAR-transfer destination segments.
+ * Two request shapes:
  *   {"target_seg": <u16|hex>}     — single sentinel (back-compat; null clears)
  *   {"target_segs": [<u16|hex>,…]}— sentinel set ([] clears)
  * Each emitted farcall.transfer carries a `which` index into this set. */
@@ -361,8 +359,8 @@ JsonValue handleFarcallUnwatch(double id, const JsonValue & /*args*/) {
     return makeReplyOk(id, std::move(r));
 }
 
-/* cpu.watch_target — arm a *set* of NEAR-transfer (seg, off) sentinels
- * (proposal 4.9.5). Two request shapes:
+/* cpu.watch_target — arm a *set* of NEAR-transfer (seg, off) sentinels.
+ * Two request shapes:
  *   {"target_seg":…,"target_off":…}  — single sentinel (back-compat; null clears)
  *   {"targets":["SEG:OFF", …]}        — sentinel set ([] clears), the same
  *                                       "SEG:OFF" string form cpu.probe uses.
@@ -434,7 +432,7 @@ JsonValue handleCpuUnwatchTarget(double id, const JsonValue & /*args*/) {
  * the region itself has a lot of intra-range traffic (a slide / loop /
  * data-as-code execution) that would otherwise flood cpu.watch_target.
  *
- * Multi-range (proposal 4.9.5). Two request shapes:
+ * Multi-range. Two request shapes:
  *   {"seg":…,"lo":…,"hi":…}                       — single range (null clears)
  *   {"ranges":[{"seg":…,"lo":…,"hi":…}, …]}        — range set ([] clears)
  * Each emitted cpu.range_enter carries a `which` index into this set. */
@@ -648,7 +646,7 @@ std::string dispatchLine(const std::string &line) {
     if (cmd->s == "cpu.unwatch_range") return jsonEncode(handleCpuUnwatchRange(id, a));
     if (cmd->s == "mem.watch")         return jsonEncode(handleMemWatch(id, a));
     if (cmd->s == "mem.unwatch")       return jsonEncode(handleMemUnwatch(id, a));
-    /* Observability & trust (proposal 4.9) — handlers in agent_observe.cpp. */
+    /* Observability & trust — handlers in agent_observe.cpp. */
     if (cmd->s == "debug.status")      return jsonEncode(handleDebugStatus(id, a));
     if (cmd->s == "cpu.probe")         return jsonEncode(handleCpuProbe(id, a));
     if (cmd->s == "cpu.trace_ring")    return jsonEncode(handleCpuTraceRing(id, a));
@@ -731,11 +729,11 @@ void AGENT_OnStateRestored(void) {
 
 void AGENT_Poll(bool /*paused*/) {
     /* The tick handler already drives serverPoll() every 1 ms. The
-     * paused-context call from DEBUG_Loop (added in iteration 5) needs
-     * the same drain logic, so route both through the same entry. */
+     * paused-context call from DEBUG_Loop needs the same drain logic, so
+     * route both through the same entry. */
     if (!agent::g_started) return;
     agent::serverPoll();
-    /* Wall-clock screen.capture deadline (proposal 4.7): also check from
+    /* Wall-clock screen.capture deadline: also check from
      * the paused branch since PIC ticks freeze but the wall clock doesn't,
      * and we don't want a request issued just before pause to wait
      * forever for the user to resume. */
@@ -743,19 +741,19 @@ void AGENT_Poll(bool /*paused*/) {
 }
 
 void AGENT_OnLoopChange(void) {
-    /* Iteration 5 will emit state.paused / state.running here. */
+    /* Reserved hook for CPU run/pause transitions. */
 }
 
 bool AGENT_IsHeadless(void) {
-    /* For Phase 1 the agent owns the debugger UI whenever the listener is
-     * up. Granular control (e.g. agent + curses concurrently) can be
-     * revisited later; the loss is that pressing Alt-Pause with the agent
-     * active no longer pops a curses window. */
+    /* The agent owns the debugger UI whenever the listener is up. Granular
+     * control (e.g. agent + curses concurrently) can be revisited later; the
+     * loss is that pressing Alt-Pause with the agent active no longer pops a
+     * curses window. */
     return agent::g_started;
 }
 
 void AGENT_OnDebuggerPaused(void) {
-    /* Deferred cpu.step_over reply (proposal 4.9.7). A step-over of a
+    /* Deferred cpu.step_over reply. A step-over of a
      * CALL/INT/LOOP/REP set a temp BP and resumed the CPU; the running->paused
      * transition that just settled is (normally) that temp BP firing. Send the
      * post-step register snapshot now. If a *different* breakpoint fired first

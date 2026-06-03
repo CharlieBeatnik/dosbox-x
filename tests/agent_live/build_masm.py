@@ -3,8 +3,7 @@
 *inside* DOSBox-X (the host is 64-bit Windows and cannot exec the 1990s DOS
 binaries directly).
 
-This is the dosbox-x in-repo analogue of X2RE's scripts/assemble_masm611.py,
-trimmed for the single-source tiny-model .COM programs the agent live-fire
+It assembles the single-source tiny-model .COM programs the agent live-fire
 tests need. Two stages, both inside one DOSBox-X session:
 
   1. ML.EXE /c /AT      assemble  src.ASM  -> <stem>.OBJ   (+ <stem>.LST)
@@ -13,14 +12,13 @@ tests need. Two stages, both inside one DOSBox-X session:
 ML's `/AT` selects the tiny memory model (mandatory for a .COM); TLINK's
 `/t` produces a .COM image and `/x` suppresses the .MAP.
 
-Tools are located via the same environment variables X2RE uses, so a host
-that can already run that build can run this one unchanged:
+Tools are located via environment variables:
 
     MASM  - MASM 6.11 install root (must contain BIN/ML.EXE)
     TASM  - TASM 1.0 install root  (must contain TLINK.EXE)
 
 DOSBox-X is located via, in priority order: --dosbox, the DOSBOXX env var
-(directory containing dosbox-x.exe, as X2RE sets it), or the in-repo
+(directory containing dosbox-x.exe), or the in-repo
 bin/x64/Debug/dosbox-x.exe.
 
 Exit codes:

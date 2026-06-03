@@ -6,21 +6,21 @@
 ; / farcall.transfer).  None of those paths are reached by the GTest suite,
 ; which bypasses the CPU core entirely.
 ;
-; The program waits for an ASCII keystroke and dispatches a phase per byte:
+; The program waits for an ASCII keystroke and dispatches a scenario per byte:
 ;
-;   '1'  -- Phase 1: tight LOOP of NOPs at landmark2.  Driver sets BP at
+;   '1'  -- Scenario 1: tight LOOP of NOPs at landmark2.  Driver sets BP at
 ;          landmark2 mid-run; before commit 2ac9b58 the BP stayed inactive
 ;          and never fired.
-;   '2'  -- Phase 2: illegal opcode "FFh FCh" -> CPU_Exception(6) ->
+;   '2'  -- Scenario 2: illegal opcode "FFh FCh" -> CPU_Exception(6) ->
 ;          dispatches INT 6.  Driver sets BPINT 06 mid-run.
-;   '3'  -- Phase 3: MOV byte ptr ds:[0500h], 0AAh.  Driver sets a BPM
+;   '3'  -- Scenario 3: MOV byte ptr ds:[0500h], 0AAh.  Driver sets a BPM
 ;          watch at DS:0500h mid-run.
-;   '4'  -- Phase 4: PUSHF / set TF / POPF, then NOP at landmark_tf_next.
+;   '4'  -- Scenario 4: PUSHF / set TF / POPF, then NOP at landmark_tf_next.
 ;          With TF set, a successful BP at the NOP would (without fix
 ;          c50d109) be clobbered by Trap_Run firing DBINT_STEP -> INT 1.
 ;          With the fix, regs.get returns CS:IP at the NOP, not at the
 ;          INT 1 vector.
-;   '5'  -- Phase 5: CALL FAR DWORD PTR ds:[farptr].  Target is 9000:0010,
+;   '5'  -- Scenario 5: CALL FAR DWORD PTR ds:[farptr].  Target is 9000:0010,
 ;          where we plant a single RETF byte at setup.  Driver runs
 ;          farcall.watch target_seg=9000h and expects a farcall.transfer
 ;          event with kind="call_far_indirect", target_off=0010h.
@@ -49,9 +49,9 @@ start:  jmp     near ptr setup          ; 3 bytes -> table at 103h
 ; bytes here and uses them to set BPs / verify farcall.transfer fields.
 
 landmarks_table:
-        dw      landmark2               ; +0: BP target for phase 1
-        dw      landmark_tf_next        ; +2: BP target for phase 4
-        dw      landmark_callfar        ; +4: from_ip expected in phase 5
+        dw      landmark2               ; +0: BP target for scenario 1
+        dw      landmark_tf_next        ; +2: BP target for scenario 4
+        dw      landmark_callfar        ; +4: from_ip expected in scenario 5
 
 ; ---- Variables -----------------------------------------------------------
 
@@ -59,7 +59,7 @@ oldint6_off     dw      0
 oldint6_seg     dw      0
 int6_count      dw      0
 
-; Far pointer for phase 5 -- CALL FAR DWORD PTR ds:[farptr].  We plant a
+; Far pointer for scenario 5 -- CALL FAR DWORD PTR ds:[farptr].  We plant a
 ; RETF at 9000:0010 in setup so the call returns cleanly.
 
 farptr          dw      0010h           ; offset
@@ -111,45 +111,45 @@ main_loop:
         mov     ah, 0
         int     16h                     ; AL = ASCII, AH = scancode
         cmp     al, '1'
-        je      phase1
+        je      scenario1
         cmp     al, '2'
-        je      phase2
+        je      scenario2
         cmp     al, '3'
-        je      phase3
+        je      scenario3
         cmp     al, '4'
-        je      phase4
+        je      scenario4
         cmp     al, '5'
-        je      phase5
+        je      scenario5
         cmp     al, 'q'
         je      do_exit
         jmp     main_loop
 
-; ---- Phase 1: tight NOP loop --------------------------------------------
+; ---- Scenario 1: tight NOP loop --------------------------------------------
 
-phase1:
+scenario1:
         mov     cx, 100
-phase1_loop:
+scenario1_loop:
 landmark2:
         nop                             ; <- BP target
-        loop    phase1_loop
+        loop    scenario1_loop
         jmp     main_loop
 
-; ---- Phase 2: illegal opcode FFh,FCh -> INT 6 ----------------------------
+; ---- Scenario 2: illegal opcode FFh,FCh -> INT 6 ----------------------------
 
-phase2:
+scenario2:
 landmark4:
         db      0FFh, 0FCh              ; GRP5 /7 with reg operand -> #UD
         jmp     main_loop
 
-; ---- Phase 3: BPM target write ------------------------------------------
+; ---- Scenario 3: BPM target write ------------------------------------------
 
-phase3:
+scenario3:
         mov     byte ptr ds:[0500h], 0AAh
         jmp     main_loop
 
-; ---- Phase 4: TF set + NOP ----------------------------------------------
+; ---- Scenario 4: TF set + NOP ----------------------------------------------
 
-phase4:
+scenario4:
         pushf
         pop     ax
         or      ax, 0100h               ; set TF
@@ -166,9 +166,9 @@ landmark_tf_next:
         popf
         jmp     main_loop
 
-; ---- Phase 5: CALL FAR DWORD PTR ----------------------------------------
+; ---- Scenario 5: CALL FAR DWORD PTR ----------------------------------------
 
-phase5:
+scenario5:
 landmark_callfar:
         call    dword ptr ds:[farptr]   ; -> 9000:0010 (RETF) -> here
         jmp     main_loop

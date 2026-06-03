@@ -2,13 +2,11 @@
 """Live-fire test for the agent breakpoint / Trap_Run / farcall.watch fixes.
 
 Runs `bptest.com` inside a real DOSBox-X instance via the agent control
-channel and verifies all five phases observed end-to-end.  This is the
-"definitive test" called for in
-`D:\\Data\\Git\\X2RE\\.claude\\notes\\dosbox-x-fixes\\PLAN.md` § 5.2 -- it
-exercises the CPU-core code paths that the GTest suite cannot reach
-because the in-process test harness bypasses the CPU core entirely.
+channel and verifies all five scenarios observed end-to-end.  It exercises
+the CPU-core code paths that the GTest suite cannot reach because the
+in-process test harness bypasses the CPU core entirely.
 
-Phases (each preceded by `BPDEL 0 *` to start from a clean BP list):
+Scenarios (each preceded by `BPDEL 0 *` to start from a clean BP list):
 
   1. BP at landmark2 (NOP inside a tight LOOP).  Pre-fix the BP added
      mid-run stayed inactive and the bp.hit never arrived.  Post-fix the
@@ -33,7 +31,7 @@ Phases (each preceded by `BPDEL 0 *` to start from a clean BP list):
 Usage:
     python tests/agent_live/test_bps.py [--dosbox PATH] [--keep-tmp]
 
-Exit code 0 if every phase passes; 1 otherwise.
+Exit code 0 if every scenario passes; 1 otherwise.
 """
 
 from __future__ import annotations
@@ -209,7 +207,7 @@ def _launch_dosbox(
     )
 
 
-# --- phase implementations ------------------------------------------------
+# --- scenario implementations ------------------------------------------------
 
 
 class Reporter:
@@ -229,10 +227,10 @@ class Reporter:
         return all(ok for _, ok, _ in self.results)
 
 
-def phase1_bp_in_loop(
+def scenario1_bp_in_loop(
     agent: DbxAgent, cs: int, landmark2: int, rep: Reporter
 ) -> None:
-    name = f"phase1: BP CS:{landmark2:04X} (NOP inside LOOP)"
+    name = f"scenario1: BP CS:{landmark2:04X} (NOP inside LOOP)"
     try:
         _bp_reset(agent)
         agent.debugger_command(f"BP {cs:04X}:{landmark2:04X}")
@@ -255,10 +253,10 @@ def phase1_bp_in_loop(
             _drain_events(agent)
 
 
-def phase2_bpint_06(
+def scenario2_bpint_06(
     agent: DbxAgent, cs: int, landmark4: int, rep: Reporter
 ) -> None:
-    name = "phase2: BPINT 06 (illegal-opcode INT 6)"
+    name = "scenario2: BPINT 06 (illegal-opcode INT 6)"
     try:
         _bp_reset(agent)
         agent.debugger_command("BPINT 06")
@@ -286,8 +284,8 @@ def phase2_bpint_06(
             _drain_events(agent)
 
 
-def phase3_bpm(agent: DbxAgent, cs: int, rep: Reporter) -> None:
-    name = f"phase3: BPM CS:0500h (memory write)"
+def scenario3_bpm(agent: DbxAgent, cs: int, rep: Reporter) -> None:
+    name = f"scenario3: BPM CS:0500h (memory write)"
     try:
         _bp_reset(agent)
         agent.debugger_command(f"BPM {cs:04X}:0500")
@@ -311,11 +309,11 @@ def phase3_bpm(agent: DbxAgent, cs: int, rep: Reporter) -> None:
             _drain_events(agent)
 
 
-def phase4_tf_then_bp(
+def scenario4_tf_then_bp(
     agent: DbxAgent, cs: int, landmark_tf_next: int, rep: Reporter
 ) -> None:
     name = (
-        f"phase4: BP CS:{landmark_tf_next:04X} after TF=1 -- regs.get must NOT "
+        f"scenario4: BP CS:{landmark_tf_next:04X} after TF=1 -- regs.get must NOT "
         "be re-vectored into INT 1"
     )
     try:
@@ -364,10 +362,10 @@ def phase4_tf_then_bp(
             _drain_events(agent)
 
 
-def phase5_farcall(
+def scenario5_farcall(
     agent: DbxAgent, cs: int, landmark_callfar: int, rep: Reporter
 ) -> None:
-    name = "phase5: farcall.watch 9000h + CALL FAR DWORD PTR"
+    name = "scenario5: farcall.watch 9000h + CALL FAR DWORD PTR"
     try:
         _bp_reset(agent)
         agent.call("farcall.watch", target_seg="9000")
@@ -462,7 +460,7 @@ def run(argv: list[str] | None = None) -> int:
             if ver["build"] != "heavy-debug":
                 print(
                     "WARNING: BPM watches require a heavy-debug build; "
-                    f"this build advertises {ver['build']!r}.  Phase 3 will "
+                    f"this build advertises {ver['build']!r}.  Scenario 3 will "
                     "almost certainly fail.",
                     flush=True,
                 )
@@ -478,11 +476,11 @@ def run(argv: list[str] | None = None) -> int:
                 flush=True,
             )
 
-            phase1_bp_in_loop(agent, cs, l2, rep)
-            phase2_bpint_06(agent, cs, 0x0175, rep)
-            phase3_bpm(agent, cs, rep)
-            phase4_tf_then_bp(agent, cs, l_tf, rep)
-            phase5_farcall(agent, cs, l_far, rep)
+            scenario1_bp_in_loop(agent, cs, l2, rep)
+            scenario2_bpint_06(agent, cs, 0x0175, rep)
+            scenario3_bpm(agent, cs, rep)
+            scenario4_tf_then_bp(agent, cs, l_tf, rep)
+            scenario5_farcall(agent, cs, l_far, rep)
 
             # Clean exit: tell BPTEST to quit, which returns to COMMAND.COM,
             # which runs `exit` from the conf and shuts DOSBox-X down.
@@ -511,7 +509,7 @@ def run(argv: list[str] | None = None) -> int:
             print(f"(kept tmp dir: {tmp})", flush=True)
 
     print("---")
-    print(f"{sum(1 for _, ok, _ in rep.results if ok)}/{len(rep.results)} phases passed")
+    print(f"{sum(1 for _, ok, _ in rep.results if ok)}/{len(rep.results)} scenarios passed")
     return 0 if rep.all_passed else 1
 
 

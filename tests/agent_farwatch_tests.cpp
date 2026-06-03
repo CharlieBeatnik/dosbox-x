@@ -17,11 +17,11 @@
  */
 
 /* Agent control channel — farcall.watch dispatch + state tests, plus a
- * smoke-test for the immediate-activation breakpoint fix (4.1).
+ * smoke-test for the immediate-activation breakpoint fix.
  *
  * The CPU-core hooks themselves (in src/cpu/core_normal/prefix_none.h) need
  * a running guest to exercise, which the -tests harness doesn't provide;
- * those are covered by SMOKE.md / the X2RE shift-test reproducer. Here we
+ * those are covered by the live-fire tests (see SMOKE.md). Here we
  * verify the agent-side surface (state, dispatch, predicate, emitter
  * safety). */
 

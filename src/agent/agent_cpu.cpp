@@ -20,9 +20,9 @@
  *
  * regs.get      - all GPRs + segregs + EIP + EFLAGS in one structured reply.
  * mem.read      - read N bytes from guest memory, returned base64-encoded.
- * cpu.step      - structured single-step (proposal 4.9.7).
- * state.save    - snapshot the whole machine to a save slot (proposal 4.9.8).
- * state.restore - restore the machine from a save slot (proposal 4.9.8).
+ * cpu.step      - structured single-step.
+ * state.save    - snapshot the whole machine to a save slot.
+ * state.restore - restore the machine from a save slot.
  *
  * regs.get/mem.read exist because the legacy ParseCommand passthrough cannot
  * reach the curses register pane (drawn directly to ncurses windows, never via
@@ -327,7 +327,7 @@ JsonValue handleRegsSet(double id, const JsonValue &args) {
     return makeReplyOk(id, std::move(r));
 }
 
-/* ---- cpu.step / cpu.step_over (4.9.7) --------------------------------- */
+/* ---- cpu.step / cpu.step_over ----------------------------------------- */
 
 /* {regs:{...}, cs_ip:"SEG:EIP", insn:{cs_ip,bytes,text}} for the *current*
  * (post-step) CPU state. The insn is the instruction now at CS:IP — i.e. the
@@ -524,7 +524,7 @@ JsonValue handleMemWrite(double id, const JsonValue &args) {
     return makeReplyOk(id, std::move(r));
 }
 
-/* ---- state.save / state.restore (4.9.8) ------------------------------ */
+/* ---- state.save / state.restore -------------------------------------- */
 
 /* Headless wrappers over the savestate subsystem. The menu/mapper save & load
  * are heavily UI-coupled: a remark input box on save, version/program/memory/
@@ -640,7 +640,7 @@ JsonValue handleStateRestore(double id, const JsonValue &args) {
     return makeReplyOk(id, std::move(r));
 }
 
-/* ---- bp.set / bp.clear : conditional / Nth-hit breakpoints (4.9.9) ----
+/* ---- bp.set / bp.clear : conditional / Nth-hit breakpoints -----------
  *
  * A conditional breakpoint pairs an execution address with three optional
  * pieces: a `if` condition (a tiny expression over registers / memory / the
@@ -1066,11 +1066,11 @@ JsonValue handleBpClear(double id, const JsonValue &args) {
 
 /* ---- bp.add / bp.list / bp.del : typed real breakpoints with stable handles
  *
- * The typed replacement for the `debugger.command "BP …"` / "BPINT …" /
- * "BPDEL" strings the client used in Phase 1. These create real CBreakpoints
+ * The typed replacement for the string-based `debugger.command "BP …"` /
+ * "BPINT …" / "BPDEL" commands. These create real CBreakpoints
  * (the kind that halt the CPU in the debugger), each addressed by a stable id
  * assigned at construction, so a handle stays valid as other breakpoints are
- * added and removed — retiring the carry-over that the bp.hit `bp_index` was an
+ * added and removed — unlike the bp.hit `bp_index`, which is a BPoints
  * iteration position, not a handle. The bp.hit event now also carries `bp_id`,
  * so a consumer can correlate a hit with the breakpoint it added here.
  *

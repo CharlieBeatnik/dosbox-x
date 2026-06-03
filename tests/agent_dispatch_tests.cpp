@@ -16,7 +16,7 @@
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
  */
 
-/* Agent control channel — capture + dispatch tests for iteration 3.
+/* Agent control channel — capture + dispatch tests.
  *
  * Note: ParseCommand from src/debug/debug.cpp depends on curses being
  * initialized for most commands; that doesn't happen in -tests mode. So

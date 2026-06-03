@@ -103,11 +103,11 @@ def run(argv: list[str] | None = None) -> int:
             ip21, cs21 = struct.unpack("<HH", ivt21)
             print(f"IVT[21] = {cs21:04X}:{ip21:04X}", flush=True)
 
-            # Phase A: seg-only farcall.watch on IVT[8]'s segment. This
+            # Scenario A: seg-only farcall.watch on IVT[8]'s segment. This
             # exercises the CPU_Interrupt choke-point hook in the wrapper
             # at src/cpu/cpu.cpp:1213.
             agent.call("farcall.watch", target_seg=cs8)
-            print(f"\nPhase A: farcall.watch armed on seg=0x{cs8:04X}", flush=True)
+            print(f"\nScenario A: farcall.watch armed on seg=0x{cs8:04X}", flush=True)
 
             t_start = time.monotonic()
             kinds_a: dict = {}
@@ -128,10 +128,10 @@ def run(argv: list[str] | None = None) -> int:
             for s in samples_a:
                 print(f"  {s}")
 
-            # Phase B: cpu.watch_target on IVT[8] entry. Exercises the
+            # Scenario B: cpu.watch_target on IVT[8] entry. Exercises the
             # (seg,off)-matching NEAR-watch fire from the same hook.
             agent.call("cpu.watch_target", target_seg=cs8, target_off=ip8)
-            print(f"\nPhase B: cpu.watch_target armed on {cs8:04X}:{ip8:04X}", flush=True)
+            print(f"\nScenario B: cpu.watch_target armed on {cs8:04X}:{ip8:04X}", flush=True)
 
             t_start = time.monotonic()
             kinds_b: dict = {}

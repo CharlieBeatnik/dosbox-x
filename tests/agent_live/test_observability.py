@@ -1,32 +1,32 @@
 #!/usr/bin/env python3
-"""Live-fire test for the agent observability & trust commands (proposal 4.9).
+"""Live-fire test for the agent observability & trust commands.
 
 Companion to test_bps.py. Runs OBSTEST.COM inside a real DOSBox-X instance
 over the agent control channel and proves, end-to-end against a running
-guest, that the proposal-4.9 commands report the truth:
+guest, that the commands report the truth:
 
-  Phase 1 (4.9.1 + 4.9.2): arm cpu.probe on the phase-1 NOP loop body, run
+  Scenario 1: arm cpu.probe on the scenario-1 NOP loop body, run
      the loop (exactly LOOP_ITERS iterations), and assert debug.status shows
      the probe hit count == LOOP_ITERS — a full-speed, non-halting count.
      Then set a real BP at the same address, run, and assert it fires AND
      that debug.status reports that BP's own hit counter and live bytes_now.
      This is the C01E "fired or never reached?" disambiguation made concrete.
 
-  Phase 2 (4.9.6): cpu.disasm the known, never-executed instruction block at
+  Scenario 2: cpu.disasm the known, never-executed instruction block at
      landmark_disasm and check the decoded mnemonics, that every reported
      `bytes` field equals mem.read of the same address (the anti-fabrication
      guarantee), and that the walk lands exactly on disasm_end.
 
-  Phase 3 (4.9.3): arm cpu.trace_ring (CS-filtered), run the distinctive
+  Scenario 3: arm cpu.trace_ring (CS-filtered), run the distinctive
      straight-line chain, pause at a BP on landmark_trace_end, and assert
      cpu.traceback shows the chain in execution order, most-recent-last,
      ending at trace_end.
 
-  Phases 4-8 cover mem.watch (4.9.4 + VGA), multi-sentinel watches (4.9.5),
-  cpu.step/step_over (4.9.7), and state.save/restore (4.9.8).
+  Scenarios 4-8 cover mem.watch (VGA), multi-sentinel watches,
+  cpu.step/step_over, and state.save/restore.
 
-  Phase 9 (4.9.9): conditional / Nth-hit breakpoints with on-hit macros,
-     reusing the phase-1 loop (cx == iters+1-N at the Nth hit). 9a halts on the
+  Scenario 9: conditional / Nth-hit breakpoints with on-hit macros,
+     reusing the scenario-1 loop (cx == iters+1-N at the Nth hit). 9a halts on the
      Nth hit and captures a regs.get macro atomically at the trigger; 9b uses a
      register condition with continue=true to fire-and-resume, proving the
      hits-vs-fires distinction.
@@ -37,7 +37,7 @@ The landmark offsets are read from a fixed table in the guest at runtime
 Usage:
     python tests/agent_live/test_observability.py [--dosbox PATH] [--keep-tmp]
 
-Exit code 0 if every phase passes; 1 otherwise.
+Exit code 0 if every scenario passes; 1 otherwise.
 """
 
 from __future__ import annotations
@@ -184,11 +184,11 @@ class Reporter:
         return all(ok for _, ok, _ in self.results)
 
 
-# --- phases ---------------------------------------------------------------
+# --- scenarios ---------------------------------------------------------------
 
-def phase1_probe_and_counters(agent, cs, loopbody, iters, rep) -> None:
+def scenario1_probe_and_counters(agent, cs, loopbody, iters, rep) -> None:
     # 1a: probe counts every iteration at full speed, no halt.
-    name = f"phase1a: cpu.probe counts {iters} loop iterations (non-halting)"
+    name = f"scenario1a: cpu.probe counts {iters} loop iterations (non-halting)"
     try:
         _reset(agent)
         r = agent.call("cpu.probe", points=[f"{cs:04X}:{loopbody:04X}"])
@@ -219,7 +219,7 @@ def phase1_probe_and_counters(agent, cs, loopbody, iters, rep) -> None:
 
     # 1b: a real BP at the same address fires, and debug.status reports its
     # hit counter + live bytes_now (0x90 = NOP at loopbody).
-    name = "phase1b: BP hit counter + bytes_now in debug.status"
+    name = "scenario1b: BP hit counter + bytes_now in debug.status"
     try:
         _reset(agent)
         agent.debugger_command(f"BP {cs:04X}:{loopbody:04X}")
@@ -258,8 +258,8 @@ def phase1_probe_and_counters(agent, cs, loopbody, iters, rep) -> None:
             agent.cpu_run(); _drain_events(agent)
 
 
-def phase2_disasm(agent, cs, disasm, disasm_end, rep) -> None:
-    name = "phase2: cpu.disasm decodes the known instruction block"
+def scenario2_disasm(agent, cs, disasm, disasm_end, rep) -> None:
+    name = "scenario2: cpu.disasm decodes the known instruction block"
     # The fodder at landmark_disasm is, in source order:
     #   mov ax,1234h / add bx,ax / push bx / pop cx / nop / ret(n)
     # We don't hardcode exact encodings (assembler-dependent); we (a) require
@@ -311,8 +311,8 @@ def phase2_disasm(agent, cs, disasm, disasm_end, rep) -> None:
         rep.record(name, False, repr(exc))
 
 
-def phase3_traceback(agent, cs, trace_a, trace_end, rep) -> None:
-    name = "phase3: cpu.trace_ring + cpu.traceback show the chain in order"
+def scenario3_traceback(agent, cs, trace_a, trace_end, rep) -> None:
+    name = "scenario3: cpu.trace_ring + cpu.traceback show the chain in order"
     try:
         _reset(agent)
         agent.call("cpu.trace_ring", depth=128, seg=cs)
@@ -373,13 +373,13 @@ VGA_OFFSET = 0x0064
 VGA_VALUE = 0x005A
 
 
-def phase4_memwatch(agent, cs, watch_target, store, rep) -> None:
-    # 4.9.4: arm a write-intercept on the 2-byte field with a value predicate,
+def scenario4_memwatch(agent, cs, watch_target, store, rep) -> None:
+    # arm a write-intercept on the 2-byte field with a value predicate,
     # tap '4' to run the single known store, and assert the mem.write event
     # names the storing instruction (from_cs:from_ip == landmark_store) and
     # reports the exact old->new transition. The watch does NOT halt the CPU,
     # so the event arrives asynchronously on the stream.
-    name = "phase4: mem.watch names the stamp site + old/new value"
+    name = "scenario4: mem.watch names the stamp site + old/new value"
     try:
         _reset(agent)
         r = agent.call("mem.watch", seg=f"{cs:04X}",
@@ -433,8 +433,8 @@ def phase4_memwatch(agent, cs, watch_target, store, rep) -> None:
             agent.cpu_run(); _drain_events(agent)
 
 
-def phase5_vga_memwatch(agent, cs, vga_store, rep) -> None:
-    # 4.9.4 (VGA blind spot): the framebuffer used to be invisible to mem.watch
+def scenario5_vga_memwatch(agent, cs, vga_store, rep) -> None:
+    # VGA blind spot: the framebuffer used to be invisible to mem.watch
     # because reading it back to obtain the old value loads the VGA plane
     # latches. The hook now classifies the destination: side-effecting memory
     # (VGA/MMIO) is reported WITHOUT reading old (old==null) using only the
@@ -443,7 +443,7 @@ def phase5_vga_memwatch(agent, cs, vga_store, rep) -> None:
     # is filtered out), tap '5' to run the one known framebuffer store, and
     # assert the mem.write event names the storing instruction with
     # new==VGA_VALUE and old==None.
-    name = "phase5: mem.watch fires on VGA framebuffer write (old=null)"
+    name = "scenario5: mem.watch fires on VGA framebuffer write (old=null)"
     try:
         _reset(agent)
         r = agent.call("mem.watch", seg=f"{VGA_SEG:04X}",
@@ -495,14 +495,14 @@ def phase5_vga_memwatch(agent, cs, vga_store, rep) -> None:
             agent.cpu_run(); _drain_events(agent)
 
 
-def phase6_multi_sentinel(agent, cs, msa, msb, rep) -> None:
-    # 4.9.5: arm cpu.watch_target with a TWO-sentinel set (msa first, msb
+def scenario6_multi_sentinel(agent, cs, msa, msb, rep) -> None:
+    # arm cpu.watch_target with a TWO-sentinel set (msa first, msb
     # second). The guest makes two NEAR calls, msa then msb. Assert each
     # cpu.transfer event carries the right `which` (0 for msa, 1 for msb),
     # names the calling segment, and that debug.status shows one hit per
     # sentinel (and 2 total). The watch does not halt the CPU, so the two
     # events arrive asynchronously on the stream.
-    name = "phase6: multi-sentinel cpu.watch_target reports which + per-sentinel hits"
+    name = "scenario6: multi-sentinel cpu.watch_target reports which + per-sentinel hits"
     try:
         _reset(agent)
         r = agent.call("cpu.watch_target",
@@ -537,9 +537,9 @@ def phase6_multi_sentinel(agent, cs, msa, msb, rep) -> None:
                 problems.append(f"from_cs={ev.get('from_cs'):04X} expected {cs:04X}")
 
         # Per-sentinel hit counters in debug.status (non-event proof). The
-        # guest may run phase 6 more than once if the '6' key auto-repeats
+        # guest may run scenario 6 more than once if the '6' key auto-repeats
         # before the slow paste-pump releases it — a known harness timing
-        # quirk that phases 4/5 also tolerate (they use >=1 thresholds). What
+        # quirk that scenarios 4/5 also tolerate (they use >=1 thresholds). What
         # MUST hold regardless of pass count: each sentinel is counted
         # independently and *equally* (one call apiece per pass), and the
         # total is their sum.
@@ -583,13 +583,13 @@ def _off_of(cs_ip: str) -> int:
     return int(off_s, 16) & 0xFFFF if off_s else -1
 
 
-def phase7_step(agent, cs, trace_a, trace_end, call_at, call_ret, sub, rep) -> None:
+def scenario7_step(agent, cs, trace_a, trace_end, call_at, call_ret, sub, rep) -> None:
     # 7a: cpu.step is single-instruction granular and returns post-step regs +
-    # the instruction now at CS:IP. Walk the phase-3 straight-line chain
+    # the instruction now at CS:IP. Walk the scenario-3 straight-line chain
     #   mov ax,AAAA / mov bx,BBBB / mov dx,DDDD / xchg ax,bx / inc ax / dec bx
     # one instruction at a time, asserting each register transition and that
     # every step's `insn.bytes` equals mem.read of the reported address.
-    name = "phase7a: cpu.step single-steps with post-step regs + insn"
+    name = "scenario7a: cpu.step single-steps with post-step regs + insn"
     try:
         _reset(agent)
         agent.debugger_command(f"BP {cs:04X}:{trace_a:04X}")
@@ -651,7 +651,7 @@ def phase7_step(agent, cs, trace_a, trace_end, call_at, call_ret, sub, rep) -> N
     # (lands at landmark_sub) while cpu.step_over treats the call as one unit
     # (lands at landmark_call_ret). step_over of a CALL is the asynchronous,
     # deferred-reply path: agent.call() still returns the post-step {regs}.
-    name = "phase7b: cpu.step into vs cpu.step_over over a CALL"
+    name = "scenario7b: cpu.step into vs cpu.step_over over a CALL"
     try:
         problems = []
 
@@ -694,16 +694,16 @@ def phase7_step(agent, cs, trace_a, trace_end, call_at, call_ret, sub, rep) -> N
             agent.cpu_run(); _drain_events(agent)
 
 
-def phase8_savestate(agent, cs, trace_a, rep) -> None:
-    # 4.9.8: state.save / state.restore round-trip the whole machine. Pause at a
-    # known landmark (trace_a, the phase-3 chain head, where `mov ax,AAAA` has
+def scenario8_savestate(agent, cs, trace_a, rep) -> None:
+    # state.save / state.restore round-trip the whole machine. Pause at a
+    # known landmark (trace_a, the scenario-3 chain head, where `mov ax,AAAA` has
     # NOT yet executed), snapshot to a slot, single-step three instructions so
     # CS:IP advances and ax/bx/dx load AAAA/BBBB/DDDD, then restore and assert
     # the CPU snapped back to the EXACT saved registers and CS:IP. Both ends
     # require the CPU paused, which it already is at the BP. Breakpoints are a
     # debugger construct and are not part of the snapshot, so we delete the BP
     # before saving to keep the stepping unambiguous.
-    name = "phase8: state.save/state.restore round-trips full CPU state"
+    name = "scenario8: state.save/state.restore round-trips full CPU state"
     slot = 7   # high slot; avoids clobbering the user's slot 0/1
     try:
         _reset(agent)
@@ -796,9 +796,9 @@ def phase8_savestate(agent, cs, trace_a, rep) -> None:
             agent.cpu_run(); _drain_events(agent)
 
 
-def phase9_cond_bp(agent, cs, loopbody, iters, rep) -> None:
-    # 4.9.9: conditional / Nth-hit breakpoints with on-hit command macros.
-    # Reuses the phase-1 bounded loop (`mov cx,iters` / nop@loopbody / loop):
+def scenario9_cond_bp(agent, cs, loopbody, iters, rep) -> None:
+    # conditional / Nth-hit breakpoints with on-hit command macros.
+    # Reuses the scenario-1 bounded loop (`mov cx,iters` / nop@loopbody / loop):
     # at the Nth execution of loopbody, cx == iters + 1 - N (loop decrements cx
     # AFTER the nop). So a register condition and an Nth-hit condition pick the
     # SAME iteration, which lets the two sub-checks cross-validate.
@@ -809,7 +809,7 @@ def phase9_cond_bp(agent, cs, loopbody, iters, rep) -> None:
     # trigger instant. The macro's cx must equal expected_cx (taken before the
     # `loop` that decrements it), proving the snapshot is at the trigger, and
     # the bp.cond event must say hits==N and halted==true.
-    name = "phase9a: Nth-hit conditional BP halts with atomic on-hit macro"
+    name = "scenario9a: Nth-hit conditional BP halts with atomic on-hit macro"
     try:
         _reset(agent)
         r = agent.bp_set(f"{cs:04X}:{loopbody:04X}", if_=f"hits=={target_n}",
@@ -871,7 +871,7 @@ def phase9_cond_bp(agent, cs, loopbody, iters, rep) -> None:
     # iteration cx==expected_cx) WITHOUT halting — proving run-and-resume, and
     # the hits-vs-fires distinction: the BP is reached every iteration (hits ==
     # iters) but its condition holds exactly once (fires == 1).
-    name = "phase9b: continue=true conditional BP runs-and-resumes (hits vs fires)"
+    name = "scenario9b: continue=true conditional BP runs-and-resumes (hits vs fires)"
     try:
         _reset(agent)
         r = agent.bp_set(f"{cs:04X}:{loopbody:04X}", if_=f"cx=={expected_cx:#x}",
@@ -910,7 +910,7 @@ def phase9_cond_bp(agent, cs, loopbody, iters, rep) -> None:
 
         # debug.status (read while running) proves the hits-vs-fires distinction.
         # The '1' key may auto-repeat before the slow paste pump releases it, so
-        # the loop can run more than once (the same quirk phases 4/5/6 tolerate).
+        # the loop can run more than once (the same quirk scenarios 4/5/6 tolerate).
         # What MUST hold regardless of run count N: the BP fired once per run
         # (fires == N >= 1) yet was REACHED `iters` times per run, i.e.
         # hits == iters * fires. That equality is the whole point of the test.
@@ -938,15 +938,15 @@ def phase9_cond_bp(agent, cs, loopbody, iters, rep) -> None:
             agent.cpu_run(); _drain_events(agent)
 
 
-def phase10_regs_set_mem_write(agent, cs, scratch, rep) -> None:
+def scenario10_regs_set_mem_write(agent, cs, scratch, rep) -> None:
     # regs.set writes named registers (validated all-or-nothing, paused-only);
     # mem.write stores raw bytes (base64 on the wire) into guest memory. Both
     # are confirmed by reading back independently. `scratch` is a RAM word in
-    # OBSTEST's own segment (the phase-4 watch target), used here only as a safe
-    # writable location. No OBSTEST rebuild: this phase needs just a paused CPU
+    # OBSTEST's own segment (the scenario-4 watch target), used here only as a safe
+    # writable location. No OBSTEST rebuild: this scenario needs just a paused CPU
     # and a writable RAM address. Runs last; it restores the registers it
     # clobbered before resuming so the guest is left undisturbed.
-    name = "phase10: regs.set + mem.write round-trip"
+    name = "scenario10: regs.set + mem.write round-trip"
     saved = None
     try:
         _reset(agent)                       # leaves the CPU paused
@@ -1012,9 +1012,9 @@ def phase10_regs_set_mem_write(agent, cs, scratch, rep) -> None:
             agent.cpu_run(); _drain_events(agent)
 
 
-def phase11_typed_breakpoints(agent, cs, loopbody, trace_a, rep) -> None:
+def scenario11_typed_breakpoints(agent, cs, loopbody, trace_a, rep) -> None:
     # bp.add / bp.list / bp.del — typed real breakpoints with STABLE handles.
-    # Reuses the phase-1 loopbody and the phase-3 trace_a landmarks (no OBSTEST
+    # Reuses the scenario-1 loopbody and the scenario-3 trace_a landmarks (no OBSTEST
     # rebuild). Two halves: (a) the handle stays valid as other breakpoints are
     # added/removed, and the iteration index does not; (b) the live bp.hit event
     # carries the same bp_id bp.add returned, so a hit correlates to the handle
@@ -1022,7 +1022,7 @@ def phase11_typed_breakpoints(agent, cs, loopbody, trace_a, rep) -> None:
 
     # 11a: add three (two exec + one int), list, delete the MIDDLE one by id,
     # and confirm the survivors keep their ids while their indices shift.
-    name = "phase11a: bp.add/list/del stable handle survives reorder"
+    name = "scenario11a: bp.add/list/del stable handle survives reorder"
     try:
         _reset(agent)                        # paused, clean BP list
         agent.bp_del(all=True)
@@ -1089,14 +1089,14 @@ def phase11_typed_breakpoints(agent, cs, loopbody, trace_a, rep) -> None:
             agent.cpu_run(); _drain_events(agent)
 
     # 11b: the live bp.hit event carries the bp_id bp.add returned.
-    name = "phase11b: bp.hit event carries the stable bp_id from bp.add"
+    name = "scenario11b: bp.hit event carries the stable bp_id from bp.add"
     try:
         _reset(agent)
         added = agent.bp_add(f"{cs:04X}:{loopbody:04X}")
         want_id = added["bp_id"]
         agent.cpu_run(); _drain_events(agent)
-        # Tap '1' to run the phase-1 loop and trip the BP. The '1' keytap can be
-        # dropped against the slow paste pump (the same harness quirk phases
+        # Tap '1' to run the scenario-1 loop and trip the BP. The '1' keytap can be
+        # dropped against the slow paste pump (the same harness quirk scenarios
         # 4/5/6 tolerate), so re-tap until the bp.hit arrives. Once it fires the
         # CPU is paused and we stop; any buffered extra '1' is harmless.
         ev = None
@@ -1170,7 +1170,7 @@ def run(argv=None) -> int:
             print(f"connected: version={ver['version']} build={ver['build']}", flush=True)
             if ver["build"] != "heavy-debug":
                 print("WARNING: probe/trace need a heavy-debug build; this is "
-                      f"{ver['build']!r}. Phases 1a/3 will likely fail.", flush=True)
+                      f"{ver['build']!r}. Scenarios 1a/3 will likely fail.", flush=True)
 
             cs = _read_signature(agent)
             print(f"OBSTEST.COM CS=0x{cs:04X}", flush=True)
@@ -1185,25 +1185,23 @@ def run(argv=None) -> int:
                   f"msa={msa:04X} msb={msb:04X} "
                   f"call={call_at:04X} call_ret={call_ret:04X} sub={sub:04X}", flush=True)
 
-            phase1_probe_and_counters(agent, cs, loopbody, iters, rep)
-            phase2_disasm(agent, cs, disasm, disasm_end, rep)
-            phase3_traceback(agent, cs, trace_a, trace_end, rep)
-            phase4_memwatch(agent, cs, watch_target, store, rep)
-            phase5_vga_memwatch(agent, cs, vga_store, rep)
-            phase6_multi_sentinel(agent, cs, msa, msb, rep)
-            phase7_step(agent, cs, trace_a, trace_end, call_at, call_ret, sub, rep)
-            # Natural proposal order: 4.9.8 (phase 8) then 4.9.9 (phase 9).
-            # phase 8 now resumes a healthy VM after restore (the restore->run
-            # tick-handler crash is fixed; see HANDOFF.md), and phase 9 running
-            # after it on the same instance proves the 4.9.8+4.9.9 "restore then
-            # arm a conditional BP" pairing end-to-end.
-            phase8_savestate(agent, cs, trace_a, rep)
-            phase9_cond_bp(agent, cs, loopbody, iters, rep)
-            # Phase-2 mutation surface (regs.set + mem.write); restores the
+            scenario1_probe_and_counters(agent, cs, loopbody, iters, rep)
+            scenario2_disasm(agent, cs, disasm, disasm_end, rep)
+            scenario3_traceback(agent, cs, trace_a, trace_end, rep)
+            scenario4_memwatch(agent, cs, watch_target, store, rep)
+            scenario5_vga_memwatch(agent, cs, vga_store, rep)
+            scenario6_multi_sentinel(agent, cs, msa, msb, rep)
+            scenario7_step(agent, cs, trace_a, trace_end, call_at, call_ret, sub, rep)
+            # state.save/restore (scenario 8) resumes a healthy VM after restore,
+            # then the conditional BPs (scenario 9) run on the same instance so the
+            # "restore then arm a conditional BP" pairing is exercised end-to-end.
+            scenario8_savestate(agent, cs, trace_a, rep)
+            scenario9_cond_bp(agent, cs, loopbody, iters, rep)
+            # Mutation surface (regs.set + mem.write); restores the
             # registers it touches before the final resume.
-            phase10_regs_set_mem_write(agent, cs, watch_target, rep)
+            scenario10_regs_set_mem_write(agent, cs, watch_target, rep)
             # Typed real breakpoints with stable handles (bp.add/list/del).
-            phase11_typed_breakpoints(agent, cs, loopbody, trace_a, rep)
+            scenario11_typed_breakpoints(agent, cs, loopbody, trace_a, rep)
 
             with contextlib.suppress(Exception):
                 _reset(agent)
@@ -1225,7 +1223,7 @@ def run(argv=None) -> int:
             print(f"(kept tmp dir: {tmp})", flush=True)
 
     print("---")
-    print(f"{sum(1 for _, ok, _ in rep.results if ok)}/{len(rep.results)} phases passed")
+    print(f"{sum(1 for _, ok, _ in rep.results if ok)}/{len(rep.results)} scenarios passed")
     return 0 if rep.all_passed else 1
 
 

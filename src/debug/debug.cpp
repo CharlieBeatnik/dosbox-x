@@ -582,9 +582,9 @@ public:
 	uint16_t					GetValue		(void)						{ return ahValue; };
 	uint16_t					GetOther		(void)						{ return alValue; };
 
-	// Monotonic hit counter (agent proposal 4.9.1). Incremented every time
-	// this breakpoint matches in CheckBreakpoint / CheckIntBreakpoint, even
-	// when the match does not halt the CPU. Readable via debug.status.
+	// Monotonic hit counter for the agent control channel. Incremented every
+	// time this breakpoint matches in CheckBreakpoint / CheckIntBreakpoint,
+	// even when the match does not halt the CPU. Readable via debug.status.
 	uint64_t				GetHits			(void)						{ return hits; };
 	void					BumpHits		(void)						{ hits++; };
 
@@ -631,7 +631,7 @@ private:
 	// Shared
 	bool		active;
 	bool		once;
-	uint64_t	hits = 0;	// agent proposal 4.9.1 — see GetHits/BumpHits
+	uint64_t	hits = 0;	// agent hit counter — see GetHits/BumpHits
 	uint32_t	bpId;		// agent bp.add/list/del — stable handle (see GetBpId)
 
 	static std::list<CBreakpoint*>	BPoints;
@@ -639,7 +639,7 @@ private:
 #if C_HEAVY_DEBUG
 	friend bool DEBUG_HeavyIsBreakpoint(void);
 #endif
-	// agent 4.9.1 — read-only iteration over BPoints for debug.status
+	// agent — read-only iteration over BPoints for debug.status
 	friend void DEBUG_AgentForEachBreakpoint(
 		void (*cb)(void *ctx, const AgentBreakpointInfo *info), void *ctx);
 };
@@ -772,7 +772,7 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
 
 		if ((bp->GetType() == BKPNT_PHYSICAL) && bp->IsActive() &&
 		    (bp->GetLocation() == GetAddress(seg, off))) {
-			bp->BumpHits();		// agent 4.9.1
+			bp->BumpHits();		// agent hit counter
 			/* Pass the previous instruction's CS:IP so consumers can attribute
 			 * the transfer source even when the source opcode isn't hooked.
 			 * bp_id is the stable handle bp.add/list/del use. */
@@ -821,7 +821,7 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
                         return false;
                     }
 					DEBUG_ShowMsg("DEBUG: Memory breakpoint %s: %04X:%04X - %02X -> %02X\n",(bp->GetType()==BKPNT_MEMORY_PROT)?"(Prot)":"",bp->GetSegment(),bp->GetOffset(),bp->GetValue(),value);
-					bp->BumpHits();		// agent 4.9.1
+					bp->BumpHits();		// agent hit counter
 					AGENT_EmitBpHit(seg, off, bp_index, bp->GetBpId(),
 					                DEBUG_GetPrevCS(), DEBUG_GetPrevIP());
 					bp->SetValue(value);
@@ -849,7 +849,7 @@ bool CBreakpoint::CheckIntBreakpoint(PhysPt adr, uint8_t intNr, uint16_t ahValue
 		CBreakpoint* bp = (*i);
 		if ((bp->GetType()==BKPNT_INTERRUPT) && bp->IsActive() && (bp->GetIntNr()==intNr)) {
 			if (((bp->GetValue()==BPINT_ALL) || (bp->GetValue()==ahValue)) && ((bp->GetOther()==BPINT_ALL) || (bp->GetOther()==alValue))) {
-				bp->BumpHits();		// agent 4.9.1
+				bp->BumpHits();		// agent hit counter
 				AGENT_EmitBpHit(SegValue(cs), reg_eip, bp_index, bp->GetBpId(),
 				                DEBUG_GetPrevCS(), DEBUG_GetPrevIP());
 				// Ignore it once ?
@@ -867,7 +867,7 @@ bool CBreakpoint::CheckIntBreakpoint(PhysPt adr, uint8_t intNr, uint16_t ahValue
 	return false;
 }
 
-/* ---- Agent observability bridge (proposal 4.9) ------------------------- */
+/* ---- Agent observability bridge ---------------------------------------- */
 
 void DEBUG_AgentForEachBreakpoint(
 	void (*cb)(void *ctx, const AgentBreakpointInfo *info), void *ctx)
@@ -903,7 +903,7 @@ void DEBUG_AgentForEachBreakpoint(
  * existing CBreakpoint statics so the agent never needs the file-local
  * BPINT_ALL / CBreakpoint internals, and return the new breakpoint's stable
  * id. AddBreakpoint / AddIntBreakpoint Activate() immediately, so a breakpoint
- * added while the CPU runs fires without a subsequent RUN (same as fix 4.1). */
+ * added while the CPU runs fires without a subsequent RUN. */
 uint32_t DEBUG_AgentAddExecBreakpoint(uint16_t seg, uint32_t off)
 {
 	CBreakpoint *bp = CBreakpoint::AddBreakpoint(seg, off, false);
@@ -4468,7 +4468,7 @@ int32_t DEBUG_Run(int32_t amount,bool quickexit) {
 	return ret;
 }
 
-/* ---- Agent single-step bridge (proposal 4.9.7) --------------------------
+/* ---- Agent single-step bridge -------------------------------------------
  * Drives the same machinery the curses F11 (trace into) and F10 (step over)
  * keys use, but from the agent dispatch instead of a keypress. Called while
  * the CPU is paused in DEBUG_Loop (the agent dispatch runs from AGENT_Poll,
@@ -5871,7 +5871,7 @@ Bitu DEBUG_EnableDebugger(void)
 	if (wasRunning && debugging && !debug_running) {
 		AGENT_EmitDebuggerEntered("breakpoint");
 		AGENT_EmitStatePaused();
-		/* If a cpu.step_over (proposal 4.9.7) is awaiting the temp-BP pause,
+		/* If a cpu.step_over is awaiting the temp-BP pause,
 		 * send its deferred reply now that the post-step state is settled. */
 		AGENT_OnDebuggerPaused();
 	}
@@ -6318,7 +6318,7 @@ bool DEBUG_HeavyIsBreakpoint(void) {
 	g_dbg_prev_cs = cur_cs;
 	g_dbg_prev_ip = cur_ip;
 
-	/* Agent execution probe (4.9.2) and trace ring (4.9.3). Each is gated on
+	/* Agent execution probe and trace ring. Each is gated on
 	 * a fast bool so a disarmed observer costs only that load. Recorded for
 	 * every executed instruction, before any early-return below. */
 	if (AGENT_ProbeActive()) AGENT_ProbeCheck(cur_cs, cur_ip);
@@ -6363,7 +6363,7 @@ bool DEBUG_HeavyIsBreakpoint(void) {
 	if (prev_cs != cur_cs || prev_ip != cur_ip) {
 		if (AGENT_TargetWatchMatches(cur_cs, cur_ip))
 			AGENT_EmitTransfer("hbp_exec", cur_cs, cur_ip, prev_cs, prev_ip);
-		/* Range-entry fallback (proposal 4.8): same gate as the target
+		/* Range-entry fallback: same gate as the target
 		 * watch, but the range predicate's "from outside" guard
 		 * automatically suppresses intra-range steps so the slide
 		 * inside the watched window doesn't flood. */
@@ -6371,7 +6371,7 @@ bool DEBUG_HeavyIsBreakpoint(void) {
 			AGENT_EmitRangeEnter("hbp_exec", cur_cs, cur_ip, prev_cs, prev_ip);
 	}
 
-	/* Conditional / Nth-hit breakpoints with on-hit macros (proposal 4.9.9).
+	/* Conditional / Nth-hit breakpoints with on-hit macros.
 	 * Same per-instruction slot the probe/trace hooks use. When a conditional
 	 * BP's predicate holds, AGENT_CondBpCheck runs its macro + emits bp.cond
 	 * here (atomically, before this instruction retires); it returns true only

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live-fire test for the screen.capture agent command (proposal 4.7).
+"""Live-fire test for the screen.capture agent command.
 
 Boots DOSBox-X with a captures directory configured, waits for the DOS
 prompt to land, calls screen.capture (raw and cooked), and verifies:
@@ -137,8 +137,8 @@ def run(argv: list[str] | None = None) -> int:
             # / WriteRawImage).
             time.sleep(2.0)
 
-            # ---- Phase A: raw capture (default) -----------------------
-            print("\nPhase A: screen.capture {raw: true} (default)", flush=True)
+            # ---- Scenario A: raw capture (default) -----------------------
+            print("\nScenario A: screen.capture {raw: true} (default)", flush=True)
             t0 = time.monotonic()
             res = agent.call("screen.capture", timeout=10.0, raw=True)
             dt = time.monotonic() - t0
@@ -160,8 +160,8 @@ def run(argv: list[str] | None = None) -> int:
             else:
                 print(f"  screen.captured event: {ev}", flush=True)
 
-            # ---- Phase B: cooked capture ------------------------------
-            print("\nPhase B: screen.capture {raw: false}", flush=True)
+            # ---- Scenario B: cooked capture ------------------------------
+            print("\nScenario B: screen.capture {raw: false}", flush=True)
             t0 = time.monotonic()
             res = agent.call("screen.capture", timeout=10.0, raw=False)
             dt = time.monotonic() - t0
@@ -181,10 +181,10 @@ def run(argv: list[str] | None = None) -> int:
                 print("  FAIL: raw and cooked paths are the same", flush=True)
                 ok = False
 
-            # ---- Phase C: raw on paused CPU should time out cleanly ----
+            # ---- Scenario C: raw on paused CPU should time out cleanly ----
             # Pausing the CPU stops VGA scanline rendering — the exact
-            # failure mode the X2RE agent reports for static screens.
-            print("\nPhase C: raw capture while CPU paused -> expect timeout", flush=True)
+            # failure mode the agent reports for static screens.
+            print("\nScenario C: raw capture while CPU paused -> expect timeout", flush=True)
             from dbxagent import AgentError  # noqa: E402
             agent.cpu_pause()
             # Drain debugger.entered / state.paused events.

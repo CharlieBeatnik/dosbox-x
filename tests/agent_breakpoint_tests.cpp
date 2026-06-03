@@ -16,10 +16,10 @@
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
  */
 
-/* Regression test for fix 4.1 ("BPs added via the agent activate
- * immediately").
+/* Regression test for immediate breakpoint activation ("BPs added via the
+ * agent activate immediately").
  *
- * The bug we are pinning down: prior to fix 4.1, CBreakpoint::AddBreakpoint
+ * The bug we are pinning down: previously, CBreakpoint::AddBreakpoint
  * /AddInt/AddMem returned a breakpoint with `active=false`. The breakpoint
  * was only flipped active by CBreakpoint::ActivateBreakpoints(), which the
  * curses path triggers from F5/RUN. Agents that add a BP while the CPU is
@@ -72,11 +72,11 @@ TEST_F(AgentBreakpointTest, AddBpViaDispatchActivatesImmediately)
 
     EXPECT_TRUE(DEBUG_Breakpoint())
         << "BP added via debugger.command must fire on CheckBreakpoint match — "
-           "regression of fix 4.1 (agent BPs activated only after RUN)";
+           "regression of immediate BP activation (agent BPs activated only after RUN)";
 }
 
 /* Twice-add to the same address: prior behaviour was that the second
- * AddBreakpoint also started inactive. After fix 4.1 both are active; the
+ * AddBreakpoint also started inactive. Both are now active; the
  * Activate() implementation's heavy-debug path is just a flag set, so the
  * idempotence is trivial. Sanity-check via DEBUG_Breakpoint. */
 TEST_F(AgentBreakpointTest, DuplicateAddStillActive)
@@ -147,7 +147,7 @@ TEST_F(AgentBpTypedTest, AddExecReturnsStableIdAndFires)
     EXPECT_EQ(uint16_t(r->get("seg")->n), 0x1000u);
     EXPECT_EQ(uint16_t(r->get("off")->n), 0x0100u);
 
-    /* The real breakpoint must be live (fix 4.1) — CheckBreakpoint sees it. */
+    /* The real breakpoint must be live — CheckBreakpoint sees it. */
     EXPECT_TRUE(DEBUG_Breakpoint());
 }
 

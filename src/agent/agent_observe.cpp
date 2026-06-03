@@ -16,17 +16,17 @@
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
  */
 
-/* Agent control channel — observability & trust commands (proposal 4.9).
+/* Agent control channel — observability & trust commands.
  *
- *   debug.status     (4.9.1) typed snapshot: cpu state, instr_count, every
+ *   debug.status     typed snapshot: cpu state, instr_count, every
  *                    breakpoint with its live hit counter + bytes_now, every
  *                    watch with its hit counter, the probe table, trace ring.
- *   cpu.probe        (4.9.2) non-halting execution counter — arm a set of
+ *   cpu.probe        non-halting execution counter — arm a set of
  *                    (seg:off) points; each maintains a hit count visible in
  *                    debug.status, with no per-hit event and no CPU halt.
- *   cpu.trace_ring   (4.9.3) configure a fixed ring of retired instructions.
- *   cpu.traceback    (4.9.3) dump the last N retired instructions, disassembled.
- *   cpu.disasm       (4.9.6) structured disassembly via the in-tree DasmI386.
+ *   cpu.trace_ring   configure a fixed ring of retired instructions.
+ *   cpu.traceback    dump the last N retired instructions, disassembled.
+ *   cpu.disasm       structured disassembly via the in-tree DasmI386.
  *
  * The probe and trace ring are checked once per instruction from the heavy-
  * debug per-instruction hook (DEBUG_HeavyIsBreakpoint); each is gated on a
@@ -59,13 +59,13 @@ namespace agent {
 
 namespace {
 
-/* ---- Execution probe state (4.9.2) ----------------------------------- */
+/* ---- Execution probe state ------------------------------------------- */
 struct ProbePoint { uint16_t seg; uint16_t off; uint64_t hits; };
 static std::vector<ProbePoint> g_probes;
 static bool                    g_probeActive = false;
 const size_t                   PROBE_MAX_POINTS = 256;
 
-/* ---- Instruction-trace ring (4.9.3) ---------------------------------- */
+/* ---- Instruction-trace ring ------------------------------------------ */
 struct TraceEntry { uint16_t seg; uint16_t off; };
 static std::vector<TraceEntry> g_traceRing;      /* capacity == ring size  */
 static size_t                  g_traceHead  = 0;  /* next slot to write     */
@@ -76,7 +76,7 @@ static uint16_t                g_traceSeg = 0;
 const uint32_t                 TRACE_MAX_DEPTH = 4096;
 const uint32_t                 TRACE_DEFAULT_DEPTH = 256;
 
-/* ---- mem.watch write-intercept state (4.9.4) ------------------------- */
+/* ---- mem.watch write-intercept state --------------------------------- */
 /* The armed flag itself is the global AGENT_memWatchArmed (defined at the
  * bottom of this file) so the paging.h write hook can read it without going
  * through the agent namespace. Everything else is file-scope here. The
@@ -164,7 +164,7 @@ bool parseU32Any(const JsonValue &v, uint32_t &out) {
     return false;
 }
 
-/* ---- mem.watch helpers (4.9.4) --------------------------------------- */
+/* ---- mem.watch helpers ----------------------------------------------- */
 
 void memWatchClear() {
     AGENT_memWatchArmed = false;
@@ -321,7 +321,7 @@ JsonValue watchObj(bool armed, uint64_t hits) {
 
 }  /* anonymous namespace */
 
-/* ---- debug.status (4.9.1) -------------------------------------------- */
+/* ---- debug.status ---------------------------------------------------- */
 
 JsonValue handleDebugStatus(double id, const JsonValue & /*args*/) {
     JsonObject r;
@@ -341,7 +341,7 @@ JsonValue handleDebugStatus(double id, const JsonValue & /*args*/) {
     DEBUG_AgentForEachBreakpoint(&bpCollector, &bps);
     r.emplace("breakpoints", JsonValue::makeArray(std::move(bps)));
 
-    /* Watches. Each watch is a *set* of sentinels (proposal 4.9.5). `hits` is
+    /* Watches. Each watch is a *set* of sentinels. `hits` is
      * the total across the set; `sentinels[]` carries the per-sentinel count
      * (the `which` index in emitted events is the position in this array). For
      * back-compat the single-sentinel case also exposes the first sentinel's
@@ -410,7 +410,7 @@ JsonValue handleDebugStatus(double id, const JsonValue & /*args*/) {
         w.emplace("range", JsonValue::makeObject(std::move(rg)));
     }
     {
-        /* mem.watch (4.9.4): the write-intercept watch. size=0 means "any
+        /* mem.watch: the write-intercept watch. size=0 means "any
          * access width"; predicate is a short human-readable description. */
         JsonObject m;
         m.emplace("armed", JsonValue::makeBool(AGENT_memWatchArmed));
@@ -426,7 +426,7 @@ JsonValue handleDebugStatus(double id, const JsonValue & /*args*/) {
     }
     r.emplace("watches", JsonValue::makeObject(std::move(w)));
 
-    /* Probe table (4.9.2). */
+    /* Probe table. */
     JsonArray pr;
     for (const ProbePoint &p : g_probes) {
         JsonObject o;
@@ -440,7 +440,7 @@ JsonValue handleDebugStatus(double id, const JsonValue & /*args*/) {
     }
     r.emplace("probe", JsonValue::makeArray(std::move(pr)));
 
-    /* Trace ring (4.9.3). */
+    /* Trace ring. */
     {
         JsonObject t;
         t.emplace("enabled", JsonValue::makeBool(g_traceActive));
@@ -451,11 +451,11 @@ JsonValue handleDebugStatus(double id, const JsonValue & /*args*/) {
         r.emplace("trace", JsonValue::makeObject(std::move(t)));
     }
 
-    /* Conditional / Nth-hit breakpoints (4.9.9). Each carries the reach
+    /* Conditional / Nth-hit breakpoints. Each carries the reach
      * counter `hits` (the value the `hits` operand sees) and `fires` (the
      * subset where the condition held and the macro ran) so an agent can tell
      * "reached but never matched" from "matched N times" without consuming the
-     * bp.cond event stream — the 4.9.1 "fired or not?" principle applied to
+     * bp.cond event stream — the "fired or not?" principle applied to
      * conditional BPs too. */
     {
         JsonArray cbs;
@@ -481,7 +481,7 @@ JsonValue handleDebugStatus(double id, const JsonValue & /*args*/) {
     return makeReplyOk(id, std::move(r));
 }
 
-/* ---- cpu.probe (4.9.2) ----------------------------------------------- */
+/* ---- cpu.probe ------------------------------------------------------- */
 
 JsonValue handleCpuProbe(double id, const JsonValue &args) {
     const JsonValue *pts = args.get("points");
@@ -517,7 +517,7 @@ JsonValue handleCpuProbe(double id, const JsonValue &args) {
     return makeReplyOk(id, std::move(r));
 }
 
-/* ---- cpu.trace_ring (4.9.3) ------------------------------------------ */
+/* ---- cpu.trace_ring -------------------------------------------------- */
 
 JsonValue handleCpuTraceRing(double id, const JsonValue &args) {
     /* enabled defaults to true (the common "arm it" call); enabled=false
@@ -572,7 +572,7 @@ JsonValue handleCpuTraceRing(double id, const JsonValue &args) {
     return makeReplyOk(id, std::move(r));
 }
 
-/* ---- cpu.traceback (4.9.3) ------------------------------------------- */
+/* ---- cpu.traceback --------------------------------------------------- */
 
 JsonValue handleCpuTraceback(double id, const JsonValue &args) {
     size_t want = g_traceCount;
@@ -612,7 +612,7 @@ JsonValue handleCpuTraceback(double id, const JsonValue &args) {
     return makeReplyOk(id, std::move(r));
 }
 
-/* ---- cpu.disasm (4.9.6) ---------------------------------------------- */
+/* ---- cpu.disasm ------------------------------------------------------ */
 
 JsonValue handleCpuDisasm(double id, const JsonValue &args) {
     const JsonValue *vaddr = args.get("addr");
@@ -656,7 +656,7 @@ JsonValue handleCpuDisasm(double id, const JsonValue &args) {
     return makeReplyOk(id, std::move(r));
 }
 
-/* ---- mem.watch (4.9.4) ----------------------------------------------- */
+/* ---- mem.watch ------------------------------------------------------- */
 
 JsonValue handleMemWatch(double id, const JsonValue &args) {
     const JsonValue *seg = args.get("seg");
@@ -814,7 +814,7 @@ void AGENT_TraceRecord(uint16_t seg, uint16_t off) {
     if (agent::g_traceCount < agent::g_traceRing.size()) agent::g_traceCount++;
 }
 
-/* ---- mem.watch hot-path hook (4.9.4) --------------------------------- */
+/* ---- mem.watch hot-path hook ----------------------------------------- */
 
 /* The fast gate read by mem_write{b,w,d}_inline (paging.h). Global scope so
  * that very hot path needn't reach into the agent namespace. */
@@ -883,7 +883,7 @@ bool AGENT_MemWatchMatchNoOld(uint32_t lin_addr, uint32_t newval, int size) {
  * are NOT read back — a VGA read loads the plane latches, which would corrupt a
  * latched copy the guest's next instruction relies on — so for those old is
  * left unknown (reported null) and only the new-value predicate is evaluated.
- * This is what extends mem.watch to the VGA framebuffer (proposal 4.9.4)
+ * This is what extends mem.watch to the VGA framebuffer
  * without disturbing emulation. */
 void AGENT_MemWatchNote(uint32_t lin_addr, uint32_t newval, int size) {
     /* Cheap range/size pre-filter before touching anything. */

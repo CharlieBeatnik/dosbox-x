@@ -439,7 +439,7 @@ static INLINE PhysPt64 PAGING_GetPhysicalAddress64(const LinearPt linAddr) {
 /* Special inlined memory reading/writing */
 
 #if C_DEBUG
-/* Agent mem.watch write-intercept hook (proposal 4.9.4) — definition in
+/* Agent mem.watch write-intercept hook — definition in
  * src/agent/agent_observe.cpp. Declared locally so paging.h, which is
  * included almost everywhere, needn't pull in the whole agent header.
  * AGENT_memWatchArmed is the fast gate: a disarmed watch costs one bool

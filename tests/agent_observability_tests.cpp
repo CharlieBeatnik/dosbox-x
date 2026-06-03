@@ -16,20 +16,20 @@
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
  */
 
-/* Agent control channel — observability & trust tests (proposal 4.9).
+/* Agent control channel — observability & trust tests.
  *
  * What is and isn't covered here, and why:
  *
- *  - The probe (4.9.2) and trace ring (4.9.3) are pure agent-side state with
+ *  - The probe and trace ring are pure agent-side state with
  *    hot-path hooks (AGENT_ProbeCheck / AGENT_TraceRecord) that touch no
  *    guest memory. So we can drive them directly the way the CPU core would,
  *    then read the result back through debug.status — a genuine end-to-end
  *    check of the counter/ring logic without a running guest.
  *
- *  - The watch hit counters (4.9.1) live on AGENT_*WatchMatches, also pure
+ *  - The watch hit counters live on AGENT_*WatchMatches, also pure
  *    agent state, so they too are exercised directly.
  *
- *  - cpu.disasm (4.9.6) and a non-empty cpu.traceback dump call
+ *  - cpu.disasm and a non-empty cpu.traceback dump call
  *    DEBUG_AgentDisasmOne -> DasmI386, which reads guest memory via MemBase.
  *    In -tests mode the memory subsystem is not initialised (MemBase==NULL),
  *    exactly as documented in agent_cpu_tests.cpp, so here we only exercise
@@ -70,8 +70,8 @@ public:
         dispatchLine("{\"id\":99,\"cmd\":\"cpu.trace_ring\",\"args\":{\"depth\":256}}");
         dispatchLine("{\"id\":99,\"cmd\":\"cpu.trace_ring\",\"args\":{\"enabled\":false}}");
         dispatchLine("{\"id\":99,\"cmd\":\"mem.unwatch\"}");
-        dispatchLine("{\"id\":99,\"cmd\":\"bp.clear\"}");   /* 4.9.9 cond BPs */
-        g_stepOverPending = false;   /* no cpu.step_over (4.9.7) in flight */
+        dispatchLine("{\"id\":99,\"cmd\":\"bp.clear\"}");   /* conditional BPs */
+        g_stepOverPending = false;   /* no cpu.step_over in flight */
         /* Clear the BP list so debug.status never reads bytes_now (no MemBase). */
         dispatchLine("{\"id\":99,\"cmd\":\"debugger.command\",\"args\":{\"text\":\"BPDEL 0 *\"}}");
     }
@@ -97,7 +97,7 @@ public:
     }
 };
 
-/* ---- debug.status reply shape (4.9.1) -------------------------------- */
+/* ---- debug.status reply shape -------------------------------- */
 
 TEST_F(AgentObservabilityTest, StatusHasAllTopLevelFields)
 {
@@ -129,7 +129,7 @@ TEST_F(AgentObservabilityTest, StatusReportsCsIpFromRegisters)
     EXPECT_EQ(uint32_t(v.get("result")->get("eip")->n), 0x99E2u);
 }
 
-/* ---- watch hit counters (4.9.1) ------------------------------------- */
+/* ---- watch hit counters ------------------------------------- */
 
 TEST_F(AgentObservabilityTest, TargetWatchHitsCountAndSurfaceInStatus)
 {
@@ -193,7 +193,7 @@ TEST_F(AgentObservabilityTest, ClearResetsHitCounter)
     EXPECT_EQ(uint64_t(t->get("hits")->n), 0u);
 }
 
-/* ---- multi-sentinel watches (4.9.5) ---------------------------------- */
+/* ---- multi-sentinel watches ---------------------------------- */
 
 /* Arming a set of NEAR targets; the matcher reports *which* sentinel fired
  * (g_targetWatchWhich — the value the cpu.transfer emitter stamps) and bumps
@@ -309,7 +309,7 @@ TEST_F(AgentObservabilityTest, MultiRangeWatchWhichAndPerSentinelHits)
 }
 
 /* The single-sentinel scalar form still works and is reported as a
- * one-element set (back-compat with pre-4.9.5 callers). */
+ * one-element set (back-compat with the original single-sentinel callers). */
 TEST_F(AgentObservabilityTest, ScalarFormIsAOneElementSet)
 {
     dispatchLine("{\"id\":1,\"cmd\":\"farcall.watch\",\"args\":{\"target_seg\":\"483C\"}}");
@@ -322,7 +322,7 @@ TEST_F(AgentObservabilityTest, ScalarFormIsAOneElementSet)
     EXPECT_EQ(f->get("sentinels")->a->size(), 1u);
 }
 
-/* ---- cpu.probe (4.9.2) ----------------------------------------------- */
+/* ---- cpu.probe ----------------------------------------------- */
 
 TEST_F(AgentObservabilityTest, ProbeArmsAndDisarms)
 {
@@ -389,7 +389,7 @@ TEST_F(AgentObservabilityTest, ProbeRejectsMalformedPoint)
     EXPECT_FALSE(AGENT_ProbeActive());
 }
 
-/* ---- cpu.trace_ring + cpu.traceback (4.9.3) -------------------------- */
+/* ---- cpu.trace_ring + cpu.traceback -------------------------- */
 
 TEST_F(AgentObservabilityTest, TraceRingArmsWithDepthAndDisarmsKeepingContents)
 {
@@ -477,7 +477,7 @@ TEST_F(AgentObservabilityTest, TraceRingRejectsBadDepth)
     EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
 }
 
-/* ---- cpu.disasm argument validation (4.9.6) -------------------------- */
+/* ---- cpu.disasm argument validation -------------------------- */
 /* (Real decode needs MemBase; covered by the live test.) */
 
 TEST_F(AgentObservabilityTest, DisasmRejectsMissingAddr)
@@ -503,7 +503,7 @@ TEST_F(AgentObservabilityTest, DisasmRejectsBadCount)
     EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
 }
 
-/* ---- mem.watch (4.9.4) ----------------------------------------------- */
+/* ---- mem.watch ----------------------------------------------- */
 /* The hot-path hook AGENT_MemWatchNote reads guest memory (old value) and
  * emits an event, so the end-to-end path (counter bump, mem.write event,
  * from_cs/ip attribution) is covered by the live test. Here we drive the
@@ -665,7 +665,7 @@ TEST_F(AgentObservabilityTest, MemWatchRejectsEmptyPredicate)
     EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
 }
 
-/* ---- mem.watch on side-effecting memory (4.9.4 VGA) ------------------ */
+/* ---- mem.watch on side-effecting memory (VGA) ------------------ */
 /* When the write destination cannot be read back without side effects (the
  * VGA framebuffer loads its plane latches on read), AGENT_MemWatchNote skips
  * the old-value read and evaluates AGENT_MemWatchMatchNoOld instead. That pure
@@ -727,14 +727,14 @@ TEST_F(AgentObservabilityTest, MemWatchMatchNoOldFalseWhenDisarmed)
     EXPECT_FALSE(AGENT_MemWatchMatchNoOld(0xA0010, 0x5A, 1));
 }
 
-/* ---- cpu.step / cpu.step_over (4.9.7) -------------------------------- */
+/* ---- cpu.step / cpu.step_over -------------------------------- */
 /* The step itself runs guest instructions through DEBUG_Run, which needs a
  * paused CPU and an initialised memory/core (MemBase). In -tests mode the
  * debugger is never entered, so the gate (DEBUG_AgentStep returning 0 because
  * `debugging` is false) is what we exercise here: both commands are routed and
  * cleanly refuse with bad_state instead of touching the uninitialised core.
  * The actual single-step / step-over behaviour is covered live by
- * tests/agent_live/test_observability.py phase 7. */
+ * tests/agent_live/test_observability.py scenario 7. */
 
 TEST_F(AgentObservabilityTest, CpuStepRequiresPause)
 {
@@ -771,7 +771,7 @@ TEST_F(AgentObservabilityTest, CpuStepOverBusyWhilePending)
     g_stepOverPending = false;   /* don't leak into the next test */
 }
 
-/* ---- state.save / state.restore (4.9.8) ----------------------------- */
+/* ---- state.save / state.restore ----------------------------- */
 /* The save/restore themselves drive the whole savestate subsystem (zip I/O,
  * every device component, MemBase) and require a paused CPU + initialised
  * core, none of which exist in -tests mode. So these exercise the two gates
@@ -779,7 +779,7 @@ TEST_F(AgentObservabilityTest, CpuStepOverBusyWhilePending)
  * rejected with bad_args, checked first so it is testable headless) and the
  * paused gate (a valid slot while the CPU is not paused refuses with bad_state,
  * never touching SaveState). The real round-trip is covered live by
- * tests/agent_live/test_observability.py phase 8. */
+ * tests/agent_live/test_observability.py scenario 8. */
 
 TEST_F(AgentObservabilityTest, StateSaveRejectsBadSlot)
 {
@@ -826,13 +826,13 @@ TEST_F(AgentObservabilityTest, StateRestoreRequiresPause)
     EXPECT_EQ(v.get("error")->get("code")->s, "bad_state");
 }
 
-/* ---- conditional / Nth-hit breakpoints (4.9.9) ----------------------- */
+/* ---- conditional / Nth-hit breakpoints ----------------------- */
 /* The condition parser and evaluator are pure functions (the evaluator reads
  * register globals, which exist in -tests mode), so they are exercised
  * directly here. The hot-path worker AGENT_CondBpCheck mutates agent-side
  * state and reads registers only (empty / regs.get macros), so it too runs
  * headless. The actual halt-into-the-debugger and mem.read/disasm macros need
- * a running guest and are covered live by test_observability.py phase 9. */
+ * a running guest and are covered live by test_observability.py scenario 9. */
 
 TEST_F(AgentObservabilityTest, CondParseAcceptsCommonForms)
 {
