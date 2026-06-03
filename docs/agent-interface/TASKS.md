@@ -136,8 +136,8 @@ Goal: a reproducible end-to-end test.
 - [ ] `bp.add` / `bp.list` / `bp.del` typed (direct `CBreakpoint::*`).
 - [x] `bp.set` / `bp.clear` — conditional / Nth-hit BP + on-hit macro. *(4.9.9)*
 - [x] `mem.read` (binary, base64). *(shipped)*
-- [ ] `mem.write` (typed store; `mem.watch` write-intercept shipped in 4.9.4).
-- [x] `regs.get` typed. *(shipped)* — `regs.set` still TODO.
+- [x] `mem.write` (typed store, base64). *(shipped)* — `mem.watch` write-intercept was 4.9.4.
+- [x] `regs.get` / `regs.set` typed. *(shipped)*
 - [x] `cpu.step` / `cpu.step_over` with structured output. *(4.9.7)*
 - [x] `disasm` `{addr, count}` via `DasmI386` — `cpu.disasm`. *(4.9.6)*
 - [x] `state.save` / `state.restore` — slot-based, headless. *(4.9.8)*

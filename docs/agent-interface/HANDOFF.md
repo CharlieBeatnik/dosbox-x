@@ -6,7 +6,87 @@ Leave-behind for the next agent continuing the **proposal-4.9** work on the
 Source proposal:
 `X2RE/.claude/notes/dosbox-x-fixes/PROPOSAL_4.9_observability_and_trust.md`.
 
-## What shipped this iteration (savestate restore→resume crash — FIXED)
+## What shipped this iteration (Phase-2 mutation: `regs.set` + `mem.write`)
+
+The first post-4.9 Phase-2 items from `TASKS.md` § Iteration 7+ — the *write*
+counterparts to the long-shipped `regs.get` / `mem.read`. Built (0 errors),
+**134 Agent gTests pass** (+13), and verified end-to-end (a new live **phase
+10**, no OBSTEST.COM rebuild). With these the agent can now *change* CPU + guest
+state, not only observe it.
+
+| Item | Proves | Status |
+|------|--------|--------|
+| `regs.set {<reg>:<val>, …}` → `{set, regs}` | "poke a register and re-run from there" | ✅ |
+| `mem.write {kind, addr, bytes(base64)}` → `{written}` | "patch a byte / word / blob in place" | ✅ |
+
+### Design / code map
+
+- **Both handlers live in `src/agent/agent_cpu.cpp`** next to their read twins
+  (`handleRegsGet` / `handleMemRead`); two dispatch cases in `agent.cpp`, two
+  prototypes in `agent_internal.h`. No new TU, no `Makefile.am` / vcxproj change.
+- **`regs.set`** takes the register names `regs.get` *returns* as top-level args
+  (`eax`..`esp`, `eip`, `cs`/`ds`/`es`/`fs`/`gs`/`ss`, `eflags`) — get and set
+  are symmetric. Each value is a JSON number or hex string. It mirrors the
+  debugger's `ChangeRegister`: GPRs/EIP by direct assignment, segment registers
+  via `SegSet16` (real-mode form — does **not** reload protected-mode descriptor
+  limits, exactly like the debugger's `SR`), `EFLAGS` via `CPU_SetFlags(v,
+  FMASK_ALL)`. **Two-pass / all-or-nothing:** every entry is validated (unknown
+  name, bad value, segment > 0xFFFF → `bad_args`) *before* any write, so a bad
+  request mutates nothing. Validation runs **before** the paused gate (the same
+  ordering `state.save` uses for its slot) so the `bad_args` paths are
+  unit-testable headless; a well-formed request then requires the CPU paused
+  (`DEBUG_AgentIsPaused`, same gate as `cpu.step`/`state.save`) → `bad_state`.
+  Reply `{set:[names], regs:{…}}` echoes what changed plus the full post-set
+  snapshot, so no follow-up `regs.get` is needed.
+- **`mem.write`** is `mem.read` in the store direction: same `kind`
+  (`seg:off`/`linear`/`physical`), same 64 KB cap, bytes arrive base64 (new
+  `base64Decode`, strict RFC-4648 — length %4, alphabet-checked, `=`-padded).
+  `seg:off`/`linear` go through the paged `MEM_BlockWrite`; `physical` is a
+  `phys_writeb` loop (bypasses paging), mirroring `mem.read`'s physical path. A
+  zero-length write is a guarded no-op. **No paused gate** — like `mem.read`, the
+  agent dispatch runs on the emulator thread between instructions so the store is
+  race-free; writing while the guest runs naturally races with the guest's own
+  stores, documented as "pause first when patching a live value."
+
+### Reply shapes
+
+```json
+regs.set  → {"set":["cs","eax"],"regs":{"eax":3735928559,…,"eflags":518}}
+mem.write → {"written":6}
+```
+
+Errors: `regs.set` — `bad_args` (no registers / unknown name / bad value /
+segment > 0xFFFF), `bad_state` (CPU not paused). `mem.write` — `bad_args`
+(missing kind/addr/bytes, bad base64, oversize, bad addr, unknown kind).
+
+### Tests
+
+- **`tests/agent_cpu_tests.cpp`** — **13 new gTests** (AgentCpuTest 9→22). The
+  successful write needs a paused CPU / `MemBase`, neither present in `-tests`,
+  so these cover every headless-reachable path: `regs.set` empty / unknown reg /
+  bad value / oversize segment → `bad_args`, and a well-formed set → `bad_state`
+  (validation-before-gate makes all of these reachable); `mem.write` missing
+  field / invalid + unpadded base64 / oversize / unknown kind / `seg:off`
+  without colon → `bad_args`, and the zero-length no-op → `{written:0}`. The real
+  apply is covered live. **134 Agent gTests total, all pass.**
+- **`tests/agent_live/test_observability.py` phase 10** (no OBSTEST rebuild):
+  pause, `regs.set eax/ebx/esi`, confirm the reply + an independent `regs.get`
+  took the new values while an un-named register (`edi`) stayed put; a
+  `regs.set` with a bogus register is rejected `bad_args` and leaves `eax`
+  unchanged (atomicity); then `mem.write` a 6-byte blob via `seg:off`, read it
+  back, and a `physical` write at the aliased real-mode linear address is
+  observed through `seg:off`. The phase restores the clobbered registers before
+  resuming. **All 13 phases pass.**
+
+## What shipped (previous iteration: typed wrappers for the earlier 4.9 commands)
+
+`contrib/agent-client/dbxagent.py` gained typed wrappers for every remaining
+command (`debug_status`, `cpu_probe`, `cpu_trace_ring`, `cpu_traceback`,
+`cpu_disasm`, the watch family, multi-range `cpu_watch_range`). See the
+*Smaller follow-ups* note. (`regs_set` / `mem_write` wrappers were added this
+iteration alongside the handlers.)
+
+## What shipped (savestate restore→resume crash — FIXED)
 
 Root-caused and fixed the `state.restore` → `cpu.run` → ~crash defect the
 previous iteration discovered (it was documented as a "pre-existing savestate
@@ -696,9 +776,11 @@ python tests/agent_live/test_observability.py
   restore→resume crash that blocked the 4.9.8+4.9.9 loop is fixed** (top
   section). The restore-and-rerun loop the proposal is built around is now
   trustworthy.
-- Next, the remaining Phase-2 surface from `TASKS.md` § Iteration 7+:
-  typed `bp.add`/`bp.list`/`bp.del` (stable handles), `regs.set`, `mem.write`
-  (typed store), and mouse input (`mouse.move`/`mouse.click`).
+- `regs.set` and `mem.write` (the typed write surface) shipped this iteration
+  (top section). Remaining Phase-2 surface from `TASKS.md` § Iteration 7+:
+  typed `bp.add`/`bp.list`/`bp.del` (stable handles — retires the `bp_index`
+  isn't-a-stable-handle carry-over), and mouse input
+  (`mouse.move`/`mouse.click`).
 - *Optional core hardening:* make `SerializePic::setBytes` skip a `0xffff`
   ticker/event index instead of installing a NULL handler, so the same class of
   bug can't bite `IPX`/`NE2000`/other un-tabled handlers. Deliberately not done
@@ -726,12 +808,19 @@ python tests/agent_live/test_observability.py
 - **`Makefile.am`** not updated for `agent_observe.cpp` — only the VS project
   was. A Linux/macOS build needs the agent TU list updated; verify on a Unix
   host.
-- **`contrib/agent-client/dbxagent.py`** now has typed wrappers for the 4.9.7
-  commands (`cpu_step()`, `cpu_step_over()`), the 4.9.8 commands (`state_save()`,
-  `state_restore()`), and the 4.9.9 commands (`bp_set()`, `bp_clear()`), but
-  still not for the earlier 4.9 commands — clients use `call("debug.status")`
-  etc. Add `debug_status()`, `cpu_probe()`, `cpu_trace_ring()`,
-  `cpu_traceback()`, `cpu_disasm()` when convenient.
+- **`contrib/agent-client/dbxagent.py`** has typed wrappers for **every** agent
+  command, including this iteration's `regs_set()` and `mem_write()` (added
+  alongside the handlers). An earlier iteration filled the 4.9 gap — the
+  commands:
+  `debug_status()`, `cpu_probe()`, `cpu_trace_ring()`, `cpu_traceback()`,
+  `cpu_disasm()`, plus the watch family `farcall_watch()`/`farcall_unwatch()`,
+  `cpu_watch_target()`/`cpu_unwatch_target()`, `mem_watch()`/`mem_unwatch()`, and
+  `cpu_watch_range()` gained the 4.9.5 multi-range `ranges=[…]` form
+  (backward-compatible: the positional `(seg, lo, hi)` single-range call still
+  works). The watch wrappers expose both the single-sentinel and the set form,
+  and clear by calling with no argument. Verified at the protocol level (each
+  wrapper emits the exact `cmd`+`args` its server-side handler parses; the live
+  test still drives the server via `call(...)`, which is unchanged).
 - **Heavy-debug only:** `cpu.probe` and `cpu.trace_ring` rely on
   `DEBUG_HeavyIsBreakpoint`, which only runs in a `C_HEAVY_DEBUG` build
   (`vs/config.h` has it on). A plain `C_DEBUG` build compiles them but they
@@ -765,6 +854,10 @@ python tests/agent_live/test_observability.py
   `hits==150, halted==true`; macro `regs.get` captured `cx==151`) and phase9b
   (`bp.set if=cx==0x97 continue=true` fires once without halting;
   `hits==iters*fires` in `debug.status`).
+- Phase-2 "poke a register / patch memory and re-run" → phase10 (`regs.set`
+  eax/ebx/esi confirmed via an independent `regs.get` with an un-named register
+  intact and a bad request left atomic; `mem.write` a blob via `seg:off` plus an
+  aliased `physical` write, both read back).
 
 ## Environment note
 

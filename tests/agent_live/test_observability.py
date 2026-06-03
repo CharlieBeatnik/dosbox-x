@@ -938,6 +938,80 @@ def phase9_cond_bp(agent, cs, loopbody, iters, rep) -> None:
             agent.cpu_run(); _drain_events(agent)
 
 
+def phase10_regs_set_mem_write(agent, cs, scratch, rep) -> None:
+    # regs.set writes named registers (validated all-or-nothing, paused-only);
+    # mem.write stores raw bytes (base64 on the wire) into guest memory. Both
+    # are confirmed by reading back independently. `scratch` is a RAM word in
+    # OBSTEST's own segment (the phase-4 watch target), used here only as a safe
+    # writable location. No OBSTEST rebuild: this phase needs just a paused CPU
+    # and a writable RAM address. Runs last; it restores the registers it
+    # clobbered before resuming so the guest is left undisturbed.
+    name = "phase10: regs.set + mem.write round-trip"
+    saved = None
+    try:
+        _reset(agent)                       # leaves the CPU paused
+        problems = []
+        saved = agent.regs_get()
+
+        # --- regs.set: set three GPRs, leave the rest alone ---
+        want = {"eax": 0xDEADBEEF, "ebx": 0x12345678, "esi": 0x0000CAFE}
+        rs = agent.regs_set(**want)
+        if set(rs.get("set", [])) != set(want):
+            problems.append(f"regs.set 'set' echo {rs.get('set')} != {sorted(want)}")
+        for k, v in want.items():
+            if rs.get("regs", {}).get(k) != v:
+                problems.append(f"regs.set reply regs[{k}]={rs.get('regs',{}).get(k)} != {v:#x}")
+        live = agent.regs_get()
+        for k, v in want.items():
+            if live.get(k) != v:
+                problems.append(f"after regs.set live {k}={live.get(k)} != {v:#x}")
+        if live.get("edi") != saved.get("edi"):
+            problems.append(f"regs.set perturbed unrelated edi "
+                            f"{saved.get('edi')} -> {live.get('edi')}")
+
+        # A bad request must be rejected as bad_args AND change nothing.
+        try:
+            agent.regs_set(eax=0x11111111, bogusreg=1)
+            problems.append("regs.set with an unknown register did not error")
+        except AgentError as e:
+            if e.code != "bad_args":
+                problems.append(f"regs.set bad-register code={e.code} (want bad_args)")
+        if agent.regs_get().get("eax") != want["eax"]:
+            problems.append("a rejected regs.set still mutated eax (not atomic)")
+
+        # --- mem.write: seg:off then aliased physical, each read back ---
+        addr = f"{cs:04X}:{scratch:04X}"
+        payload = bytes([0xDE, 0xAD, 0xBE, 0xEF, 0x5A, 0xA5])
+        w = agent.mem_write("seg:off", addr, payload)
+        if w.get("written") != len(payload):
+            problems.append(f"mem.write written={w.get('written')} != {len(payload)}")
+        back = bytes(agent.mem_read("seg:off", addr, len(payload)))
+        if back != payload:
+            problems.append(f"seg:off write/read mismatch {back!r} != {payload!r}")
+
+        # A "physical" write at the same real-mode linear address must alias.
+        phys = (cs << 4) + scratch
+        payload2 = bytes([0x11, 0x22, 0x33, 0x44])
+        agent.mem_write("physical", f"{phys:X}", payload2)
+        back2 = bytes(agent.mem_read("seg:off", addr, len(payload2)))
+        if back2 != payload2:
+            problems.append(f"physical write not visible via seg:off {back2!r} != {payload2!r}")
+
+        if problems:
+            rep.record(name, False, "; ".join(problems[:4]))
+        else:
+            rep.record(name, True,
+                       "regs.set wrote eax/ebx/esi (others intact, bad req atomic); "
+                       "mem.write seg:off+physical round-tripped")
+    except Exception as exc:
+        rep.record(name, False, repr(exc))
+    finally:
+        with contextlib.suppress(Exception):
+            if saved is not None:
+                agent.regs_set(**saved)     # undo the register clobber
+            agent.cpu_run(); _drain_events(agent)
+
+
 def run(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dosbox", default=str(DEFAULT_DOSBOX))
@@ -996,6 +1070,9 @@ def run(argv=None) -> int:
             # arm a conditional BP" pairing end-to-end.
             phase8_savestate(agent, cs, trace_a, rep)
             phase9_cond_bp(agent, cs, loopbody, iters, rep)
+            # Phase-2 mutation surface (regs.set + mem.write); runs last and
+            # restores the registers it touches before the final resume.
+            phase10_regs_set_mem_write(agent, cs, watch_target, rep)
 
             with contextlib.suppress(Exception):
                 _reset(agent)

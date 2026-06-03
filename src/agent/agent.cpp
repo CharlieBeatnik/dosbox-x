@@ -626,7 +626,9 @@ std::string dispatchLine(const std::string &line) {
     if (cmd->s == "cpu.pause")         return jsonEncode(handleCpuPause(id, a));
     if (cmd->s == "cpu.run")           return jsonEncode(handleCpuRun(id, a));
     if (cmd->s == "regs.get")          return jsonEncode(handleRegsGet(id, a));
+    if (cmd->s == "regs.set")          return jsonEncode(handleRegsSet(id, a));
     if (cmd->s == "mem.read")          return jsonEncode(handleMemRead(id, a));
+    if (cmd->s == "mem.write")         return jsonEncode(handleMemWrite(id, a));
     if (cmd->s == "state.save")        return jsonEncode(handleStateSave(id, a));
     if (cmd->s == "state.restore")     return jsonEncode(handleStateRestore(id, a));
     if (cmd->s == "bp.set")            return jsonEncode(handleBpSet(id, a));

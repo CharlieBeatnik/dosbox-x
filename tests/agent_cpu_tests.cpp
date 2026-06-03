@@ -171,4 +171,146 @@ TEST_F(AgentCpuTest, MemReadZeroLengthIsOk)
     EXPECT_EQ(r->get("bytes")->s, "");
 }
 
+/* ---- regs.set -------------------------------------------------------- *
+ *
+ * regs.set validates its arguments *before* the "must be paused" gate (the
+ * same ordering state.save uses for its slot), so every bad_args path is
+ * reachable headless. The successful write needs a paused CPU (the agent
+ * dispatch runs between instructions inside DEBUG_Loop), which does not exist
+ * in -tests mode, so a well-formed request gets as far as bad_state here; the
+ * real register round-trip is covered live. */
+
+static std::string regsSetError(const std::string &argsJson)
+{
+    return std::string("{\"id\":1,\"cmd\":\"regs.set\",\"args\":") + argsJson + "}";
+}
+
+TEST_F(AgentCpuTest, RegsSetRejectsEmpty)
+{
+    JsonValue v;
+    ASSERT_TRUE(jsonParse(dispatchLine(regsSetError("{}")), v));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+}
+
+TEST_F(AgentCpuTest, RegsSetRejectsUnknownRegister)
+{
+    JsonValue v;
+    ASSERT_TRUE(jsonParse(dispatchLine(regsSetError("{\"rax\":1}")), v));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+}
+
+TEST_F(AgentCpuTest, RegsSetRejectsBadValue)
+{
+    JsonValue v;
+    ASSERT_TRUE(jsonParse(dispatchLine(regsSetError("{\"eax\":\"nothex\"}")), v));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+}
+
+TEST_F(AgentCpuTest, RegsSetRejectsOversizeSegment)
+{
+    /* A segment register must fit in 16 bits. */
+    JsonValue v;
+    ASSERT_TRUE(jsonParse(dispatchLine(regsSetError("{\"cs\":\"0x10000\"}")), v));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+}
+
+TEST_F(AgentCpuTest, RegsSetValidButNotPausedIsBadState)
+{
+    /* Well-formed (one GPR, one seg, hex and decimal forms) — passes
+     * validation, then trips the paused gate because -tests never pauses. */
+    JsonValue v;
+    ASSERT_TRUE(jsonParse(dispatchLine(
+        regsSetError("{\"eax\":\"0xDEADBEEF\",\"cs\":2084,\"eflags\":\"0x202\"}")), v));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_state");
+}
+
+/* ---- mem.write ------------------------------------------------------- *
+ *
+ * Like mem.read, the real store needs MemBase, so only argument validation
+ * and the zero-length no-op are exercised here; live coverage does the rest. */
+
+TEST_F(AgentCpuTest, MemWriteRejectsMissingKind)
+{
+    JsonValue v;
+    ASSERT_TRUE(jsonParse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"mem.write\",\"args\":{\"addr\":\"1000:0\",\"bytes\":\"AAAA\"}}"), v));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+}
+
+TEST_F(AgentCpuTest, MemWriteRejectsMissingBytes)
+{
+    JsonValue v;
+    ASSERT_TRUE(jsonParse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"mem.write\",\"args\":{\"kind\":\"linear\",\"addr\":\"0\"}}"), v));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+}
+
+TEST_F(AgentCpuTest, MemWriteRejectsInvalidBase64)
+{
+    /* '!' is outside the base64 alphabet. */
+    JsonValue v;
+    ASSERT_TRUE(jsonParse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"mem.write\",\"args\":{\"kind\":\"linear\",\"addr\":\"0\",\"bytes\":\"!!!!\"}}"), v));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+}
+
+TEST_F(AgentCpuTest, MemWriteRejectsUnpaddedBase64)
+{
+    /* Length not a multiple of 4 is rejected (strict RFC-4648). */
+    JsonValue v;
+    ASSERT_TRUE(jsonParse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"mem.write\",\"args\":{\"kind\":\"linear\",\"addr\":\"0\",\"bytes\":\"AAA\"}}"), v));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+}
+
+TEST_F(AgentCpuTest, MemWriteRejectsOversize)
+{
+    /* "AAAA"*N decodes to 3*N bytes; exceed the 64 KB cap. */
+    std::string big(87384, 'A');   /* %4==0; decodes to 65538 bytes > 65536 */
+    JsonValue v;
+    ASSERT_TRUE(jsonParse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"mem.write\",\"args\":{\"kind\":\"linear\",\"addr\":\"0\",\"bytes\":\""
+        + big + "\"}}"), v));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+}
+
+TEST_F(AgentCpuTest, MemWriteRejectsUnknownKind)
+{
+    JsonValue v;
+    ASSERT_TRUE(jsonParse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"mem.write\",\"args\":{\"kind\":\"banana\",\"addr\":\"0\",\"bytes\":\"AAAA\"}}"), v));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+}
+
+TEST_F(AgentCpuTest, MemWriteRejectsSegOffWithoutColon)
+{
+    JsonValue v;
+    ASSERT_TRUE(jsonParse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"mem.write\",\"args\":{\"kind\":\"seg:off\",\"addr\":\"DEADBEEF\",\"bytes\":\"AAAA\"}}"), v));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+}
+
+TEST_F(AgentCpuTest, MemWriteZeroLengthIsOk)
+{
+    /* Empty base64 decodes to zero bytes; the len==0 guard skips MEM_BlockWrite
+     * so this is safe with no memory subsystem. Verify the reply shape. */
+    JsonValue v;
+    ASSERT_TRUE(jsonParse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"mem.write\",\"args\":{\"kind\":\"linear\",\"addr\":\"0\",\"bytes\":\"\"}}"), v));
+    ASSERT_TRUE(v.get("ok")->b);
+    EXPECT_EQ(int(v.get("result")->get("written")->n), 0);
+}
+
 }  /* anonymous namespace */

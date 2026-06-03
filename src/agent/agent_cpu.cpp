@@ -40,6 +40,7 @@
 #include "dosbox.h"
 #include "mem.h"
 #include "regs.h"
+#include "cpu.h"            /* CPU_SetFlags (regs.set EFLAGS) */
 #include "debug.h"          /* DEBUG_AgentStep, DEBUG_AgentDisasmOne */
 
 #include <cctype>
@@ -91,6 +92,43 @@ std::string base64Encode(const uint8_t *data, size_t len) {
     return out;
 }
 
+/* Strict RFC-4648 decode (standard alphabet, `=` padded). Requires a length
+ * that is a multiple of 4 — the form base64Encode and Python's base64.b64encode
+ * both produce — and rejects any out-of-alphabet character. Returns false on
+ * malformed input (the caller maps that to bad_args). An empty string decodes
+ * to zero bytes. */
+bool base64Decode(const std::string &in, std::vector<uint8_t> &out) {
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+    out.clear();
+    const size_t n = in.size();
+    if (n % 4 != 0) return false;
+    size_t pad = 0;
+    if (n >= 1 && in[n-1] == '=') pad++;
+    if (n >= 2 && in[n-2] == '=') pad++;
+    out.reserve((n / 4) * 3);
+    for (size_t i = 0; i < n; i += 4) {
+        const bool last = (i + 4 == n);
+        const int c0 = val(in[i]);
+        const int c1 = val(in[i+1]);
+        const int c2 = (last && pad >= 2) ? 0 : val(in[i+2]);
+        const int c3 = (last && pad >= 1) ? 0 : val(in[i+3]);
+        if (c0 < 0 || c1 < 0 || c2 < 0 || c3 < 0) return false;
+        const uint32_t v = (uint32_t(c0) << 18) | (uint32_t(c1) << 12) |
+                           (uint32_t(c2) << 6)  |  uint32_t(c3);
+        out.push_back(uint8_t((v >> 16) & 0xFF));
+        if (!(last && pad >= 2)) out.push_back(uint8_t((v >> 8) & 0xFF));
+        if (!(last && pad >= 1)) out.push_back(uint8_t(v & 0xFF));
+    }
+    return true;
+}
+
 /* Parse a hex string (with or without "0x" prefix) into a uint32_t.
  * Returns true on success. Empty/garbage input fails. */
 bool parseHexU32(const std::string &s, uint32_t &out) {
@@ -111,6 +149,19 @@ bool parseHexU32(const std::string &s, uint32_t &out) {
     }
     out = uint32_t(v);
     return true;
+}
+
+/* Parse a JSON number or hex string into a u32 (mirrors agent_observe.cpp's
+ * file-local parseU32Any, which isn't shared via the header). */
+bool parseU32Arg(const JsonValue &v, uint32_t &out) {
+    if (v.isNumber()) {
+        if (v.n < 0 || v.n > 4294967295.0) return false;
+        out = uint32_t(v.n);
+        return true;
+    }
+    if (v.isString())
+        return parseHexU32(v.s, out);
+    return false;
 }
 
 /* Parse "SEG:OFF" with both halves hex. Both must fit in 32 bits; seg is
@@ -162,12 +213,115 @@ JsonObject buildRegs(void) {
     return r;
 }
 
+/* regs.set classifies each named register so the handler can range-check
+ * before applying and reject typos. The names are exactly the keys regs.get
+ * returns, so set and get are symmetric. */
+enum RegKind { RK_UNKNOWN, RK_GPR, RK_SEG, RK_FLAGS };
+
+RegKind regKind(const std::string &n) {
+    if (n == "eax" || n == "ebx" || n == "ecx" || n == "edx" ||
+        n == "esi" || n == "edi" || n == "ebp" || n == "esp" || n == "eip")
+        return RK_GPR;
+    if (n == "cs" || n == "ds" || n == "es" || n == "fs" || n == "gs" || n == "ss")
+        return RK_SEG;
+    if (n == "eflags")
+        return RK_FLAGS;
+    return RK_UNKNOWN;
+}
+
+/* Write one validated register. Mirrors the debugger's ChangeRegister: GPRs and
+ * EIP by direct assignment; segment registers via SegSet16 (the real-mode form
+ * — like the debugger's SR command it does NOT reload protected-mode descriptor
+ * limits); EFLAGS via CPU_SetFlags so the flag mask and any core-side flag
+ * bookkeeping are honoured. Assumes regKind(name) already accepted `name`. */
+void applyReg(const std::string &name, uint32_t val) {
+    switch (regKind(name)) {
+    case RK_GPR:
+        if      (name == "eax") reg_eax = val;
+        else if (name == "ebx") reg_ebx = val;
+        else if (name == "ecx") reg_ecx = val;
+        else if (name == "edx") reg_edx = val;
+        else if (name == "esi") reg_esi = val;
+        else if (name == "edi") reg_edi = val;
+        else if (name == "ebp") reg_ebp = val;
+        else if (name == "esp") reg_esp = val;
+        else if (name == "eip") reg_eip = val;
+        break;
+    case RK_SEG:
+        if      (name == "cs") SegSet16(cs, uint16_t(val));
+        else if (name == "ds") SegSet16(ds, uint16_t(val));
+        else if (name == "es") SegSet16(es, uint16_t(val));
+        else if (name == "fs") SegSet16(fs, uint16_t(val));
+        else if (name == "gs") SegSet16(gs, uint16_t(val));
+        else if (name == "ss") SegSet16(ss, uint16_t(val));
+        break;
+    case RK_FLAGS:
+        CPU_SetFlags(val, FMASK_ALL);
+        break;
+    case RK_UNKNOWN:
+        break;
+    }
+}
+
 }  /* anonymous namespace */
 
 /* ---- regs.get --------------------------------------------------------- */
 
 JsonValue handleRegsGet(double id, const JsonValue & /*args*/) {
     return makeReplyOk(id, buildRegs());
+}
+
+/* ---- regs.set --------------------------------------------------------- */
+
+/* Write one or more registers, named exactly as regs.get returns them
+ * (eax..esp, eip, cs/ds/es/fs/gs/ss, eflags). Each value is a JSON number or a
+ * hex string. Requires the CPU paused (same gate as cpu.step / state.save): the
+ * agent dispatch then runs between instructions, a safe point to mutate the
+ * register file. Validation is done in full *before* any write, so a bad entry
+ * leaves the register file untouched (no partial application). The reply echoes
+ * the names set and the post-set register snapshot, so the client confirms the
+ * write with no follow-up regs.get. */
+JsonValue handleRegsSet(double id, const JsonValue &args) {
+    if (!args.isObject() || !args.o || args.o->empty())
+        return makeReplyError(id, "bad_args",
+            "expected at least one register, e.g. {\"eax\":<u32>, \"cs\":<u16>}");
+
+    /* Pass 1 — validate every entry; no writes yet. Done before the paused
+     * gate (as state.save validates its slot first) so a malformed request is
+     * rejected as bad_args regardless of run state, and is unit-testable
+     * headless where the CPU can never be paused. */
+    for (const auto &kv : *args.o) {
+        const std::string &name = kv.first;
+        RegKind kind = regKind(name);
+        if (kind == RK_UNKNOWN)
+            return makeReplyError(id, "bad_args",
+                std::string("unknown register: \"") + name + "\"");
+        uint32_t val;
+        if (!parseU32Arg(kv.second, val))
+            return makeReplyError(id, "bad_args",
+                std::string("register \"") + name + "\" must be a u32 number or hex string");
+        if (kind == RK_SEG && val > 0xFFFF)
+            return makeReplyError(id, "bad_args",
+                std::string("segment register \"") + name + "\" must be <= 0xFFFF");
+    }
+
+    if (!DEBUG_AgentIsPaused())
+        return makeReplyError(id, "bad_state",
+            "regs.set requires the CPU to be paused (call cpu.pause first)");
+
+    /* Pass 2 — apply. */
+    JsonArray setNames;
+    for (const auto &kv : *args.o) {
+        uint32_t val = 0;
+        parseU32Arg(kv.second, val);
+        applyReg(kv.first, val);
+        setNames.push_back(JsonValue::makeString(kv.first));
+    }
+
+    JsonObject r;
+    r.emplace("set",  JsonValue::makeArray(std::move(setNames)));
+    r.emplace("regs", JsonValue::makeObject(buildRegs()));
+    return makeReplyOk(id, std::move(r));
 }
 
 /* ---- cpu.step / cpu.step_over (4.9.7) --------------------------------- */
@@ -301,6 +455,69 @@ JsonValue handleMemRead(double id, const JsonValue &args) {
     JsonObject r;
     r.emplace("bytes", JsonValue::makeString(base64Encode(buf.data(), len)));
     r.emplace("len",   JsonValue::makeNumber(double(len)));
+    return makeReplyOk(id, std::move(r));
+}
+
+/* ---- mem.write -------------------------------------------------------- */
+
+/* Same size cap and address semantics as mem.read, in the store direction.
+ * The bytes to write arrive base64-encoded (the mirror of mem.read's reply).
+ * Like mem.read this does not require the CPU paused — the agent dispatch runs
+ * on the emulator thread between instructions, so the store is race-free; but
+ * writing while the guest runs naturally races with the guest's own stores, so
+ * pause first when patching a live value. */
+constexpr size_t MEM_WRITE_MAX = MEM_READ_MAX;
+
+JsonValue handleMemWrite(double id, const JsonValue &args) {
+    const JsonValue *vKind  = args.get("kind");
+    const JsonValue *vAddr  = args.get("addr");
+    const JsonValue *vBytes = args.get("bytes");
+
+    if (!vKind || !vKind->isString())
+        return makeReplyError(id, "bad_args", "expected \"kind\": \"seg:off\"|\"linear\"|\"physical\"");
+    if (!vAddr || !vAddr->isString())
+        return makeReplyError(id, "bad_args", "expected \"addr\": hex string");
+    if (!vBytes || !vBytes->isString())
+        return makeReplyError(id, "bad_args", "expected \"bytes\": base64 string");
+
+    std::vector<uint8_t> buf;
+    if (!base64Decode(vBytes->s, buf))
+        return makeReplyError(id, "bad_args", "\"bytes\" is not valid base64");
+    if (buf.size() > MEM_WRITE_MAX)
+        return makeReplyError(id, "bad_args",
+            std::string("bytes exceeds cap of ") + std::to_string(MEM_WRITE_MAX) + " bytes");
+
+    const std::string &kind = vKind->s;
+    const size_t len = buf.size();
+
+    if (kind == "seg:off") {
+        uint32_t seg, off;
+        if (!parseSegOff(vAddr->s, seg, off))
+            return makeReplyError(id, "bad_args", "addr must be \"SEG:OFF\" in hex");
+        uint32_t linear = (seg << 4) + off;
+        if (len) MEM_BlockWrite(LinearPt(linear), buf.data(), len);
+    }
+    else if (kind == "linear") {
+        uint32_t linear;
+        if (!parseHexU32(vAddr->s, linear))
+            return makeReplyError(id, "bad_args", "addr must be hex");
+        if (len) MEM_BlockWrite(LinearPt(linear), buf.data(), len);
+    }
+    else if (kind == "physical") {
+        uint32_t phys;
+        if (!parseHexU32(vAddr->s, phys))
+            return makeReplyError(id, "bad_args", "addr must be hex");
+        /* phys_writeb bypasses paging, mirroring mem.read's "physical" path. */
+        for (size_t i = 0; i < len; ++i)
+            phys_writeb(PhysPt(phys + uint32_t(i)), buf[i]);
+    }
+    else {
+        return makeReplyError(id, "bad_args",
+            std::string("unknown kind: \"") + kind + "\"");
+    }
+
+    JsonObject r;
+    r.emplace("written", JsonValue::makeNumber(double(len)));
     return makeReplyOk(id, std::move(r));
 }
 

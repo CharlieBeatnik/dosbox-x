@@ -151,7 +151,9 @@ JsonValue handleKeyboardTap(double id, const JsonValue &args);
 
 /* Dispatch entry points implemented in agent_cpu.cpp. */
 JsonValue handleRegsGet(double id, const JsonValue &args);
+JsonValue handleRegsSet(double id, const JsonValue &args);
 JsonValue handleMemRead(double id, const JsonValue &args);
+JsonValue handleMemWrite(double id, const JsonValue &args);
 
 /* Structured single-step (proposal 4.9.7), implemented in agent_cpu.cpp.
  * cpu.step always replies synchronously. cpu.step_over returns the empty

@@ -166,6 +166,29 @@ class DbxAgent:
     def vm_version(self) -> dict:
         return self.call("vm.version")
 
+    def debug_status(self) -> dict:
+        """One-shot snapshot of the agent's observability state (proposal 4.9.1).
+
+        Returns ``{cpu, cs_ip, cs, eip, instr_count, breakpoints, watches,
+        probe, trace, cond_breakpoints}``:
+
+        - ``cpu`` is ``"paused"`` or ``"running"``; ``instr_count`` is the
+          cumulative cycle count.
+        - ``breakpoints`` lists the debugger's breakpoints, each with a ``hits``
+          counter and (when paused at it) ``bytes_now`` — so you can tell
+          "fired" from "never reached" in one run.
+        - ``watches`` has ``far`` / ``target`` / ``range`` (each a sentinel set
+          with per-sentinel ``hits``; the array index is the ``which`` reported
+          in events) and ``mem`` (the write-intercept watch).
+        - ``probe`` is the ``cpu_probe`` point table with per-point ``hits``;
+          ``trace`` is the ``cpu_trace_ring`` status; ``cond_breakpoints`` lists
+          ``bp_set`` entries with their ``hits`` (reaches) and ``fires``.
+
+        Counters and disassembly bytes are accurate only in a heavy-debug build;
+        see the per-command notes.
+        """
+        return self.call("debug.status")
+
     def cpu_pause(self) -> dict:
         return self.call("cpu.pause")
 
@@ -194,6 +217,60 @@ class DbxAgent:
         flight — wait for it, or cpu.pause to bail out).
         """
         return self.call("cpu.step_over", timeout=timeout)
+
+    def cpu_probe(self, points: Optional[list] = None) -> dict:
+        """Arm non-halting execution counters at a set of addresses (proposal 4.9.2).
+
+        ``points`` is a list of ``"SEG:OFF"`` hex strings; each is counted every
+        time the CPU executes there, at full speed and without halting — the
+        answer to "is X on the path, and how often?". Pass ``[]`` or ``None`` to
+        disarm. Returns ``{armed}`` (the number of points now armed); read the
+        per-point ``hits`` back from ``debug_status``' ``probe`` array. Counts
+        only in a heavy-debug build. Errors ``bad_args`` (too many points or a
+        malformed ``SEG:OFF``).
+        """
+        return self.call("cpu.probe", points=list(points) if points else [])
+
+    def cpu_trace_ring(self, enabled: bool = True, *, depth: Optional[int] = None,
+                       seg: Optional[int] = None) -> dict:
+        """Arm/disarm the rolling CS:IP trace ring (proposal 4.9.3).
+
+        With ``enabled=True`` (the default) records the last ``depth``
+        instructions (server default if omitted) into a ring buffer, optionally
+        filtered to a single ``seg``. ``enabled=False`` stops recording but
+        *retains* the ring so a later ``cpu_traceback`` still works. Returns
+        ``{enabled, depth[, seg]}``. Records only in a heavy-debug build. Pair
+        with ``cpu_traceback`` to answer "how did the CPU get here?".
+        """
+        args: dict = {"enabled": enabled}
+        if depth is not None:
+            args["depth"] = depth
+        if seg is not None:
+            args["seg"] = seg
+        return self.call("cpu.trace_ring", **args)
+
+    def cpu_traceback(self, count: Optional[int] = None) -> dict:
+        """Dump the trace ring captured by ``cpu_trace_ring`` (proposal 4.9.3).
+
+        Returns ``{entries}`` where each entry is ``{cs_ip, bytes, text}``
+        (disassembled), ordered oldest-first so the array reads most-recent-last.
+        ``count`` caps how many of the most-recent entries to return (default:
+        all currently held).
+        """
+        if count is None:
+            return self.call("cpu.traceback")
+        return self.call("cpu.traceback", count=count)
+
+    def cpu_disasm(self, addr: str, count: int = 1) -> dict:
+        """Disassemble ``count`` instructions starting at ``addr`` (proposal 4.9.6).
+
+        ``addr`` is ``"SEG:OFF"`` (hex); ``count`` is clamped to 64 server-side.
+        Returns ``{insns}`` where each instruction is ``{cs_ip, bytes, text}`` —
+        ``bytes`` is the exact opcode bytes (verifiable against ``mem_read``), so
+        you never hand-decode. Errors ``bad_args`` on a malformed ``addr`` /
+        non-positive ``count``.
+        """
+        return self.call("cpu.disasm", addr=addr, count=count)
 
     def state_save(self, slot: int) -> dict:
         """Snapshot the whole machine to save ``slot`` (0-99). CPU must be paused.
@@ -265,6 +342,29 @@ class DbxAgent:
         """
         return self.call("regs.get")
 
+    def regs_set(self, regs: Optional[dict] = None, **kwargs: Any) -> dict:
+        """Write one or more CPU registers. The CPU must be paused.
+
+        The write counterpart to ``regs_get`` — pass registers by the *same*
+        names it returns (``eax``..``esp``, ``eip``, ``cs``/``ds``/``es``/``fs``/
+        ``gs``/``ss``, ``eflags``), as keyword args or a dict, e.g.
+        ``regs_set(eax=0xDEAD, cs=0x0824)`` or ``regs_set({"eip": 0x100})``.
+        Values are ints (or hex strings). Only the registers you name change;
+        the rest are left alone. Validation is all-or-nothing — a bad name /
+        value / oversize segment rejects the whole request with ``bad_args`` and
+        writes nothing. Segment writes use the real-mode form (they do not
+        reload protected-mode descriptor limits, same as the debugger's ``SR``).
+
+        Returns ``{set, regs}`` — the names applied plus the full post-set
+        register snapshot (``regs_get`` shape), so you confirm the write with no
+        follow-up. Errors ``bad_state`` (CPU not paused) or ``bad_args``.
+        """
+        fields: dict = dict(regs or {})
+        fields.update(kwargs)
+        if not fields:
+            raise ValueError("regs_set requires at least one register")
+        return self.call("regs.set", **fields)
+
     def mem_read(self, kind: str, addr: str, length: int) -> bytes:
         """Read up to 64 KB of guest memory.
 
@@ -276,6 +376,23 @@ class DbxAgent:
         import base64
         res = self.call("mem.read", kind=kind, addr=addr, len=length)
         return base64.b64decode(res["bytes"])
+
+    def mem_write(self, kind: str, addr: str, data: bytes) -> dict:
+        """Write raw bytes into guest memory (the store counterpart to ``mem_read``).
+
+        ``kind`` is ``"seg:off"``, ``"linear"``, or ``"physical"``; ``addr`` is
+        the hex address string (``"1000:0100"`` for seg:off, otherwise plain hex
+        with or without ``0x``). ``data`` is a ``bytes``-like object — it is
+        base64-encoded for you on the wire. Capped at 64 KB per call (chunk
+        larger writes). ``physical`` bypasses paging; ``seg:off`` / ``linear``
+        go through the paged path. Returns ``{"written": <n>}``.
+
+        Does not require the CPU paused, but writing while the guest runs races
+        with the guest's own stores — pause first when patching a live value.
+        """
+        import base64
+        enc = base64.b64encode(bytes(data)).decode("ascii")
+        return self.call("mem.write", kind=kind, addr=addr, bytes=enc)
 
     def keyboard_type(self, text: str) -> dict:
         return self.call("keyboard.type", text=text)
@@ -298,12 +415,94 @@ class DbxAgent:
     def log_unsubscribe(self) -> dict:
         return self.call("log.unsubscribe")
 
-    def cpu_watch_range(self, seg: int, lo: int, hi: int) -> dict:
-        """Arm cpu.watch_range — fires on entry into [seg, lo..hi] from outside."""
+    def farcall_watch(self, target_seg: Optional[int] = None, *,
+                      target_segs: Optional[list] = None) -> dict:
+        """Watch FAR calls/jumps into one or more target segments (proposal 4.9.5).
+
+        Single form: ``farcall_watch(0x1234)`` arms a sentinel on segment
+        ``0x1234``. Set form: ``farcall_watch(target_segs=[0x1234, 0x5678])``
+        arms a *set* (replaces any prior set; ``[]`` clears). Each
+        ``farcall.transfer`` event carries a ``which`` index into that set, and
+        per-sentinel ``hits`` show up in ``debug_status``' ``watches.far``.
+        Called with no argument (or ``target_seg=None``) it clears the watch.
+        """
+        if target_segs is not None:
+            return self.call("farcall.watch", target_segs=list(target_segs))
+        return self.call("farcall.watch", target_seg=target_seg)
+
+    def farcall_unwatch(self) -> dict:
+        return self.call("farcall.unwatch")
+
+    def cpu_watch_target(self, target_seg: Optional[int] = None,
+                        target_off: Optional[int] = None, *,
+                        targets: Optional[list] = None) -> dict:
+        """Watch NEAR transfers to one or more exact CS:IP targets (proposal 4.9.5).
+
+        Single form: ``cpu_watch_target(0x1234, 0x5678)``. Set form:
+        ``cpu_watch_target(targets=["1234:5678", "1234:9ABC"])`` arms a *set* of
+        ``"SEG:OFF"`` sentinels (replaces any prior set; ``[]`` clears). Each
+        ``cpu.transfer`` event carries a ``which`` index into the set, with
+        per-sentinel ``hits`` in ``debug_status``' ``watches.target``. Called
+        with no argument (or ``target_seg=None``) it clears the watch.
+        """
+        if targets is not None:
+            return self.call("cpu.watch_target", targets=list(targets))
+        if target_seg is None:
+            return self.call("cpu.watch_target", target_seg=None)
+        return self.call("cpu.watch_target", target_seg=target_seg, target_off=target_off)
+
+    def cpu_unwatch_target(self) -> dict:
+        return self.call("cpu.unwatch_target")
+
+    def cpu_watch_range(self, seg: Optional[int] = None, lo: Optional[int] = None,
+                       hi: Optional[int] = None, *, ranges: Optional[list] = None) -> dict:
+        """Watch entry into one or more [seg, lo..hi] ranges from outside (4.9.5).
+
+        Single form: ``cpu_watch_range(seg, lo, hi)`` fires on the boundary
+        crossing *into* ``[seg, lo..hi]`` (use this over ``cpu_watch_target``
+        when the region has heavy intra-range traffic). Set form:
+        ``cpu_watch_range(ranges=[{"seg":…,"lo":…,"hi":…}, …])`` arms a *set*
+        (replaces any prior set; ``[]`` clears). Each ``cpu.range_enter`` event
+        carries a ``which`` index into the set, with per-sentinel ``hits`` in
+        ``debug_status``' ``watches.range``. Called with no argument (or
+        ``seg=None``) it clears the watch.
+        """
+        if ranges is not None:
+            return self.call("cpu.watch_range", ranges=list(ranges))
+        if seg is None:
+            return self.call("cpu.watch_range", seg=None)
         return self.call("cpu.watch_range", seg=seg, lo=lo, hi=hi)
 
     def cpu_unwatch_range(self) -> dict:
         return self.call("cpu.unwatch_range")
+
+    def mem_watch(self, seg: int, lo: int, hi: int, *, size: Optional[int] = None,
+                  when: Optional[dict] = None) -> dict:
+        """Intercept guest writes into [seg, lo..hi] and report the storing
+        instruction (proposal 4.9.4).
+
+        A real write-intercept (not a value-change poll): on a matching store
+        you get a ``mem.write`` event naming the instruction
+        (``from_cs:from_ip`` + ``from_text``), the old/new value, and the access
+        size. ``lo``/``hi`` are offsets within ``seg`` (matched against the
+        write's starting linear address). ``size`` (1, 2, or 4) optionally
+        filters by access width. ``when`` optionally filters by value — pass one
+        of ``{"new_eq": v}``, ``{"new_ne_old": True}``, or
+        ``{"new_and_mask_eq": {"mask": m, "value": v}}``. Returns
+        ``{armed, seg, lo, hi, size, predicate}``. VGA-framebuffer writes report
+        ``old: null`` (the read-back is skipped to avoid latch corruption). Use
+        ``mem_unwatch`` to clear. Heavy-debug build records ``from_*``; the watch
+        itself fires in any C_DEBUG build.
+        """
+        args: dict = {"seg": seg, "lo": lo, "hi": hi}
+        if size is not None:
+            args["size"] = size
+        if when is not None:
+            args["when"] = when
+        return self.call("mem.watch", **args)
+
+    def mem_unwatch(self) -> dict:
+        return self.call("mem.unwatch")
 
     def screen_capture(self, raw: bool = True, timeout: float = 10.0) -> dict:
         """Trigger a PNG screenshot and block until written.

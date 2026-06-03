@@ -16,8 +16,10 @@ newline-delimited JSON. You can:
 
 - Pause / resume the CPU.
 - Type ASCII into the guest, or send raw key make/break events.
-- Read all CPU registers in one structured reply (`regs.get`).
-- Read up to 64 KB of guest memory at a time, base64-encoded (`mem.read`).
+- Read all CPU registers in one structured reply (`regs.get`), or write named
+  registers (`regs.set`, paused only).
+- Read up to 64 KB of guest memory at a time, base64-encoded (`mem.read`), or
+  write raw bytes back (`mem.write`).
 - Invoke any of the existing debugger commands whose output goes through
   `DEBUG_ShowMsg` (`BPLIST`, `BP`, `BPM`, `BPINT`, `BPDEL`, `EV`, `INT`,
   `IDT`, `GDT`, `KERN`, `CALLBACKS`, `DOS MCBS/DEVS/XMS/EMS`, `BIOS MEM`,
@@ -30,9 +32,10 @@ but the headlines are: anything the curses debugger draws into a pane
 (register pane, disassembly pane, hex/ASCII data pane) is invisible to
 the agent. `MEMDUMP` writes a file on disk rather than returning bytes
 inline. Single-stepping *is* available with structured output
-(`cpu.step` / `cpu.step_over`, below); mouse input and typed breakpoint
-commands are still planned for Phase 2. (Screenshots are available via
-`screen.capture`.)
+(`cpu.step` / `cpu.step_over`, below); register and memory *writes* are
+available too (`regs.set` / `mem.write`, below). Mouse input and typed
+breakpoint commands (`bp.add`/`bp.list`/`bp.del`) are still planned for Phase 2.
+(Screenshots are available via `screen.capture`.)
 
 ## Requirements
 
@@ -113,7 +116,9 @@ events don't. The reference client does this in a single reader thread.
 |---------------------|-------------------------------|-------------------------------------|
 | `vm.version`        | none                          | `{version, machine, build}`         |
 | `regs.get`          | none                          | All GPRs + segregs + EIP + EFLAGS   |
+| `regs.set`          | `{<reg>: <val>, …}`           | `{set, regs}` (paused only)         |
 | `mem.read`          | `{kind, addr, len}`           | `{bytes, len}` — bytes base64       |
+| `mem.write`         | `{kind, addr, bytes}`         | `{written}` — bytes base64          |
 | `debugger.command`  | `{text}`                      | `{output, recognized}`              |
 | `cpu.pause`         | none                          | `{}`                                |
 | `cpu.run`           | none                          | `{}`                                |
@@ -181,6 +186,35 @@ curses register pane is drawn directly to ncurses windows (not capturable
 through the agent). Prefer `regs.get` over the legacy `EV <register>`
 expression-reader, which only returns one register per call.
 
+### `regs.set`
+
+Write one or more registers — the write counterpart to `regs.get`. **Requires
+the CPU paused** (`cpu.pause` first); the agent applies the write between
+instructions, a safe point. Pass registers by the same names `regs.get` returns,
+each value a JSON number or a hex string. Only the registers you name change.
+
+```json
+{"id": 1, "cmd": "regs.set", "args": {"eax": 4275878552, "cs": "0x0824"}}
+```
+
+- Names: `eax`..`esp`, `eip` (32-bit), `cs`/`ds`/`es`/`fs`/`gs`/`ss` (16-bit),
+  `eflags`. An unknown name, a non-numeric value, or a segment value above
+  `0xFFFF` rejects the **whole** request with `bad_args` and writes nothing
+  (all-or-nothing).
+- Segment writes use the real-mode form (they update the segment value and its
+  real-mode base, but do **not** reload protected-mode descriptor limits — same
+  behaviour as the curses debugger's `SR` command). `eflags` is written through
+  `CPU_SetFlags`, so reserved/masked bits are handled.
+
+Reply: `{"set": ["cs", "eax"], "regs": {…}}` — `set` lists the names applied,
+`regs` is the full post-set snapshot (`regs.get` shape) so you confirm the write
+with no follow-up call. Errors: `bad_state` (CPU not paused), `bad_args`.
+
+```python
+a.cpu_pause()
+a.regs_set(eax=0xDEADBEEF, eip=0x100)        # keyword args or a dict
+```
+
 ### `mem.read`
 
 Read up to 64 KB of guest memory at a time. Returns base64-encoded bytes.
@@ -214,6 +248,34 @@ This is the supported replacement for `MEMDUMP` (which writes
 `MEMDUMP.TXT` to DOSBox-X's cwd) and the curses `D`/`DV`/`DP` data panes
 (which render into invisible ncurses windows). Use `mem.read` for any
 inline byte access.
+
+### `mem.write`
+
+Write raw bytes into guest memory — the store counterpart to `mem.read`. Same
+`kind` / `addr` semantics and the same 64 KB per-call cap; the bytes to write
+arrive base64-encoded.
+
+```json
+{"id": 1, "cmd": "mem.write",
+ "args": {"kind": "seg:off", "addr": "1000:0100", "bytes": "kJDNIQ=="}}
+```
+
+- `kind` (required) — `"seg:off"` / `"linear"` (paged write) or `"physical"`
+  (bypasses paging), exactly as `mem.read`.
+- `addr` (required, string) — hex, with or without `0x` prefix.
+- `bytes` (required, string) — standard padded base64 (length a multiple of 4);
+  decodes to at most 65536 bytes. Chunk larger writes.
+
+Reply: `{"written": <N>}` — the number of bytes stored.
+
+```python
+a.mem_write("seg:off", "1000:0100", b"\x90\x90\xcd\x21")   # raw bytes; encoded for you
+```
+
+Unlike the savestate and step commands, `mem.write` does **not** require the CPU
+paused — the agent applies the store between instructions, so it is race-free.
+But a running guest may immediately overwrite what you wrote; pause first when
+patching a value the guest is actively using.
 
 ### `debugger.command`
 
@@ -1203,8 +1265,8 @@ a.keyboard_release("leftctrl")
 - **`debugger.command` is text in, text out.** Output formatting matches
   the curses debugger and can change between versions. Don't write
   brittle parsers on top of it; for registers and memory use the typed
-  `regs.get` / `mem.read` commands, and for everything else wait for
-  Phase 2 to add a typed equivalent.
+  `regs.get` / `regs.set` / `mem.read` / `mem.write` commands, and for
+  everything else wait for Phase 2 to add a typed equivalent.
 - **`keyboard.type` is ASCII only.** Non-ASCII input is silently mangled
   by the paste driver. For non-ASCII or modifier combos, use `press` /
   `release` / `tap` with named keys.
