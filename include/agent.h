@@ -160,6 +160,18 @@ bool AGENT_MemWatchMatch(uint32_t lin_addr, uint32_t newval, uint32_t oldval, in
 bool AGENT_MemWatchMatchNoOld(uint32_t lin_addr, uint32_t newval, int size);
 void AGENT_MemWatchNote(uint32_t lin_addr, uint32_t newval, int size);
 
+/* The becomes_eq (value-landed) predicate fires once per rising edge for ANY
+ * store overlapping the watched value_size-byte unit, regardless of that
+ * store's width/value — so a byte-wise / partial / block populate that the
+ * store-value predicates miss is named in one run. AGENT_MemWatchUnitOverlap
+ * exposes the overlap decision and AGENT_MemWatchMergeUnit the byte-overlay
+ * that derives the settled unit; both are pure (no MemBase) for the unit
+ * tests, the full hook path (read-back + rising-edge dedup) is in
+ * AGENT_MemWatchNote. */
+bool AGENT_MemWatchUnitOverlap(uint32_t store_lin, int size);
+uint32_t AGENT_MemWatchMergeUnit(uint32_t preUnit, uint32_t store_lin,
+                                 uint32_t store_val, int store_size);
+
 /* Notified when DOSBOX_SetNormalLoop / DOSBOX_SetLoop changes the main
  * loop. Used so we know when to flip state.paused <-> state.running. */
 void AGENT_OnLoopChange(void);
@@ -241,6 +253,8 @@ static inline void AGENT_TraceRecord(uint16_t /*seg*/, uint16_t /*off*/) {}
 static inline bool AGENT_MemWatchMatch(uint32_t, uint32_t, uint32_t, int) { return false; }
 static inline bool AGENT_MemWatchMatchNoOld(uint32_t, uint32_t, int) { return false; }
 static inline void AGENT_MemWatchNote(uint32_t, uint32_t, int) {}
+static inline bool AGENT_MemWatchUnitOverlap(uint32_t, int) { return false; }
+static inline uint32_t AGENT_MemWatchMergeUnit(uint32_t, uint32_t, uint32_t, int) { return 0; }
 static inline void AGENT_OnLoopChange(void) {}
 static inline void AGENT_OnScreenCaptured(const char * /*path*/, bool /*raw*/) {}
 static inline bool AGENT_IsHeadless(void) { return false; }

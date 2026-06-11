@@ -204,12 +204,18 @@ struct BpValSrc {
 };
 
 /* One operand: either a direct value source, or a real-mode memory
- * dereference [seg:off] read at a given access width (1/2/4 bytes). */
+ * dereference [seg:off] read at a given access width (1/2/4 bytes). The
+ * effective offset is memOff (a register or literal) plus the signed
+ * displacement memDisp, wrapped to 16 bits — so `[si+04]` is memOff=SI,
+ * memDisp=+4, and `[ds:di-02]` is memOff=DI, memDisp=-2. When the source
+ * writes no explicit segment (`[si+04]` rather than `[ds:si+04]`), memSeg is
+ * set to the DS register so it resolves live like a real `[reg]` reference. */
 struct BpOperand {
     bool     isMem = false;
     BpValSrc direct;          /* when !isMem */
     BpValSrc memSeg;          /* when isMem  */
     BpValSrc memOff;
+    int32_t  memDisp = 0;     /* when isMem: signed disp added to memOff      */
     int      memSize = 2;
 };
 

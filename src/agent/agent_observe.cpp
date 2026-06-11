@@ -86,7 +86,8 @@ enum MemWatchPred {
     MW_PRED_NONE = 0,
     MW_PRED_NEW_EQ,           /* new == val (masked to size)              */
     MW_PRED_NEW_NE_OLD,       /* new != old (masked to size)              */
-    MW_PRED_NEW_AND_MASK_EQ   /* (new & mask) == (val & mask)             */
+    MW_PRED_NEW_AND_MASK_EQ,  /* (new & mask) == (val & mask)             */
+    MW_PRED_BECOMES_EQ        /* the value-landed predicate (see below)   */
 };
 static uint16_t g_memWatchSeg     = 0;
 static uint16_t g_memWatchLo      = 0;
@@ -99,6 +100,18 @@ static int      g_memWatchPred    = MW_PRED_NONE;
 static uint32_t g_memWatchPredVal = 0;
 static uint32_t g_memWatchPredMask= 0;
 static uint64_t g_memWatchHits    = 0;
+
+/* becomes_eq (value-landed) state. The watched *unit* is the value_size-byte
+ * value at seg:lo; it fires once per rising edge (unit != V -> unit == V) for
+ * ANY store that overlaps the unit, regardless of that store's width or value.
+ * g_memWatchLastUnit tracks the post-store unit value across overlapping
+ * stores so the per-frame re-stamp of V doesn't flood; it is seeded with a
+ * 33-bit sentinel that can never equal a 1/2/4-byte unit, so the first landing
+ * always edges (i.e. a field that is already V at arm time still names its next
+ * writer). */
+static int      g_memWatchValueSize = 0; /* becomes_eq unit width: 1 / 2 / 4   */
+const  uint64_t MEMWATCH_UNIT_SENTINEL = 0x1FFFFFFFFull;
+static uint64_t g_memWatchLastUnit  = MEMWATCH_UNIT_SENTINEL;
 
 /* Longest legal x86 instruction; clamp DasmI386's reported size so a bad
  * decode can't make us read/echo a huge byte run. */
@@ -174,13 +187,26 @@ void memWatchClear() {
     g_memWatchPred = MW_PRED_NONE;
     g_memWatchPredVal = g_memWatchPredMask = 0;
     g_memWatchHits = 0;
+    g_memWatchValueSize = 0;
+    g_memWatchLastUnit = MEMWATCH_UNIT_SENTINEL;
 }
 
 /* The cheap range+size pre-filter (no memory read). Shared by the hot-path
  * hook (which calls it before reading the old value) and AGENT_MemWatchMatch
- * (which adds the value predicate). Matches on the write's *starting* address
- * lying in [linLo, linHi]. */
+ * (which adds the value predicate). For the store-value predicates the test is
+ * the write's *starting* address lying in [linLo, linHi] (plus the access-size
+ * filter). For becomes_eq the question is different — "did this store touch the
+ * watched unit at all?" — so the test is interval *overlap* of the store
+ * [lin, lin+size) with the unit [linLo, linLo+value_size), and the access-size
+ * filter is ignored (any width that crosses the unit qualifies). */
 bool memWatchInScope(uint32_t lin_addr, int size) {
+    if (g_memWatchPred == MW_PRED_BECOMES_EQ) {
+        const uint32_t storeLo = lin_addr;
+        const uint32_t storeHi = lin_addr + uint32_t(size);
+        const uint32_t unitLo  = g_memWatchLinLo;
+        const uint32_t unitHi  = unitLo + uint32_t(g_memWatchValueSize);
+        return storeLo < unitHi && unitLo < storeHi;
+    }
     if (g_memWatchSize != 0 && size != g_memWatchSize) return false;
     if (lin_addr < g_memWatchLinLo) return false;
     if (lin_addr > g_memWatchLinHi) return false;
@@ -206,6 +232,27 @@ bool memReadIsSideEffectFree(uint32_t lin_addr) {
     return h != nullptr && (h->getFlags() & PFLAG_READABLE) != 0;
 }
 
+/* Pure: given the pre-store value of the `vsz`-byte unit at `unitLo`, return
+ * the unit value AFTER the store [storeLin, storeLin+storeSize) of `storeVal`
+ * (little-endian) is applied. Each unit byte that the store overwrites takes
+ * the corresponding store byte; the rest keep their pre-store value. No memory
+ * access — the caller supplies the pre-store unit — so this is unit-testable.
+ * This is what makes becomes_eq fire on a byte-wise / partial / block store
+ * that the store-value predicates miss: the merged result is what the unit
+ * actually becomes, not what any single store wrote. */
+uint32_t mergeStoreIntoUnit(uint32_t preUnit, uint32_t unitLo, int vsz,
+                            uint32_t storeLin, uint32_t storeVal, int storeSize) {
+    uint32_t post = 0;
+    for (int i = 0; i < vsz; ++i) {
+        const uint32_t a = unitLo + uint32_t(i);
+        uint8_t b = uint8_t((preUnit >> (8 * i)) & 0xFFu);
+        if (a >= storeLin && a < storeLin + uint32_t(storeSize))
+            b = uint8_t((storeVal >> (8u * (a - storeLin))) & 0xFFu);
+        post |= uint32_t(b) << (8 * i);
+    }
+    return post;
+}
+
 std::string memWatchPredDesc() {
     char buf[80];
     switch (g_memWatchPred) {
@@ -217,6 +264,9 @@ std::string memWatchPredDesc() {
         case MW_PRED_NEW_AND_MASK_EQ:
             snprintf(buf, sizeof(buf), "new_and_mask_eq mask=0x%X value=0x%X",
                      unsigned(g_memWatchPredMask), unsigned(g_memWatchPredVal));
+            return buf;
+        case MW_PRED_BECOMES_EQ:
+            snprintf(buf, sizeof(buf), "becomes_eq=0x%X", unsigned(g_memWatchPredVal));
             return buf;
         default:
             return "none";
@@ -230,12 +280,20 @@ std::string memWatchPredDesc() {
  * (disassembly of the storing instruction) is escaped safely. `oldKnown` is
  * false for side-effecting destinations (VGA/MMIO) where the old value was not
  * sampled; `old` is then reported as JSON null. */
-void emitMemWrite(uint32_t lin_addr, uint32_t oldval, uint32_t newval, int size, bool oldKnown) {
+/* `valueMask` is the width at which old/new are reported. For the store-value
+ * predicates that is the store's own access width (sizeMask(size)); for
+ * becomes_eq it is the unit width (value_size), which is independent of the
+ * store width that triggered the landing — a 1-byte store can settle a 2-byte
+ * unit to V, and the event must report the full 2-byte unit, not the low byte.
+ * `lin_addr` likewise names the reported location: the store's start for the
+ * store-value predicates, the unit's base (seg:lo) for becomes_eq. */
+void emitMemWrite(uint32_t lin_addr, uint32_t oldval, uint32_t newval, int size,
+                  bool oldKnown, uint32_t valueMask) {
     uint16_t seg = g_memWatchSeg;
     uint16_t off = uint16_t((lin_addr - g_memWatchBase) & 0xFFFFu);
     uint16_t from_cs = DEBUG_GetPrevCS();
     uint16_t from_ip = DEBUG_GetPrevIP();
-    uint32_t mask = sizeMask(size);
+    uint32_t mask = valueMask;
 
     JsonObject o;
     o.emplace("event", JsonValue::makeString("mem.write"));
@@ -420,6 +478,8 @@ JsonValue handleDebugStatus(double id, const JsonValue & /*args*/) {
             m.emplace("lo",   JsonValue::makeNumber(double(g_memWatchLo)));
             m.emplace("hi",   JsonValue::makeNumber(double(g_memWatchHi)));
             m.emplace("size", JsonValue::makeNumber(double(g_memWatchSize)));
+            if (g_memWatchPred == MW_PRED_BECOMES_EQ)
+                m.emplace("value_size", JsonValue::makeNumber(double(g_memWatchValueSize)));
             m.emplace("predicate", JsonValue::makeString(memWatchPredDesc()));
         }
         w.emplace("mem", JsonValue::makeObject(std::move(m)));
@@ -699,6 +759,21 @@ JsonValue handleMemWatch(double id, const JsonValue &args) {
         }
     }
 
+    /* Optional becomes_eq unit width. Only meaningful with the becomes_eq
+     * predicate (validated below); when omitted it defaults to the lo..hi span
+     * clamped down to {1,2,4}. */
+    int valueSizeV = 0;
+    if (const JsonValue *vs = args.get("value_size")) {
+        if (!vs->isNull()) {
+            if (!vs->isNumber())
+                return makeReplyError(id, "bad_args", "value_size must be 1, 2, or 4");
+            int s = int(vs->n);
+            if (s != 1 && s != 2 && s != 4)
+                return makeReplyError(id, "bad_args", "value_size must be 1, 2, or 4");
+            valueSizeV = s;
+        }
+    }
+
     /* Optional value predicate — exactly one of the three forms. */
     int      predV     = MW_PRED_NONE;
     uint32_t predValV  = 0;
@@ -710,14 +785,20 @@ JsonValue handleMemWatch(double id, const JsonValue &args) {
             const JsonValue *neq   = when->get("new_eq");
             const JsonValue *nne   = when->get("new_ne_old");
             const JsonValue *nmask = when->get("new_and_mask_eq");
-            int count = (neq ? 1 : 0) + (nne ? 1 : 0) + (nmask ? 1 : 0);
+            const JsonValue *beq   = when->get("becomes_eq");
+            int count = (neq ? 1 : 0) + (nne ? 1 : 0) + (nmask ? 1 : 0) + (beq ? 1 : 0);
             if (count == 0)
                 return makeReplyError(id, "bad_args",
-                    "'when' needs one of new_eq / new_ne_old / new_and_mask_eq");
+                    "'when' needs one of new_eq / new_ne_old / new_and_mask_eq / becomes_eq");
             if (count > 1)
                 return makeReplyError(id, "bad_args",
                     "'when' accepts only one predicate at a time");
-            if (neq) {
+            if (beq) {
+                if (!parseU32Any(*beq, predValV))
+                    return makeReplyError(id, "bad_args",
+                        "becomes_eq must be a u32 number or hex string");
+                predV = MW_PRED_BECOMES_EQ;
+            } else if (neq) {
                 if (!parseU32Any(*neq, predValV))
                     return makeReplyError(id, "bad_args",
                         "new_eq must be a u32 number or hex string");
@@ -746,6 +827,18 @@ JsonValue handleMemWatch(double id, const JsonValue &args) {
         }
     }
 
+    /* For becomes_eq, settle the unit width: the explicit value_size, else the
+     * lo..hi span clamped to {1,2,4} (largest valid width that is <= span). */
+    int unitSizeV = 0;
+    if (predV == MW_PRED_BECOMES_EQ) {
+        if (valueSizeV) {
+            unitSizeV = valueSizeV;
+        } else {
+            const int span = int(hiV - loV + 1);
+            unitSizeV = (span >= 4) ? 4 : (span >= 2) ? 2 : 1;
+        }
+    }
+
     /* Commit. */
     g_memWatchSeg      = segV;
     g_memWatchLo       = loV;
@@ -758,6 +851,8 @@ JsonValue handleMemWatch(double id, const JsonValue &args) {
     g_memWatchPredVal  = predValV;
     g_memWatchPredMask = predMaskV;
     g_memWatchHits     = 0;
+    g_memWatchValueSize = unitSizeV;
+    g_memWatchLastUnit  = MEMWATCH_UNIT_SENTINEL;   /* first landing always edges */
     AGENT_memWatchArmed = true;
 
     JsonObject r;
@@ -766,6 +861,8 @@ JsonValue handleMemWatch(double id, const JsonValue &args) {
     r.emplace("lo",        JsonValue::makeNumber(double(loV)));
     r.emplace("hi",        JsonValue::makeNumber(double(hiV)));
     r.emplace("size",      JsonValue::makeNumber(double(sizeV)));
+    if (predV == MW_PRED_BECOMES_EQ)
+        r.emplace("value_size", JsonValue::makeNumber(double(unitSizeV)));
     r.emplace("predicate", JsonValue::makeString(memWatchPredDesc()));
     return makeReplyOk(id, std::move(r));
 }
@@ -841,6 +938,10 @@ bool AGENT_MemWatchMatch(uint32_t lin_addr, uint32_t newval, uint32_t oldval, in
         case agent::MW_PRED_NEW_AND_MASK_EQ:
             return (nv & agent::g_memWatchPredMask)
                  == (agent::g_memWatchPredVal & agent::g_memWatchPredMask);
+        case agent::MW_PRED_BECOMES_EQ:
+            /* becomes_eq is value-landed, not store-valued: it has its own path
+             * in AGENT_MemWatchNote and never routes through this predicate. */
+            return false;
         case agent::MW_PRED_NONE:
         default:
             return true;
@@ -867,6 +968,8 @@ bool AGENT_MemWatchMatchNoOld(uint32_t lin_addr, uint32_t newval, int size) {
                  == (agent::g_memWatchPredVal & agent::g_memWatchPredMask);
         case agent::MW_PRED_NEW_NE_OLD:   /* old unknown -> cannot filter      */
             return true;
+        case agent::MW_PRED_BECOMES_EQ:   /* value-landed: handled elsewhere   */
+            return false;
         case agent::MW_PRED_NONE:
         default:
             return true;
@@ -886,9 +989,42 @@ bool AGENT_MemWatchMatchNoOld(uint32_t lin_addr, uint32_t newval, int size) {
  * This is what extends mem.watch to the VGA framebuffer
  * without disturbing emulation. */
 void AGENT_MemWatchNote(uint32_t lin_addr, uint32_t newval, int size) {
-    /* Cheap range/size pre-filter before touching anything. */
+    /* Cheap range/size pre-filter before touching anything. For becomes_eq this
+     * is the overlap test; for the store-value predicates it is start-in-range
+     * + access-size filter. */
     if (!agent::memWatchInScope(lin_addr, size)) return;
     if (size != 1 && size != 2 && size != 4) return;
+
+    /* becomes_eq: re-derive the settled value of the watched unit after this
+     * store and fire on the rising edge (unit != V -> unit == V). The hook runs
+     * BEFORE the store, so the unit's pre-store bytes are still live in guest
+     * RAM; merging the store's bytes over them yields the post-store unit
+     * without re-reading after the store. A value-landed watch is a RAM tool —
+     * if the unit's destination cannot be read back without side effects
+     * (VGA/MMIO), there is no settled value to compute, so it does not fire. */
+    if (agent::g_memWatchPred == agent::MW_PRED_BECOMES_EQ) {
+        const uint32_t unitLo = agent::g_memWatchLinLo;
+        const int      vsz    = agent::g_memWatchValueSize;
+        if (!agent::memReadIsSideEffectFree(unitLo)) return;
+
+        uint32_t preUnit = 0;
+        for (int i = 0; i < vsz; ++i)
+            preUnit |= uint32_t(mem_readb(unitLo + uint32_t(i))) << (8 * i);
+        const uint32_t postUnit =
+            agent::mergeStoreIntoUnit(preUnit, unitLo, vsz, lin_addr, newval, size);
+
+        const uint32_t V = agent::g_memWatchPredVal;
+        const bool rising = (postUnit == V) && (agent::g_memWatchLastUnit != uint64_t(V));
+        agent::g_memWatchLastUnit = postUnit;
+        if (!rising) return;
+
+        agent::g_memWatchHits++;
+        /* Report the unit (seg:lo) and its old->new transition at the unit
+         * width; `size` stays the store's width that triggered the landing. */
+        agent::emitMemWrite(unitLo, preUnit, postUnit, size, /*oldKnown=*/true,
+                            agent::sizeMask(vsz));
+        return;
+    }
 
     const bool oldKnown = agent::memReadIsSideEffectFree(lin_addr);
 
@@ -908,7 +1044,28 @@ void AGENT_MemWatchNote(uint32_t lin_addr, uint32_t newval, int size) {
     if (!matched) return;
 
     agent::g_memWatchHits++;
-    agent::emitMemWrite(lin_addr, oldval, newval, size, oldKnown);
+    agent::emitMemWrite(lin_addr, oldval, newval, size, oldKnown, agent::sizeMask(size));
+}
+
+/* ---- becomes_eq test hooks (pure; no MemBase) ------------------------- */
+
+/* Does a store [store_lin, store_lin+size) overlap the armed becomes_eq unit?
+ * Exposes the overlap decision (memWatchInScope's becomes_eq branch) for unit
+ * tests without a running guest. False unless a becomes_eq watch is armed. */
+bool AGENT_MemWatchUnitOverlap(uint32_t store_lin, int size) {
+    if (!AGENT_memWatchArmed) return false;
+    if (agent::g_memWatchPred != agent::MW_PRED_BECOMES_EQ) return false;
+    return agent::memWatchInScope(store_lin, size);
+}
+
+/* Merge a store into a supplied pre-store unit value and return the post-store
+ * unit, using the armed watch's unit base/width. Pure — the caller provides the
+ * pre-store unit — so the byte-overlay logic is testable without MemBase. */
+uint32_t AGENT_MemWatchMergeUnit(uint32_t preUnit, uint32_t store_lin,
+                                 uint32_t store_val, int store_size) {
+    return agent::mergeStoreIntoUnit(preUnit, agent::g_memWatchLinLo,
+                                     agent::g_memWatchValueSize,
+                                     store_lin, store_val, store_size);
 }
 
 #endif /* C_DEBUG */

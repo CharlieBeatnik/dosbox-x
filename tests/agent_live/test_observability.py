@@ -1141,6 +1141,164 @@ def scenario11_typed_breakpoints(agent, cs, loopbody, trace_a, rep) -> None:
             agent.cpu_run(); _drain_events(agent)
 
 
+def scenario12_becomes_eq(agent, cs, bw_field, bw_store, rep) -> None:
+    # Feature A (proposal 4.10): value-landed mem.watch. The guest settles the
+    # 2-byte field bw_field to WATCH_VALUE one byte at a time (low byte, then the
+    # high byte at bw_store). becomes_eq fires once on the rising edge and names
+    # bw_store — even though no single store is a 2-byte write of WATCH_VALUE.
+
+    # 12a: becomes_eq names the byte-wise writer.
+    name = "scenario12a: mem.watch becomes_eq names the byte-wise writer"
+    try:
+        _reset(agent)
+        r = agent.call("mem.watch", seg=f"{cs:04X}",
+                       lo=f"{bw_field:04X}", hi=f"{bw_field + 1:04X}",
+                       value_size=2, when={"becomes_eq": WATCH_VALUE})
+        if not r.get("armed") or r.get("value_size") != 2:
+            rep.record(name, False, f"mem.watch arm reply: {r}")
+            return
+        agent.cpu_run(); _drain_events(agent)
+        agent.keyboard_tap("8")
+        ev = _wait_for_event(agent, "mem.write", timeout=8.0)
+
+        problems = []
+        if ev.get("seg") != cs or ev.get("off") != bw_field:
+            problems.append(
+                f"addr {ev.get('seg'):04X}:{ev.get('off'):04X} != unit {cs:04X}:{bw_field:04X}")
+        if ev.get("from_cs") != cs or ev.get("from_ip") != bw_store:
+            problems.append(
+                f"from {ev.get('from_cs'):04X}:{ev.get('from_ip'):04X} != "
+                f"bw_store {cs:04X}:{bw_store:04X}")
+        if ev.get("new") != WATCH_VALUE:
+            problems.append(f"new={ev.get('new')!r} expected {WATCH_VALUE:#06x}")
+        # The high-byte store lands V; the unit was 0x0053 (low byte only) before.
+        if ev.get("old") != 0x0053:
+            problems.append(f"old={ev.get('old')!r} expected 0x0053 (low byte only)")
+        if ev.get("size") != 1:
+            problems.append(f"size={ev.get('size')} expected 1 (high-byte store width)")
+        ftext = (ev.get("from_text") or "").lower()
+        if "mov" not in ftext:
+            problems.append(f"from_text={ev.get('from_text')!r} (expected a mov)")
+        st = agent.call("debug.status")
+        if st.get("watches", {}).get("mem", {}).get("hits", 0) < 1:
+            problems.append("debug.status mem hits < 1")
+
+        if problems:
+            rep.record(name, False, "; ".join(problems[:4]))
+        else:
+            rep.record(name, True,
+                       f"becomes_eq named {cs:04X}:{bw_store:04X} "
+                       f"old=0x0053->new={WATCH_VALUE:#06x} size=1 '{ev.get('from_text')}'")
+    except Exception as exc:
+        rep.record(name, False, repr(exc))
+    finally:
+        with contextlib.suppress(Exception):
+            agent.cpu_pause(); _drain_events(agent)
+            agent.call("mem.unwatch")
+            agent.cpu_run(); _drain_events(agent)
+
+    # 12b: the store-value predicate (new_eq=V, size=2) MISSES the byte-wise
+    # populate — the exact false zero this feature removes. No mem.write arrives.
+    name = "scenario12b: new_eq size=2 sees the false zero (no event), becomes_eq is the fix"
+    try:
+        _reset(agent)
+        r = agent.call("mem.watch", seg=f"{cs:04X}",
+                       lo=f"{bw_field:04X}", hi=f"{bw_field + 1:04X}",
+                       size=2, when={"new_eq": WATCH_VALUE})
+        if not r.get("armed"):
+            rep.record(name, False, f"mem.watch arm reply: {r}")
+            return
+        agent.cpu_run(); _drain_events(agent)
+        agent.keyboard_tap("8")
+        try:
+            ev = _wait_for_event(agent, "mem.write", timeout=2.5)
+            rep.record(name, False, f"unexpected mem.write (false zero not reproduced): {ev}")
+            return
+        except TimeoutError:
+            pass
+        agent.cpu_pause(); _drain_events(agent)
+        st = agent.call("debug.status")
+        hits = st.get("watches", {}).get("mem", {}).get("hits", 0)
+        if hits != 0:
+            rep.record(name, False, f"new_eq size=2 hits={hits} (expected 0)")
+        else:
+            rep.record(name, True, "new_eq size=2 produced 0 events for the byte-wise populate")
+    except Exception as exc:
+        rep.record(name, False, repr(exc))
+    finally:
+        with contextlib.suppress(Exception):
+            agent.cpu_pause(); _drain_events(agent)
+            agent.call("mem.unwatch")
+            agent.cpu_run(); _drain_events(agent)
+
+
+def scenario13_reg_indexed_bp(agent, cs, dispatch, hdl_bad, node1, rep) -> None:
+    # Feature B (proposal 4.10): a register-indexed [reg+disp] condition. The
+    # walker dispatches each node via `call word ptr [si+04]`; the conditional BP
+    # at landmark_dispatch halts only when the node it is about to call has the
+    # bad handler: `word [si+04]==<hdl_bad>`. Before 4.10 this condition was
+    # rejected at bp.set time; now it arms and halts with SI pointing at node1.
+    name = "scenario13: bp.set word [si+04]==X halts on the bad dispatch (SI=node1)"
+    try:
+        _reset(agent)
+        cond = f"word [si+04]==0x{hdl_bad:04X}"
+        r = agent.bp_set(f"{cs:04X}:{dispatch:04X}", if_=cond,
+                         do=[{"cmd": "regs.get"}], cont=False)
+        if "bp_id" not in r:
+            rep.record(name, False, f"bp.set reply: {r}")
+            return
+        if r.get("condition") != cond:
+            rep.record(name, False, f"condition echo {r.get('condition')!r} != {cond!r}")
+            return
+        agent.cpu_run(); _drain_events(agent)
+        agent.keyboard_tap("9")
+        ev = _wait_for_event(agent, "bp.cond", timeout=8.0)
+
+        problems = []
+        if ev.get("halted") is not True:
+            problems.append(f"halted={ev.get('halted')!r} expected True")
+        if ev.get("seg") != cs or ev.get("off") != dispatch:
+            problems.append(
+                f"addr {ev.get('seg'):04X}:{ev.get('off'):04X} != dispatch {cs:04X}:{dispatch:04X}")
+        # node0 is reached first (condition false), node1 second (matches) -> hits 2.
+        if ev.get("hits") != 2:
+            problems.append(f"event hits={ev.get('hits')} expected 2 (node0 missed, node1 matched)")
+        results = ev.get("results", [])
+        if not results or results[0].get("cmd") != "regs.get" or not results[0].get("ok"):
+            problems.append(f"macro results={results}")
+        else:
+            macro_si = results[0]["result"]["esi"] & 0xFFFF
+            if macro_si != node1:
+                problems.append(f"macro SI={macro_si:#06x} expected node1 {node1:#06x}")
+
+        st = agent.call("debug.status")
+        if st.get("cpu") != "paused":
+            problems.append(f"cpu={st.get('cpu')!r} expected paused")
+        cbs = st.get("cond_breakpoints", [])
+        cb = cbs[0] if cbs else {}
+        if cb.get("fires", 0) != 1:
+            problems.append(f"cond fires={cb.get('fires')} expected 1")
+        if cb.get("hits", 0) != 2:
+            problems.append(f"cond hits={cb.get('hits')} expected 2")
+        live_si = agent.regs_get()["esi"] & 0xFFFF
+        if live_si != node1:
+            problems.append(f"live SI={live_si:#06x} expected node1 {node1:#06x}")
+
+        if problems:
+            rep.record(name, False, "; ".join(problems[:4]))
+        else:
+            rep.record(name, True,
+                       f"halted at node1 ({node1:#06x}); [si+04] selected hdl_bad {hdl_bad:#06x}")
+    except Exception as exc:
+        rep.record(name, False, repr(exc))
+    finally:
+        with contextlib.suppress(Exception):
+            agent.cpu_pause(); _drain_events(agent)
+            agent.bp_clear()
+            agent.debugger_command("BPDEL 0 *")
+            agent.cpu_run(); _drain_events(agent)
+
+
 def run(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--dosbox", default=str(DEFAULT_DOSBOX))
@@ -1174,16 +1332,20 @@ def run(argv=None) -> int:
 
             cs = _read_signature(agent)
             print(f"OBSTEST.COM CS=0x{cs:04X}", flush=True)
-            tbl = agent.mem_read("seg:off", f"{cs:04X}:0103", 28)
+            tbl = agent.mem_read("seg:off", f"{cs:04X}:0103", 38)
             (loopbody, disasm, trace_a, trace_end, iters, disasm_end,
              watch_target, store, vga_store, msa, msb,
-             call_at, call_ret, sub) = struct.unpack("<14H", tbl)
+             call_at, call_ret, sub,
+             bw_field, bw_store, dispatch, hdl_bad, node1) = struct.unpack("<19H", tbl)
             print(f"landmarks: loopbody={loopbody:04X} disasm={disasm:04X} "
                   f"trace_a={trace_a:04X} trace_end={trace_end:04X} iters={iters} "
                   f"disasm_end={disasm_end:04X} watch_target={watch_target:04X} "
                   f"store={store:04X} vga_store={vga_store:04X} "
                   f"msa={msa:04X} msb={msb:04X} "
-                  f"call={call_at:04X} call_ret={call_ret:04X} sub={sub:04X}", flush=True)
+                  f"call={call_at:04X} call_ret={call_ret:04X} sub={sub:04X} "
+                  f"bw_field={bw_field:04X} bw_store={bw_store:04X} "
+                  f"dispatch={dispatch:04X} hdl_bad={hdl_bad:04X} node1={node1:04X}",
+                  flush=True)
 
             scenario1_probe_and_counters(agent, cs, loopbody, iters, rep)
             scenario2_disasm(agent, cs, disasm, disasm_end, rep)
@@ -1202,6 +1364,10 @@ def run(argv=None) -> int:
             scenario10_regs_set_mem_write(agent, cs, watch_target, rep)
             # Typed real breakpoints with stable handles (bp.add/list/del).
             scenario11_typed_breakpoints(agent, cs, loopbody, trace_a, rep)
+            # Proposal 4.10: value-landed becomes_eq mem.watch + register-indexed
+            # [si+04] bp.set condition.
+            scenario12_becomes_eq(agent, cs, bw_field, bw_store, rep)
+            scenario13_reg_indexed_bp(agent, cs, dispatch, hdl_bad, node1, rep)
 
             with contextlib.suppress(Exception):
                 _reset(agent)

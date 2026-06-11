@@ -657,14 +657,20 @@ JsonValue handleStateRestore(double id, const JsonValue &args) {
  *     operand [ '&' mask ] op operand
  *
  *   op       := == | != | < | <= | > | >=     (unsigned)
- *   operand  := value | [size] '[' value ':' value ']'
+ *   operand  := value | [size] '[' [ value ':' ] value [ ('+'|'-') disp ] ']'
  *   value    := register | hits | number      (number: 0xHEX or decimal)
  *   register := ax bx cx dx si di bp sp ip / al ah bl bh cl ch dl dh
  *               / eax..eip / cs ds es ss fs gs / flags eflags
  *   size     := byte | word | dword            (memory access width; word default)
  *
+ * The memory operand's offset may be a register with an optional signed
+ * displacement (`[si+04]`, `[ds:di-02]`); the segment is optional and defaults
+ * to DS. The effective address is (seg<<4) + ((off + disp) & 0xFFFF), resolved
+ * against the live registers at the trigger instruction.
+ *
  * Examples: "sp==0x0200", "hits==7", "cx==151", "byte [es:di]==0x5A",
- *           "[ss:01F8]>0x1000", "flags&0x40!=0". */
+ *           "[ss:01F8]>0x1000", "flags&0x40!=0",
+ *           "word [si+04]==0x853", "word [ds:si+02]==0x37DF". */
 
 namespace {
 
@@ -723,7 +729,8 @@ bool bpParseNum(const std::string &w, uint32_t &out) {
 }
 
 /* ---- tokenizer ---- */
-enum BpTokKind { BPT_WORD, BPT_OP, BPT_LBRACK, BPT_RBRACK, BPT_COLON, BPT_AMP };
+enum BpTokKind { BPT_WORD, BPT_OP, BPT_LBRACK, BPT_RBRACK, BPT_COLON, BPT_AMP,
+                 BPT_PLUS, BPT_MINUS };
 struct BpTok { BpTokKind kind; std::string text; int op; };
 
 bool bpTokenize(const std::string &s, std::vector<BpTok> &out, std::string &err) {
@@ -735,6 +742,11 @@ bool bpTokenize(const std::string &s, std::vector<BpTok> &out, std::string &err)
         if (c == ']') { out.push_back({BPT_RBRACK, "", 0}); i++; continue; }
         if (c == ':') { out.push_back({BPT_COLON,  "", 0}); i++; continue; }
         if (c == '&') { out.push_back({BPT_AMP,    "", 0}); i++; continue; }
+        /* '+'/'-' are the displacement signs inside a [reg+disp] memref; they
+         * are not valid anywhere else and the operand parser only consumes them
+         * between an offset base and a literal. */
+        if (c == '+') { out.push_back({BPT_PLUS,  "", 0}); i++; continue; }
+        if (c == '-') { out.push_back({BPT_MINUS, "", 0}); i++; continue; }
         if (c == '<' || c == '>' || c == '=' || c == '!') {
             int op;
             if (c == '=') {
@@ -799,13 +811,39 @@ bool bpParseOperand(const std::vector<BpTok> &t, size_t &i, BpOperand &out, std:
     }
     if (i < t.size() && t[i].kind == BPT_LBRACK) {
         i++;   /* consume '[' */
-        if (i >= t.size() || t[i].kind != BPT_WORD) { err = "expected segment in [seg:off]"; return false; }
-        BpValSrc seg; if (!bpParseValSrc(t[i].text, seg, err, /*hexNum=*/true)) return false; i++;
-        if (i >= t.size() || t[i].kind != BPT_COLON) { err = "expected ':' in [seg:off]"; return false; } i++;
-        if (i >= t.size() || t[i].kind != BPT_WORD) { err = "expected offset in [seg:off]"; return false; }
-        BpValSrc off; if (!bpParseValSrc(t[i].text, off, err, /*hexNum=*/true)) return false; i++;
-        if (i >= t.size() || t[i].kind != BPT_RBRACK) { err = "expected ']' in [seg:off]"; return false; } i++;
-        out.isMem = true; out.memSeg = seg; out.memOff = off; out.memSize = size;
+        /* Grammar: '[' [ segreg|seglit ':' ] (reg|lit) [ ('+'|'-') displit ] ']'
+         * The segment is optional and defaults to DS, so `[si+04]` == `[ds:si+04]`
+         * — exactly the real-mode addressing the indirect-dispatch conditions
+         * (`call word [si+04]`) need. Both halves stay bare-hex literals or any
+         * register the standalone-operand table resolves, so every prior
+         * `[ss:01F8]` / `byte [es:di]` condition keeps parsing. */
+        if (i >= t.size() || t[i].kind != BPT_WORD) { err = "expected segment or offset in [...]"; return false; }
+        BpValSrc first; if (!bpParseValSrc(t[i].text, first, err, /*hexNum=*/true)) return false; i++;
+
+        BpValSrc seg, off;
+        if (i < t.size() && t[i].kind == BPT_COLON) {
+            /* `first` was the segment; the offset follows the ':'. */
+            seg = first; i++;
+            if (i >= t.size() || t[i].kind != BPT_WORD) { err = "expected offset after ':' in [seg:off]"; return false; }
+            if (!bpParseValSrc(t[i].text, off, err, /*hexNum=*/true)) return false; i++;
+        } else {
+            /* No segment given: default DS, `first` is the offset. */
+            seg.kind = BpValSrc::REG; seg.reg = BPREG_DS;
+            off = first;
+        }
+
+        /* Optional signed displacement: `+disp` / `-disp` (bare hex). */
+        int32_t disp = 0;
+        if (i < t.size() && (t[i].kind == BPT_PLUS || t[i].kind == BPT_MINUS)) {
+            bool neg = (t[i].kind == BPT_MINUS); i++;
+            if (i >= t.size() || t[i].kind != BPT_WORD) { err = "expected a displacement after '+'/'-'"; return false; }
+            uint32_t d;
+            if (!parseHexU32(t[i].text, d)) { err = std::string("bad displacement: ") + t[i].text; return false; }
+            disp = neg ? -int32_t(d) : int32_t(d); i++;
+        }
+
+        if (i >= t.size() || t[i].kind != BPT_RBRACK) { err = "expected ']' to close the memory reference"; return false; } i++;
+        out.isMem = true; out.memSeg = seg; out.memOff = off; out.memDisp = disp; out.memSize = size;
         return true;
     }
     if (sized) { err = "size keyword is only valid before '[seg:off]'"; return false; }
@@ -868,7 +906,9 @@ uint32_t bpEvalValSrc(const BpValSrc &v, uint64_t hits) {
 uint32_t bpEvalOperand(const BpOperand &op, uint64_t hits) {
     if (!op.isMem) return bpEvalValSrc(op.direct, hits);
     uint32_t seg = bpEvalValSrc(op.memSeg, hits) & 0xFFFF;
-    uint32_t off = bpEvalValSrc(op.memOff, hits) & 0xFFFF;
+    /* Effective offset = (base register/literal + signed disp) wrapped to 16
+     * bits, matching real-mode [reg+disp] addressing. */
+    uint32_t off = (bpEvalValSrc(op.memOff, hits) + uint32_t(op.memDisp)) & 0xFFFF;
     uint32_t lin = (seg << 4) + off;
     uint32_t v = 0;
     for (int k = 0; k < op.memSize; ++k)

@@ -150,7 +150,7 @@ events don't. The reference client does this in a single reader thread.
 | `cpu.trace_ring`    | `{depth?, enabled?, seg?}`    | `{enabled, depth, seg?}`            |
 | `cpu.traceback`     | `{count?}`                    | `{entries: [{cs_ip, bytes, text}]}` |
 | `cpu.disasm`        | `{addr, count?}`              | `{insns: [{cs_ip, bytes, text}]}`   |
-| `mem.watch`         | `{seg, lo, hi, size?, when?}` | `{armed, seg, lo, hi, size, predicate}` (`seg=null` to clear) |
+| `mem.watch`         | `{seg, lo, hi, size?, when?, value_size?}` | `{armed, seg, lo, hi, size, predicate[, value_size]}` (`seg=null` to clear) |
 | `mem.unwatch`       | none                          | `{armed: false}`                    |
 
 ### `vm.version`
@@ -1025,8 +1025,15 @@ usual `debugger.entered` / `state.paused`:
     `al ah …`, `eax…eip`, `cs ds es ss fs gs`, `flags`/`eflags`), the literal
     **`hits`** (this BP's own reach count, for Nth-hit like `"hits==7"`), a
     number (decimal, or `0x`-hex), or a memory reference
-    `[byte|word|dword] [seg:off]` (`word` default; bare-hex halves like the rest
-    of the agent, e.g. `"[ss:01F8]==0x1234"`, `"byte [es:di]==0x5A"`).
+    `[byte|word|dword] [ [seg:] off [±disp] ]` (`word` default; bare-hex
+    literals like the rest of the agent). The offset may be a **register with an
+    optional signed displacement** and the **segment is optional, defaulting to
+    DS** — so `[si+04]` is `[ds:si+04]`. The effective address is
+    `(seg<<4) + ((off + disp) & 0xFFFF)`, resolved against the live registers at
+    the trigger instruction. Examples: `"[ss:01F8]==0x1234"`,
+    `"byte [es:di]==0x5A"`, and the indirect-dispatch case
+    `"word [si+04]==0x853"` — halt at a `call word [si+04]` site only when the
+    node it is about to call has handler `0x853`.
   - An optional `& mask` is applied to the left operand: `"flags&0x40!=0"`.
   - Omitted → the BP always fires (an unconditional halt + macro).
 - **`do`** (optional) — a list of read-only macro commands run when the condition
@@ -1064,7 +1071,12 @@ Errors / limits:
    "size":2,"when":{"new_eq":"0853"}}}
    → {"armed":true,"seg":2084,"lo":24576,"hi":28671,"size":2,
       "predicate":"new_eq=0x853"}
-{"id":2,"cmd":"mem.watch","args":{"seg":null}}   → {"armed":false}   // or mem.unwatch
+// value-landed: who makes the field at 0824:9F04 *become* 0x0853, however written?
+{"id":2,"cmd":"mem.watch","args":{"seg":"0824","lo":"9F04","hi":"9F05",
+   "value_size":2,"when":{"becomes_eq":"0853"}}}
+   → {"armed":true,"seg":2084,"lo":40708,"hi":40709,"size":0,"value_size":2,
+      "predicate":"becomes_eq=0x853"}
+{"id":3,"cmd":"mem.watch","args":{"seg":null}}   → {"armed":false}   // or mem.unwatch
 ```
 
 Unlike `BPM` (a per-instruction value-change *poll*), this hooks the actual
@@ -1106,6 +1118,20 @@ reports the storing instruction's own `CS:IP`. Each matching write emits a
     idempotent stores);
   - `{"new_and_mask_eq": {"mask": <u32>, "value": <u32>}}` — `(new & mask) ==
     value`.
+  - `{"becomes_eq": <u32>}` — **value-landed**: fire once per rising edge when
+    the `value_size`-byte unit at `seg:lo` *becomes* the value, by **any** store
+    that overlaps the unit (byte-wise, partial, `rep movs`, or a block copy
+    whose start is below `lo`), regardless of that store's own width or value.
+    The store-value predicates above answer "which store *wrote* V?"; this one
+    answers "when does this location *reach* V?" — the right tool when a field is
+    populated a byte at a time or by a recycled slot, where `new_eq` would report
+    a false zero. It needs the unit width: **`value_size`** (1/2/4, a top-level
+    arg, default = the `lo..hi` span clamped to {1,2,4}). The emitted event's
+    `new` is the settled unit (== V), `old` the prior unit, and `size` the width
+    of the store that landed it. Rising-edge dedup suppresses a per-frame
+    re-stamp of V (it fires again only after the unit leaves V and returns).
+    `becomes_eq` is a RAM tool — it does not fire on a VGA/MMIO unit (there is no
+    settled value to read back without side effects).
 - The hit counter surfaces in `debug.status` under `watches.mem` so a watch
   that fired (or never did) is provable without consuming the event stream.
 - **`from_cs:from_ip` and `from_text` need a heavy-debug build** (they come

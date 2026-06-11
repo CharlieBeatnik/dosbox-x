@@ -727,6 +727,123 @@ TEST_F(AgentObservabilityTest, MemWatchMatchNoOldFalseWhenDisarmed)
     EXPECT_FALSE(AGENT_MemWatchMatchNoOld(0xA0010, 0x5A, 1));
 }
 
+/* ---- mem.watch becomes_eq (value-landed) --------------------- */
+/* The store-value predicates (new_eq/...) miss a byte-wise / partial / block
+ * store that only *lands* V at the watched location. becomes_eq closes that:
+ * it fires once per rising edge for any store that overlaps the value_size-byte
+ * unit, regardless of width or value. The rising-edge + guest read-back happen
+ * in AGENT_MemWatchNote (live-tested), but the two ingredients are pure and
+ * exercised here: the overlap decision (AGENT_MemWatchUnitOverlap) and the
+ * byte-overlay that derives the settled unit (AGENT_MemWatchMergeUnit), plus
+ * the arm/parse/status surface. seg=0x1000 -> base 0x10000. */
+
+TEST_F(AgentObservabilityTest, MemWatchBecomesEqArmsWithExplicitValueSize)
+{
+    JsonValue v = parse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"mem.watch\",\"args\":{\"seg\":\"1000\","
+        "\"lo\":\"0004\",\"hi\":\"0005\",\"value_size\":2,"
+        "\"when\":{\"becomes_eq\":\"0853\"}}}"));
+    ASSERT_TRUE(v.get("ok")->b) << jsonEncode(v);
+    const JsonValue *res = v.get("result");
+    EXPECT_TRUE(res->get("armed")->b);
+    EXPECT_EQ(int(res->get("value_size")->n), 2);
+    EXPECT_EQ(res->get("predicate")->s, "becomes_eq=0x853");
+    EXPECT_TRUE(AGENT_memWatchArmed);
+
+    JsonValue s = status();
+    const JsonValue *m = s.get("result")->get("watches")->get("mem");
+    EXPECT_TRUE(m->get("armed")->b);
+    EXPECT_EQ(int(m->get("value_size")->n), 2);
+    EXPECT_EQ(m->get("predicate")->s, "becomes_eq=0x853");
+}
+
+TEST_F(AgentObservabilityTest, MemWatchBecomesEqDefaultsValueSizeFromSpan)
+{
+    /* span = hi-lo+1, clamped down to {1,2,4}. */
+    auto vsForSpan = [&](const char *lo, const char *hi) -> int {
+        JsonValue v = parse(dispatchLine(
+            std::string("{\"id\":1,\"cmd\":\"mem.watch\",\"args\":{\"seg\":\"1000\",\"lo\":\"")
+            + lo + "\",\"hi\":\"" + hi + "\",\"when\":{\"becomes_eq\":1}}}"));
+        EXPECT_TRUE(v.get("ok")->b) << jsonEncode(v);
+        return int(v.get("result")->get("value_size")->n);
+    };
+    EXPECT_EQ(vsForSpan("0004", "0004"), 1);   /* span 1 -> 1 */
+    EXPECT_EQ(vsForSpan("0004", "0005"), 2);   /* span 2 -> 2 */
+    EXPECT_EQ(vsForSpan("0004", "0006"), 2);   /* span 3 -> 2 */
+    EXPECT_EQ(vsForSpan("0004", "0007"), 4);   /* span 4 -> 4 */
+    EXPECT_EQ(vsForSpan("0004", "0013"), 4);   /* span 16 -> 4 */
+}
+
+TEST_F(AgentObservabilityTest, MemWatchBecomesEqRejectsBadValueSize)
+{
+    JsonValue v = parse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"mem.watch\",\"args\":{\"seg\":\"1000\",\"lo\":0,\"hi\":1,"
+        "\"value_size\":3,\"when\":{\"becomes_eq\":1}}}"));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+    EXPECT_FALSE(AGENT_memWatchArmed);
+}
+
+TEST_F(AgentObservabilityTest, MemWatchBecomesEqRejectsCombinedPredicate)
+{
+    /* becomes_eq is mutually exclusive with the store-value predicates. */
+    JsonValue v = parse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"mem.watch\",\"args\":{\"seg\":\"1000\",\"lo\":0,\"hi\":1,"
+        "\"when\":{\"becomes_eq\":1,\"new_eq\":2}}}"));
+    EXPECT_FALSE(v.get("ok")->b);
+    EXPECT_EQ(v.get("error")->get("code")->s, "bad_args");
+}
+
+TEST_F(AgentObservabilityTest, MemWatchBecomesEqOverlapTest)
+{
+    /* unit [0x10004, 0x10006): a 2-byte unit at seg:lo. The overlap gate fires
+     * on ANY store that crosses the unit — including a block store that STARTS
+     * below lo but writes a byte inside (the exact false-zero case that the
+     * start-in-range store-value gate misses). */
+    armMemWatch("{\"id\":1,\"cmd\":\"mem.watch\",\"args\":{\"seg\":\"1000\","
+                "\"lo\":\"0004\",\"hi\":\"0005\",\"value_size\":2,"
+                "\"when\":{\"becomes_eq\":\"0853\"}}}");
+
+    EXPECT_FALSE(AGENT_MemWatchUnitOverlap(0x10003, 1));  /* byte just below   */
+    EXPECT_TRUE (AGENT_MemWatchUnitOverlap(0x10004, 1));  /* low byte          */
+    EXPECT_TRUE (AGENT_MemWatchUnitOverlap(0x10005, 1));  /* high byte         */
+    EXPECT_FALSE(AGENT_MemWatchUnitOverlap(0x10006, 1));  /* byte just above   */
+    EXPECT_TRUE (AGENT_MemWatchUnitOverlap(0x10003, 2));  /* block crossing lo */
+    EXPECT_FALSE(AGENT_MemWatchUnitOverlap(0x10002, 2));  /* block ends at lo  */
+    EXPECT_TRUE (AGENT_MemWatchUnitOverlap(0x10000, 8));  /* wide block covers */
+}
+
+TEST_F(AgentObservabilityTest, MemWatchBecomesEqOverlapFalseWhenDisarmedOrWrongPred)
+{
+    EXPECT_FALSE(AGENT_memWatchArmed);
+    EXPECT_FALSE(AGENT_MemWatchUnitOverlap(0x10004, 2));   /* disarmed         */
+    /* A non-becomes_eq watch must report no unit overlap. */
+    armMemWatch("{\"id\":1,\"cmd\":\"mem.watch\",\"args\":{\"seg\":\"1000\","
+                "\"lo\":\"0004\",\"hi\":\"0005\",\"when\":{\"new_eq\":\"0853\"}}}");
+    EXPECT_FALSE(AGENT_MemWatchUnitOverlap(0x10004, 2));
+}
+
+TEST_F(AgentObservabilityTest, MemWatchBecomesEqMergeUnit)
+{
+    /* unit [0x10004, 0x10006), value_size 2. Merge derives the post-store unit
+     * from a supplied pre-store unit + the store's bytes — the heart of "what
+     * the unit *becomes*", independent of any single store's value/width. */
+    armMemWatch("{\"id\":1,\"cmd\":\"mem.watch\",\"args\":{\"seg\":\"1000\","
+                "\"lo\":\"0004\",\"hi\":\"0005\",\"value_size\":2,"
+                "\"when\":{\"becomes_eq\":\"0853\"}}}");
+
+    /* Byte-wise populate: low byte then high byte settle the word to 0x0853. */
+    EXPECT_EQ(AGENT_MemWatchMergeUnit(0x0700, 0x10004, 0x53, 1), 0x0753u);
+    EXPECT_EQ(AGENT_MemWatchMergeUnit(0x0753, 0x10005, 0x08, 1), 0x0853u);
+    /* One covering word store. */
+    EXPECT_EQ(AGENT_MemWatchMergeUnit(0x0000, 0x10004, 0x0853, 2), 0x0853u);
+    /* Block store starting below lo, writing 0x53 into the low unit byte. */
+    EXPECT_EQ(AGENT_MemWatchMergeUnit(0x0700, 0x10003, 0x5308, 2), 0x0753u);
+    /* A store that misses the unit leaves it unchanged (overlap gate would have
+     * filtered it; merge is a no-op for non-overlapping bytes). */
+    EXPECT_EQ(AGENT_MemWatchMergeUnit(0x0761, 0x10006, 0xFFFF, 2), 0x0761u);
+}
+
 /* ---- cpu.step / cpu.step_over -------------------------------- */
 /* The step itself runs guest instructions through DEBUG_Run, which needs a
  * paused CPU and an initialised memory/core (MemBase). In -tests mode the
@@ -840,6 +957,9 @@ TEST_F(AgentObservabilityTest, CondParseAcceptsCommonForms)
         "sp==0x0200", "hits==7", "cx==151", "ax!=0", "eax>=0x10000",
         "[ss:01F8]==0x1234", "byte [es:di]==0x5A", "dword [ds:bx]<=0xFF",
         "flags&0x40!=0", "ip>0x100",
+        /* register-indexed operands (proposal 4.10 Feature B). */
+        "word [si+04]==0x853", "word [ds:si+02]==0x37DF", "word [bx+04]!=0x863",
+        "byte [di-01]==0xFF", "[si+0]==1", "[6A1C]==0x853",
     };
     for (const char *s : ok) {
         BpCondition c; std::string err;
@@ -865,13 +985,54 @@ TEST_F(AgentObservabilityTest, CondParseAcceptsCommonForms)
     EXPECT_TRUE(c.lhs.isMem);
     EXPECT_EQ(c.lhs.memSize, 1);
     EXPECT_EQ(c.lhs.memOff.kind, BpValSrc::REG);
+    EXPECT_EQ(c.lhs.memDisp, 0);
+
+    /* `word [si+04]` — explicit segment absent (default DS), reg base + disp.
+     * BPREG_* ids live in agent_cpu.cpp's anonymous namespace, so the default
+     * segment is proven by comparing it to an explicit `[ds:...]` parse: both
+     * must resolve memSeg to the SAME register. */
+    BpCondition cDef, cExpl;
+    ASSERT_TRUE(parseBpCondition("word [si+04]==0x853", cDef, err)) << err;
+    ASSERT_TRUE(parseBpCondition("word [ds:si+04]==0x853", cExpl, err)) << err;
+    EXPECT_TRUE(cDef.lhs.isMem);
+    EXPECT_EQ(cDef.lhs.memSize, 2);
+    EXPECT_EQ(cDef.lhs.memSeg.kind, BpValSrc::REG);
+    EXPECT_EQ(cExpl.lhs.memSeg.kind, BpValSrc::REG);
+    EXPECT_EQ(cDef.lhs.memSeg.reg, cExpl.lhs.memSeg.reg);   /* default == DS */
+    EXPECT_EQ(cDef.lhs.memOff.kind, BpValSrc::REG);
+    EXPECT_EQ(cDef.lhs.memDisp, 0x04);
+    EXPECT_EQ(cDef.rhs.direct.imm, 0x853u);
+
+    /* `word [ds:si+02]` — explicit segment + disp. */
+    ASSERT_TRUE(parseBpCondition("word [ds:si+02]==0x37DF", c, err));
+    EXPECT_EQ(c.lhs.memSeg.kind, BpValSrc::REG);
+    EXPECT_EQ(c.lhs.memOff.kind, BpValSrc::REG);
+    EXPECT_EQ(c.lhs.memDisp, 0x02);
+
+    /* A negative displacement parses to a signed memDisp. */
+    ASSERT_TRUE(parseBpCondition("byte [di-01]==0xFF", c, err));
+    EXPECT_EQ(c.lhs.memDisp, -1);
+
+    /* `[6A1C]` — no segment, literal offset -> default DS, no disp. */
+    ASSERT_TRUE(parseBpCondition("[6A1C]==0x853", c, err));
+    EXPECT_TRUE(c.lhs.isMem);
+    EXPECT_EQ(c.lhs.memSeg.kind, BpValSrc::REG);            /* defaulted to DS */
+    EXPECT_EQ(c.lhs.memOff.kind, BpValSrc::IMM);
+    EXPECT_EQ(c.lhs.memOff.imm, 0x6A1Cu);
+    EXPECT_EQ(c.lhs.memDisp, 0);
 }
 
 TEST_F(AgentObservabilityTest, CondParseRejectsMalformed)
 {
     const char *bad[] = {
-        "", "ax", "ax==", "==5", "ax===5", "[ss]==1", "foo==1",
+        "", "ax", "ax==", "==5", "ax===5", "foo==1",
         "ax & == 5", "ax & bx == 1", "ax == 5 == 1", "ax <> 5", "byte ax==1",
+        /* malformed memory references (Feature B parser error paths). */
+        "[ds:]==1",      /* segment but no offset            */
+        "[si+]==1",      /* '+' with no displacement         */
+        "[+04]==1",      /* displacement with no base        */
+        "[si+xz]==1",    /* non-hex displacement             */
+        "[si:di:bx]==1", /* too many ':' halves              */
     };
     for (const char *s : bad) {
         BpCondition c; std::string err;
@@ -980,6 +1141,23 @@ TEST_F(AgentObservabilityTest, BpSetSucceedsAndAppearsInStatus)
     EXPECT_EQ(cb.get("condition")->s, "hits==150");
     EXPECT_EQ(uint64_t(cb.get("hits")->n), 0u);
     EXPECT_EQ(uint64_t(cb.get("fires")->n), 0u);
+}
+
+TEST_F(AgentObservabilityTest, BpSetAcceptsRegisterIndexedCondition)
+{
+    /* The proposal-4.10 Feature-B acceptance: a `[reg+disp]` condition that was
+     * rejected at bp.set time before now arms cleanly. (The live test then
+     * proves it halts on the right dispatch with the field read from memory.) */
+    JsonValue v = parse(dispatchLine(
+        "{\"id\":1,\"cmd\":\"bp.set\",\"args\":{\"addr\":\"0824:3723\","
+        "\"if\":\"word [si+04]==0x853\"}}"));
+    ASSERT_TRUE(v.get("ok") && v.get("ok")->b) << jsonEncode(v);
+    EXPECT_EQ(v.get("result")->get("condition")->s, "word [si+04]==0x853");
+
+    JsonValue st = status();
+    const JsonValue *cbs = st.get("result")->get("cond_breakpoints");
+    ASSERT_EQ(cbs->a->size(), 1u);
+    EXPECT_EQ((*cbs->a)[0].get("condition")->s, "word [si+04]==0x853");
 }
 
 TEST_F(AgentObservabilityTest, BpClearAllAndById)

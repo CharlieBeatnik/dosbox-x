@@ -302,10 +302,14 @@ class DbxAgent:
         ``addr`` is "SEG:OFF" (hex). ``if_`` is an optional condition string —
         a single comparison ``operand [& mask] op operand`` where an operand is
         a register (ax/eax/al/cs/flags/...), ``hits`` (the BP's own reach
-        count), a number (decimal, or 0x-hex; bare hex inside ``[seg:off]``), or
-        a memory reference ``[byte|word|dword] [seg:off]``. Examples:
-        ``"hits==150"``, ``"cx==0x151"``, ``"byte [es:di]==0x5A"``,
-        ``"flags&0x40!=0"``. ``do`` is an optional list of read-only macro
+        count), a number (decimal, or 0x-hex; bare hex inside a memory ref), or
+        a memory reference ``[byte|word|dword] [ [seg:] off [±disp] ]``. The
+        offset may be a register with an optional signed displacement and the
+        segment is optional (defaults to DS), so an indirect-dispatch site can
+        be gated on the field it is about to call: ``"word [si+04]==0x853"``.
+        Examples: ``"hits==150"``, ``"cx==0x151"``, ``"byte [es:di]==0x5A"``,
+        ``"flags&0x40!=0"``, ``"word [si+04]==0x853"``, ``"word [ds:di-02]!=0"``.
+        ``do`` is an optional list of read-only macro
         commands run atomically when the condition holds — each a dict
         ``{"cmd": ..., "args": {...}}`` with cmd in {regs.get, mem.read,
         cpu.disasm, cpu.traceback, debug.status}; their output is delivered in
@@ -535,7 +539,7 @@ class DbxAgent:
         return self.call("cpu.unwatch_range")
 
     def mem_watch(self, seg: int, lo: int, hi: int, *, size: Optional[int] = None,
-                  when: Optional[dict] = None) -> dict:
+                  when: Optional[dict] = None, value_size: Optional[int] = None) -> dict:
         """Intercept guest writes into [seg, lo..hi] and report the storing
         instruction.
 
@@ -545,18 +549,33 @@ class DbxAgent:
         size. ``lo``/``hi`` are offsets within ``seg`` (matched against the
         write's starting linear address). ``size`` (1, 2, or 4) optionally
         filters by access width. ``when`` optionally filters by value — pass one
-        of ``{"new_eq": v}``, ``{"new_ne_old": True}``, or
-        ``{"new_and_mask_eq": {"mask": m, "value": v}}``. Returns
-        ``{armed, seg, lo, hi, size, predicate}``. VGA-framebuffer writes report
-        ``old: null`` (the read-back is skipped to avoid latch corruption). Use
-        ``mem_unwatch`` to clear. Heavy-debug build records ``from_*``; the watch
-        itself fires in any C_DEBUG build.
+        of:
+
+          * ``{"new_eq": v}`` — the stored value equals ``v``;
+          * ``{"new_ne_old": True}`` — the store actually changes the value;
+          * ``{"new_and_mask_eq": {"mask": m, "value": v}}`` — ``(new & m) == v``;
+          * ``{"becomes_eq": v}`` — *value-landed*: fire once per rising edge
+            when the ``value_size``-byte unit at ``seg:lo`` *becomes* ``v`` by
+            ANY store that overlaps it (byte-wise / partial / rep / block),
+            regardless of that store's width or value. This is the "I don't care
+            how it was written, tell me when it's ``v``" predicate — it names the
+            writer of a field a byte-at-a-time populate would hide from
+            ``new_eq``. ``value_size`` (1/2/4) is the unit width; it defaults to
+            the lo..hi span clamped to {1,2,4}.
+
+        Returns ``{armed, seg, lo, hi, size, predicate[, value_size]}``.
+        VGA-framebuffer writes report ``old: null`` (the read-back is skipped to
+        avoid latch corruption); ``becomes_eq`` is a RAM tool and does not fire
+        on VGA/MMIO units. Use ``mem_unwatch`` to clear. Heavy-debug build
+        records ``from_*``; the watch itself fires in any C_DEBUG build.
         """
         args: dict = {"seg": seg, "lo": lo, "hi": hi}
         if size is not None:
             args["size"] = size
         if when is not None:
             args["when"] = when
+        if value_size is not None:
+            args["value_size"] = value_size
         return self.call("mem.watch", **args)
 
     def mem_unwatch(self) -> dict:

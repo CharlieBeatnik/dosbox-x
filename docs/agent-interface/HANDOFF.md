@@ -6,6 +6,61 @@ Leave-behind for the next agent continuing the **proposal-4.9** work on the
 Source proposal:
 `X2RE/.claude/notes/dosbox-x-fixes/PROPOSAL_4.9_observability_and_trust.md`.
 
+---
+
+## Proposal 4.10 — value-landed `mem.watch` + register-indexed BP conditions (shipped)
+
+Source: `X2RE/.claude/notes/dosbox-x-fixes/PROPOSAL_4.10_value_landed_watch_and_indexed_conditions.md`.
+Two small generalizations of existing machinery, each turning an N-run /
+static-analysis detour into a one-run measurement. **Built (0 errors); 150 Agent
+gTests pass (+9); live `test_observability.py` 18/18 (3 new scenarios).**
+
+| Feature | What | Proves |
+|---------|------|--------|
+| **A** `mem.watch when:{becomes_eq:V}` + `value_size` | value-landed predicate: fire once per rising edge when the `value_size`-byte unit at `seg:lo` *becomes* V by ANY overlapping store (byte-wise / partial / `rep` / block start-below-`lo`) | names the writer a byte-at-a-time populate hides from `new_eq` (the iter-20 false zero) |
+| **B** `bp.set if "[reg±disp]"` + optional DS seg | the `[seg:off]` operand offset may be `reg ['+'/'-' disp]`, segment optional (default DS) | halt at `call word [si+04]` only when the node about to be called has handler X |
+
+### Code map (4.10)
+
+- **Feature A — `src/agent/agent_observe.cpp` only.** New enum `MW_PRED_BECOMES_EQ`;
+  state `g_memWatchValueSize` + `g_memWatchLastUnit` (seeded with the 33-bit
+  sentinel `MEMWATCH_UNIT_SENTINEL` so the first landing always edges).
+  `memWatchInScope` gains a **interval-overlap** branch for becomes_eq (store
+  `[lin,lin+size)` vs unit `[linLo,linLo+value_size)`), ignoring the access-size
+  filter. The hot path `AGENT_MemWatchNote` runs *before* the store, so it reads
+  the pre-store unit and **merges** the store bytes over it (`mergeStoreIntoUnit`,
+  pure) to get the settled unit — no after-store re-read needed; fires iff
+  `post==V && lastUnit!=V`. `emitMemWrite` gained an explicit `valueMask` arg so
+  becomes_eq reports old/new at the *unit* width while `size` stays the store's
+  width; `addr` is the unit (seg:lo). becomes_eq is a RAM tool (gated on
+  `memReadIsSideEffectFree` — no VGA/MMIO units). Pure test hooks
+  `AGENT_MemWatchUnitOverlap` / `AGENT_MemWatchMergeUnit` in `include/agent.h`.
+- **Feature B — `src/agent/agent_cpu.cpp` + `agent_internal.h`.** `BpOperand`
+  gains `int32_t memDisp`. Tokenizer gains `BPT_PLUS`/`BPT_MINUS`. `bpParseOperand`
+  memref branch rewritten: optional `segreg:` (default DS via a `BpValSrc{REG,
+  BPREG_DS}`), offset base (reg or literal), optional `±` bare-hex disp.
+  `bpEvalOperand` computes `off = (base + disp) & 0xFFFF`. Registers in both
+  halves were *already* accepted (4.9.9) — the proposal's "regs not accepted"
+  claim was stale; the genuinely-new bits are the disp and the default segment.
+  Note: `[ss]` (no colon) now parses as `[ds:ss]` — the old reject test for it
+  was updated.
+
+### Live coverage (4.10)
+
+`tests/agent_live/obstest.asm` rebuilt (MASM 6.11 + TLINK; `build_masm.py`) with
+2 new keystrokes and 5 new landmark-table entries (table now 19 u16 at CS:0103):
+
+- key **'8'** scenario 8: settle `bw_field` to 0x0853 a byte at a time →
+  scenario12a (becomes_eq names `landmark_bw_hi`, old=0x0053→new=0x0853 size=1)
+  and scenario12b (the old `new_eq size=2` sees **0 events**, the false zero).
+- key **'9'** scenario 9: `call word ptr [si+04]` walker over a 3-node table →
+  scenario13 (`bp.set word [si+04]==<hdl_bad>` halts at node1, SI=node1).
+
+The driver unpacks `<19H>`; rebuild OBSTEST.COM via `build_masm.py` (needs the
+`MASM`/`TASM` env roots) before running the live test if the .asm changes.
+
+---
+
 ## What shipped this iteration (typed breakpoints: `bp.add` / `bp.list` / `bp.del`)
 
 The typed replacement for the `debugger.command "BP …"` / "BPINT …" / "BPDEL"

@@ -71,6 +71,16 @@
 ;        one unit). Single-step register granularity is proven separately on
 ;        the scenario-3 trace chain. Proves the structured step.
 ;
+;   '8'  Scenario 8 (value-landed mem.watch): settle the 2-byte field bw_field
+;        to WATCH_VALUE one byte at a time. The store-value predicate misses a
+;        byte-wise populate (false zero); the becomes_eq predicate fires once on
+;        the rising edge and names the high-byte store (landmark_bw_hi).
+;
+;   '9'  Scenario 9 (register-indexed bp.set condition): an entity-walker that
+;        dispatches each node via `call word ptr [si+04]`. A conditional BP
+;        `word [si+04]==<hdl_bad>` at landmark_dispatch halts only on the node
+;        whose handler is the bad one (node1), with SI pointing at it.
+;
 ;   'q'  Exit cleanly via INT 21h AH=4Ch.
 ;
 ; All scenarios return to main_loop so the driver can run them in any order and
@@ -81,6 +91,7 @@ WATCH_INITIAL   equ     0761h           ; watch_target value at load
 WATCH_VALUE     equ     0853h           ; value scenario 4 stamps into watch_target
 VGA_OFFSET      equ     0064h           ; scenario 5 framebuffer write offset (A000:0064)
 VGA_VALUE       equ     005Ah           ; byte scenario 5 stores to the framebuffer
+NODE_SIZE       equ     6               ; scenario 9 walker node stride (handler ptr at +4)
 
 code    segment
         assume  cs:code, ds:code, es:code, ss:code
@@ -105,10 +116,28 @@ landmarks_table:
         dw      landmark_call           ; +22 the NEAR call instruction (scenario 7)
         dw      landmark_call_ret       ; +24 instruction after the call (step_over)
         dw      landmark_sub            ; +26 subroutine entry (step lands here)
+        dw      bw_field                ; +28 becomes_eq unit (2 bytes, scenario 8)
+        dw      landmark_bw_hi          ; +30 the high-byte store that lands V
+        dw      landmark_dispatch       ; +32 indirect-dispatch site / BP (scenario 9)
+        dw      landmark_hdl_bad        ; +34 the "bad" handler offset (cond value)
+        dw      node1                   ; +36 the node whose handler == hdl_bad
 
 ; ---- Variables -----------------------------------------------------------
 loopcount       dw      0
 watch_target    dw      WATCH_INITIAL   ; scenario 4 stamps WATCH_VALUE here
+bw_field        dw      0               ; scenario 8 byte-wise becomes_eq field
+
+; scenario 9 walker nodes: each is {dw,dw,dw} with the handler pointer at +4.
+; node1's handler is landmark_hdl_bad, the one the [si+04] condition selects.
+nodes:
+        dw      1111h, 2222h
+        dw      landmark_hdl_a
+node1:
+        dw      3333h, 4444h
+        dw      landmark_hdl_bad
+        dw      5555h, 6666h
+        dw      landmark_hdl_c
+nodes_end:
 
 ; ---- Setup ---------------------------------------------------------------
 setup:
@@ -150,8 +179,16 @@ chk_6:
         jmp     scenario6                  ; near jmp: scenario6 is out of je's rel8 range
 chk_7:
         cmp     al, '7'
-        jne     chk_q
+        jne     chk_8
         jmp     scenario7                  ; near jmp: scenario7 is out of je's rel8 range
+chk_8:
+        cmp     al, '8'
+        jne     chk_9
+        jmp     scenario8                  ; near jmp: scenario8 is out of je's rel8 range
+chk_9:
+        cmp     al, '9'
+        jne     chk_q
+        jmp     scenario9                  ; near jmp: scenario9 is out of je's rel8 range
 chk_q:
         cmp     al, 'q'
         je      do_exit
@@ -265,6 +302,49 @@ landmark_call_ret:
         jmp     main_loop
 landmark_sub:
         nop
+        nop
+        retn
+
+; ---- Scenario 8: byte-wise becomes_eq populate (value-landed mem.watch) -----
+; The 2-byte field bw_field is settled to WATCH_VALUE (0853h) one byte at a
+; time: the low-byte store leaves 0053h (NOT V), the high-byte store at
+; landmark_bw_hi lands 0853h. Neither store is a 2-byte write of 0853h, so the
+; store-value predicate `new_eq=0853 size=2` sees zero events (the false zero);
+; the value-landed predicate `becomes_eq=0853 value_size=2` fires once on the
+; rising edge and names landmark_bw_hi. The reset to 0 first makes the populate
+; deterministic across re-runs (key auto-repeat).
+scenario8:
+        mov     word ptr [bw_field], 0      ; reset: field != V before populate
+landmark_bw_lo:
+        mov     byte ptr [bw_field], 053h   ; low byte  -> field = 0053h (not V)
+landmark_bw_hi:
+        mov     byte ptr [bw_field+1], 008h ; high byte -> field = 0853h (lands V)
+        jmp     main_loop
+
+; ---- Scenario 9: register-indexed indirect dispatch (bp.set [si+04]) --------
+; Walk the node table; each iteration dispatches through the node's handler
+; pointer with `call word ptr [si+04]`. The driver sets a conditional BP at
+; landmark_dispatch with `word [si+04]==<hdl_bad>`, which halts only on the one
+; node (node1) whose handler is landmark_hdl_bad — SI then points at node1.
+; The handlers are NOP+RETN so the dispatch is real and SI is preserved.
+scenario9:
+        mov     si, offset nodes
+scenario9_loop:
+        cmp     si, offset nodes_end
+        jae     scenario9_done
+landmark_dispatch:
+        call    word ptr [si+04]           ; indirect dispatch on node handler
+        add     si, NODE_SIZE
+        jmp     scenario9_loop
+scenario9_done:
+        jmp     main_loop
+landmark_hdl_a:
+        nop
+        retn
+landmark_hdl_bad:
+        nop
+        retn
+landmark_hdl_c:
         nop
         retn
 
